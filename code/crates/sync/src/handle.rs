@@ -143,10 +143,8 @@ where
                 );
             }
 
-            // Circle Malachite v0.8.1 retires obsolete requests on height changes and filters
-            // stale values in the sync actor. With our separate inflight/pending maps, filter
-            // here before a late response can reserve already-decided heights indefinitely.
-            // Validate the original range and every certificate above before trimming it.
+            // Validate the original range and every certificate before trimming. With separate
+            // inflight/pending maps, already-decided values must not reserve queue capacity.
             if end <= state.tip_height {
                 debug!(%request_id, %peer_id, %start, %end, height.tip = %state.tip_height,
                     "Discarding obsolete sync response");
@@ -254,9 +252,8 @@ where
 
     debug!("Peer scores: {:#?}", state.peer_scorer.get_scores());
 
-    // Match on_status: the restored consensus height must initialize the tip before
-    // cached peer statuses can trigger requests. Backported from Circle's guarded
-    // maybe_request_values path in Malachite v0.8.1.
+    // Like on_status, wait for consensus to initialize the restored tip before
+    // cached peer statuses can trigger requests.
     if !state.started {
         return Ok(());
     }
@@ -326,6 +323,9 @@ where
     debug!(%height, is_restart=%start_type.is_restart(), "Consensus started new height");
 
     state.started = true;
+
+    // Keep inflight IDs until their response or timeout. Removing obsolete IDs here
+    // would make this implementation penalize honest peers for valid late replies.
 
     // In case of a start, core-consensus should have "consumed" everything from the `sync_input_queue`
     // up to the `height` height, so we remove those pending consensus requests.
@@ -729,13 +729,35 @@ where
         let current_number_of_heights = current_number_of_heights(state);
         let asking_for_how_many_heights = range.end().as_u64() - range.start().as_u64() + 1;
         if current_number_of_heights + asking_for_how_many_heights > max_heights {
+            let inflight_heights: u64 = state
+                .inflight_requests
+                .values()
+                .map(|(range, _)| range.end().as_u64() - range.start().as_u64() + 1)
+                .sum();
+            let pending_consensus_heights = current_number_of_heights - inflight_heights;
+            let lowest_inflight_start = state
+                .inflight_requests
+                .values()
+                .map(|(range, _)| range.start().as_u64())
+                .min();
+            let lowest_pending_start = state
+                .pending_consensus_requests
+                .values()
+                .flat_map(|(ranges, _)| ranges)
+                .map(|range| range.start().as_u64())
+                .min();
+
             info!(
+                height.tip = %state.tip_height,
                 %current_number_of_heights,
+                %inflight_heights,
+                %pending_consensus_heights,
+                ?lowest_inflight_start,
+                ?lowest_pending_start,
                 inflight_requests = state.inflight_requests.len(),
                 pending_consensus_requests = state.pending_consensus_requests.len(),
-                    %asking_for_how_many_heights,
-                    %max_heights,
-
+                %asking_for_how_many_heights,
+                %max_heights,
                 "Maximum number of heights reached, skipping request for values"
             );
             return Ok(());

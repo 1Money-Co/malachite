@@ -140,21 +140,47 @@ fn late_obsolete_responses_release_full_height_allowance() {
 
     // All 12,500 heights are still on the wire when the restored height arrives.
     harness.start(1_266_457);
+    let mut forwarded_responses = 0;
     for (id, (range, peer)) in requests {
         let effects = harness.apply(Input::ValueResponse(
             id,
             peer,
             Some(response(range.start().as_u64(), range.end().as_u64())),
         ));
-        assert!(forwarded(&effects).is_empty());
+        forwarded_responses += forwarded(&effects).len();
     }
 
-    assert!(harness.state.inflight_requests.is_empty());
-    assert!(harness.state.pending_consensus_requests.is_empty());
     // No timeout, decision, or restart is needed to request the actual missing range.
     assert_eq!(
         requested_ranges(&harness.apply(Input::Tick)),
         vec![Height::new(1_266_457)..=Height::new(1_266_884)]
+    );
+    assert_eq!(forwarded_responses, 0);
+    assert!(harness.state.pending_consensus_requests.is_empty());
+}
+
+#[test]
+fn late_response_ending_at_tip_is_discarded() {
+    let mut harness = Harness::new(5, 1);
+    let peer = PeerId::random();
+    harness.start(10);
+    harness.status(peer, 14);
+    let id = harness
+        .state
+        .inflight_requests
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    harness.start(13);
+
+    let effects = harness.apply(Input::ValueResponse(id, peer, Some(response(10, 12))));
+    assert!(forwarded(&effects).is_empty());
+    assert!(harness.state.inflight_requests.is_empty());
+    assert!(harness.state.pending_consensus_requests.is_empty());
+    assert_eq!(
+        requested_ranges(&harness.apply(Input::Tick)),
+        vec![Height::new(13)..=Height::new(14)]
     );
 }
 
