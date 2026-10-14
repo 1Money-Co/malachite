@@ -87,7 +87,7 @@ where
                 }
             };
 
-            let Some(response) = response else {
+            let Some(mut response) = response else {
                 debug!(%request_id, %peer_id, "Received invalid response");
 
                 // Received an invalid value from this peer and hence update the peer's score accordingly.
@@ -133,7 +133,37 @@ where
                 return Ok(());
             }
 
-            // Only notify consensus to start processing the response after we've performed sanity checks on the response.
+            // Account for the original response even when consensus advanced while it was in flight.
+            debug!(start = %start, num_values = %response.values.len(), %peer_id, "Received response from peer");
+            if let Some(response_time) = metrics.value_response_received(start.as_u64()) {
+                state.peer_scorer.update_score_with_metrics(
+                    peer_id,
+                    SyncResult::Success(response_time),
+                    &metrics.scoring,
+                );
+            }
+
+            // Circle Malachite v0.8.1 retires obsolete requests on height changes and filters
+            // stale values in the sync actor. With our separate inflight/pending maps, filter
+            // here before a late response can reserve already-decided heights indefinitely.
+            // Validate the original range and every certificate above before trimming it.
+            if end <= state.tip_height {
+                debug!(%request_id, %peer_id, %start, %end, height.tip = %state.tip_height,
+                    "Discarding obsolete sync response");
+                return Ok(());
+            }
+
+            if start <= state.tip_height {
+                let first_undecided = state.tip_height.increment();
+                let discarded_values = (first_undecided.as_u64() - start.as_u64()) as usize;
+                response.values.drain(..discarded_values);
+                response.start_height = first_undecided;
+                debug!(%request_id, %peer_id, %start, %first_undecided, %discarded_values,
+                    "Trimming obsolete prefix from sync response");
+            }
+
+            let pending_start = response.start_height;
+            // Only notify consensus after validation and removal of already-decided values.
             perform!(
                 co,
                 Effect::NotifyConsensusToProcessSyncResponse(
@@ -144,27 +174,11 @@ where
                 )
             );
 
-            // The peer might have sent us a partial response, so we compute what the actual `end` of
-            // the returned values is and update `pending_consensus_requests` accordingly.
-            let actual_end = requested_range
-                .start()
-                .increment_by(response.values.len() as u64)
-                .decrement()
-                .unwrap();
+            // Only the received, undecided suffix consumes the consensus queue allowance.
             state.pending_consensus_requests.insert(
-                request_id.clone(),
-                (vec![RangeInclusive::new(start, actual_end)], peer_id),
+                request_id,
+                (vec![RangeInclusive::new(pending_start, end)], peer_id),
             );
-
-            // Update peer's response time.
-            debug!(start = %start, num_values = %response.values.len(), %peer_id, "Received response from peer");
-            if let Some(response_time) = metrics.value_response_received(start.as_u64()) {
-                state.peer_scorer.update_score_with_metrics(
-                    peer_id,
-                    SyncResult::Success(response_time),
-                    &metrics.scoring,
-                );
-            }
 
             Ok(())
         }
@@ -239,6 +253,13 @@ where
     }
 
     debug!("Peer scores: {:#?}", state.peer_scorer.get_scores());
+
+    // Match on_status: the restored consensus height must initialize the tip before
+    // cached peer statuses can trigger requests. Backported from Circle's guarded
+    // maybe_request_values path in Malachite v0.8.1.
+    if !state.started {
+        return Ok(());
+    }
 
     // In the exceptional case where we stop getting `Status` updates from other peers, we initiate
     // the request of values from here up to the maximum `tip_height` we have seen so far.
@@ -710,6 +731,8 @@ where
         if current_number_of_heights + asking_for_how_many_heights > max_heights {
             info!(
                 %current_number_of_heights,
+                inflight_requests = state.inflight_requests.len(),
+                pending_consensus_requests = state.pending_consensus_requests.len(),
                     %asking_for_how_many_heights,
                     %max_heights,
 

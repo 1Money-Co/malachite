@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Prevent value-sync requests before the restored consensus height is known, and discard or trim late responses
+  for already-decided heights before reserving consensus queue capacity. Preserve validation of the original
+  response and the existing bounded queue allowance.
+  Adapted from the startup gating and stale-request lifecycle in Circle Malachite v0.8.1.
+  See [interop issue #375](https://github.com/1Money-Co/1money-interoperability-protocol/issues/375) and
+  [the upstream sync implementation](https://github.com/circlefin/malachite/tree/v0.8.1/code/crates/sync).
 - Remove `Effect::GetValidatorSet`, `AppMsg::GetValidatorSet` and `HostMsg::GetValidatorSet` ([#1189](https://github.com/circlefin/malachite/pull/1189))
 - Introduce `malachitebft-signing` crate for exposing the `SigningProvider` and `SigningProviderExt` traits ([#1191](https://github.com/informalsystems/malachite/pull/1191))
 - Make `SigningProvider` trait methods fallible ([#1191](https://github.com/informalsystems/malachite/pull/1191))
