@@ -26,11 +26,11 @@ the approved implementation plan. Evidence remains pending until its command pas
 | Behavior | Production | Current fork | Circle rc.3 | Decision | Evidence | Gate |
 | --- | --- | --- | --- | --- | --- | --- |
 | `ecdsa-signing-and-serialization` | Yes | Yes | No | Retain; production bytes pinned | E2 | G1 |
-| `sync-response-size-bound` | Yes | Yes | Yes | Reconcile in Task 4 | Pending | G2 |
-| `sync-inflight-and-pending-accounting` | Yes | Yes | Partial | Reconcile in Task 4 | Pending | G3 |
-| `sync-restored-height-startup` | No | Yes | No | Reconcile in Task 4 | Pending | G4 |
-| `sync-delayed-stale-and-partial-responses` | Partial | Yes | Partial | Reconcile in Task 4 | Pending | G5 |
-| `sync-capacity-diagnostics` | No | Yes | No | Reconcile in Task 4 | Pending | G6 |
+| `sync-response-size-bound` | Yes | Yes | Yes | Retain; exact bound characterized | E4 | G2 |
+| `sync-inflight-and-pending-accounting` | Yes | Yes | Partial | Retain; saturation characterized | E4 | G3 |
+| `sync-restored-height-startup` | No | Yes | No | Retain; startup characterized | E4 | G4 |
+| `sync-delayed-stale-and-partial-responses` | Partial | Yes | Partial | Retain; lifecycle characterized | E4 | G5 |
+| `sync-capacity-diagnostics` | No | Yes | No | Retain; snapshot characterized | E4 | G6 |
 | `consensus-request-errors` | Yes | Yes | Yes | Reconcile in Task 6 | Pending | G7 |
 | `wal-entry-height` | Yes | Yes | Yes | Retain; both baselines pinned | E3 | G8 |
 | `rc3-logging-context` | Partial | Partial | Yes | Reconcile in Task 6 | Pending | G9 |
@@ -41,6 +41,11 @@ the approved implementation plan. Evidence remains pending until its command pas
 - **E3:** `cargo test -p informalsystems-malachitebft-test --test unit wal_compatibility`
   and `cargo test -p informalsystems-malachitebft-core-consensus --test wal_height`
   plus `cargo nextest run -p informalsystems-malachitebft-test --test it wal`
+- **E4:** `cargo test -p informalsystems-malachitebft-test --test unit sync_lifecycle`
+  and `cargo nextest run -p informalsystems-malachitebft-test --test it value_sync`.
+  The unit suite covers restored startup, saturated inflight/pending accounting and diagnostics, and delayed, stale,
+  partial, unsolicited, and wrong-peer responses. The integration suite covers the exact encoded response-size bound
+  and the complete value-sync scenario set.
 
 ### Retirement gates
 

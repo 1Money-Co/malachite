@@ -8,6 +8,15 @@ use crate::handle::excise_height;
 use crate::scoring::{ema, PeerScorer, Strategy};
 use crate::{Config, OutboundRequestId, Status};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeightAllowanceSnapshot<H> {
+    pub inflight_heights: u64,
+    pub pending_heights: u64,
+    pub lowest_inflight_start: Option<H>,
+    pub lowest_pending_start: Option<H>,
+    pub tip_height: H,
+}
+
 pub struct State<Ctx>
 where
     Ctx: Context,
@@ -188,5 +197,41 @@ where
             ranges.retain(|range| range.end() > up_to_height);
             !ranges.is_empty()
         });
+    }
+}
+
+pub fn height_allowance_snapshot<Ctx>(state: &State<Ctx>) -> HeightAllowanceSnapshot<Ctx::Height>
+where
+    Ctx: Context,
+{
+    let inflight_heights = state
+        .inflight_requests
+        .values()
+        .map(|(range, _)| range.end().as_u64() - range.start().as_u64() + 1)
+        .sum();
+    let pending_heights = state
+        .pending_consensus_requests
+        .values()
+        .flat_map(|(ranges, _)| ranges)
+        .map(|range| range.end().as_u64() - range.start().as_u64() + 1)
+        .sum();
+    let lowest_inflight_start = state
+        .inflight_requests
+        .values()
+        .map(|(range, _)| *range.start())
+        .min();
+    let lowest_pending_start = state
+        .pending_consensus_requests
+        .values()
+        .flat_map(|(ranges, _)| ranges)
+        .map(|range| *range.start())
+        .min();
+
+    HeightAllowanceSnapshot {
+        inflight_heights,
+        pending_heights,
+        lowest_inflight_start,
+        lowest_pending_start,
+        tip_height: state.tip_height,
     }
 }

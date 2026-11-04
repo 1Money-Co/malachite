@@ -9,8 +9,9 @@ use malachitebft_core_types::{Context, Height};
 use crate::co::Co;
 use crate::scoring::SyncResult;
 use crate::{
-    perform, Effect, Error, HeightStartType, InboundRequestId, Metrics, OutboundRequestId, PeerId,
-    RawDecidedValue, Request, Resume, State, Status, ValueRequest, ValueResponse,
+    height_allowance_snapshot, perform, Effect, Error, HeightStartType, InboundRequestId, Metrics,
+    OutboundRequestId, PeerId, RawDecidedValue, Request, Resume, State, Status, ValueRequest,
+    ValueResponse,
 };
 
 #[derive_where(Debug)]
@@ -510,24 +511,8 @@ fn current_number_of_heights<Ctx>(state: &State<Ctx>) -> u64
 where
     Ctx: Context,
 {
-    let mut heights = 0;
-
-    for (_, (range, _)) in state.inflight_requests.iter() {
-        let requested_heights = range.end().as_u64() - range.start().as_u64() + 1;
-        heights += requested_heights;
-    }
-
-    for (_, (ranges, _)) in state.pending_consensus_requests.iter() {
-        let mut pending_consensus_heights = 0;
-
-        for range in ranges {
-            pending_consensus_heights += range.end().as_u64() - range.start().as_u64() + 1;
-        }
-
-        heights += pending_consensus_heights;
-    }
-
-    heights
+    let snapshot = height_allowance_snapshot(state);
+    snapshot.inflight_heights + snapshot.pending_heights
 }
 
 /// Finds the earliest window `[a, b]` such that the window is "free" from overlaps with ranges, meaning:
@@ -729,31 +714,15 @@ where
         let current_number_of_heights = current_number_of_heights(state);
         let asking_for_how_many_heights = range.end().as_u64() - range.start().as_u64() + 1;
         if current_number_of_heights + asking_for_how_many_heights > max_heights {
-            let inflight_heights: u64 = state
-                .inflight_requests
-                .values()
-                .map(|(range, _)| range.end().as_u64() - range.start().as_u64() + 1)
-                .sum();
-            let pending_consensus_heights = current_number_of_heights - inflight_heights;
-            let lowest_inflight_start = state
-                .inflight_requests
-                .values()
-                .map(|(range, _)| range.start().as_u64())
-                .min();
-            let lowest_pending_start = state
-                .pending_consensus_requests
-                .values()
-                .flat_map(|(ranges, _)| ranges)
-                .map(|range| range.start().as_u64())
-                .min();
+            let snapshot = height_allowance_snapshot(state);
 
             info!(
-                height.tip = %state.tip_height,
+                height.tip = %snapshot.tip_height,
                 %current_number_of_heights,
-                %inflight_heights,
-                %pending_consensus_heights,
-                ?lowest_inflight_start,
-                ?lowest_pending_start,
+                inflight_heights = %snapshot.inflight_heights,
+                pending_consensus_heights = %snapshot.pending_heights,
+                lowest_inflight_start = ?snapshot.lowest_inflight_start,
+                lowest_pending_start = ?snapshot.lowest_pending_start,
                 inflight_requests = state.inflight_requests.len(),
                 pending_consensus_requests = state.pending_consensus_requests.len(),
                 %asking_for_how_many_heights,
