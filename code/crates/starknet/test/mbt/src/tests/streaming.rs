@@ -9,6 +9,8 @@ pub mod runner;
 pub mod utils;
 
 const SHA2_256: u64 = 0x12;
+const PART_STREAM_TESTS: &str =
+    "^(MessagesInRightOrderTest|MessagesInWrongOrderTest|InitReceivedTest|FinReceivedTest)$";
 
 #[test]
 fn test_mbt_part_streaming_specified_traces() {
@@ -27,6 +29,7 @@ fn test_mbt_part_streaming_specified_traces() {
         "block-streaming/part_stream.qnt",
         &temp_path.to_string_lossy(),
         quint_seed,
+        PART_STREAM_TESTS,
     );
 
     for json_fixture in glob(&format!("{}/*.itf.json", temp_path.display()))

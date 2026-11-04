@@ -1,6 +1,6 @@
 use std::path::Path;
 
-pub fn generate_test_traces(spec_rel_path: &str, gen_dir: &str, quint_seed: u64) {
+pub fn generate_test_traces(spec_rel_path: &str, gen_dir: &str, quint_seed: u64, test_match: &str) {
     println!("🪄 Generating test traces for {spec_rel_path:?}...");
 
     let spec_abs_path = format!("{}/specs/{spec_rel_path}", env!("CARGO_MANIFEST_DIR"),);
@@ -12,6 +12,8 @@ pub fn generate_test_traces(spec_rel_path: &str, gen_dir: &str, quint_seed: u64)
         .arg(format!("{gen_dir}/test_{{test}}_{{seq}}.itf.json"))
         .arg("--seed")
         .arg(quint_seed.to_string())
+        .arg("--match")
+        .arg(test_match)
         .arg(spec_path)
         .current_dir(spec_path.parent().unwrap())
         .output()
