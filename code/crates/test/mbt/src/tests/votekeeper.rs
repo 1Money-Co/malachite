@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use glob::glob;
 
 use rand::rngs::StdRng;
@@ -12,6 +14,23 @@ pub mod utils;
 use runner::VoteKeeperRunner;
 
 const RANDOM_SEED: u64 = 0x42;
+const VOTEKEEPER_TRACE_TESTS: &str = "^(synchronousConsensusTest|polkaAnyTest|polkaNilTest|\
+    skipSmallQuorumAllPrevotesTest|noSkipSmallQuorumMixedVotesSameValTest|\
+    skipSmallQuorumMixedVotesTwoValsTest|skipQuorumSinglePrevoteTest|\
+    skipQuorumSinglePrecommitTest|noSkipQuorumMixedVotesSameValTest|\
+    skipQuorumMixedVotesTwoValsTest)$";
+const VOTEKEEPER_TRACE_TEST_NAMES: [&str; 10] = [
+    "synchronousConsensusTest",
+    "polkaAnyTest",
+    "polkaNilTest",
+    "skipSmallQuorumAllPrevotesTest",
+    "noSkipSmallQuorumMixedVotesSameValTest",
+    "skipSmallQuorumMixedVotesTwoValsTest",
+    "skipQuorumSinglePrevoteTest",
+    "skipQuorumSinglePrecommitTest",
+    "noSkipQuorumMixedVotesSameValTest",
+    "skipQuorumMixedVotesTwoValsTest",
+];
 
 #[test]
 fn test_itf() {
@@ -37,12 +56,37 @@ fn test_itf() {
         "consensus/quint/tests/votekeeper/votekeeperTest.qnt",
         &temp_path.to_string_lossy(),
         quint_seed,
+        Some(VOTEKEEPER_TRACE_TESTS),
     );
 
-    for json_fixture in glob(&format!("{}/*.itf.json", temp_path.display()))
+    let json_fixtures = glob(&format!("{}/*.itf.json", temp_path.display()))
         .expect("Failed to read glob pattern")
         .flatten()
-    {
+        .collect::<Vec<_>>();
+    assert_eq!(
+        json_fixtures.len(),
+        VOTEKEEPER_TRACE_TEST_NAMES.len(),
+        "Quint must generate one trace for each selected vote-keeper scenario"
+    );
+    let generated_tests = json_fixtures
+        .iter()
+        .map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".itf.json"))
+                .and_then(|name| name.strip_prefix("test_"))
+                .and_then(|name| name.rsplit_once('_'))
+                .map(|(test_name, _)| test_name)
+                .expect("Quint trace filename must identify its test")
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        generated_tests,
+        VOTEKEEPER_TRACE_TEST_NAMES.into_iter().collect(),
+        "Quint must generate exactly the selected vote-keeper scenarios"
+    );
+
+    for json_fixture in json_fixtures {
         println!("🚀 Running trace {json_fixture:?}");
 
         let json = std::fs::read_to_string(&json_fixture).unwrap();
