@@ -35,9 +35,9 @@ the approved implementation plan. Evidence remains pending until its command pas
 | `sync-restored-height-startup` | No | Yes | No | Retain; startup characterized | E4 | G4 |
 | `sync-delayed-stale-and-partial-responses` | Partial | Yes | Partial | Retain; lifecycle characterized | E4 | G5 |
 | `sync-capacity-diagnostics` | No | Yes | No | Retain; snapshot characterized | E4 | G6 |
-| `consensus-request-errors` | Yes | Yes | Yes | Reconcile in Task 6 | Pending | G7 |
+| `consensus-request-errors` | Yes | Yes | Yes | Retain; exact variants pinned | E6 | G7 |
 | `wal-entry-height` | Yes | Yes | Yes | Retain; both baselines pinned | E3 | G8 |
-| `rc3-logging-context` | Partial | Partial | Yes | Reconcile in Task 6 | Pending | G9 |
+| `rc3-logging-context` | Partial | Partial | Yes | Reconciled; context audited | E6 | G9 |
 
 ### Evidence
 
@@ -52,6 +52,8 @@ the approved implementation plan. Evidence remains pending until its command pas
   and the complete value-sync scenario set.
 - **E5:** after the rc.3 merge, `cargo check --workspace --all-targets --all-features` passed, every E2–E4 focused
   command passed, and the combined WAL/value-sync integration run passed all 22 scenarios without retry.
+- **E6:** `cargo test -p informalsystems-malachitebft-app-channel --test consensus_request` pins `Closed`, `Full`,
+  and `Recv`; the E4 lifecycle suite pins capacity state and control flow after the logging reconciliation.
 
 ### Retirement gates
 
@@ -65,6 +67,16 @@ the approved implementation plan. Evidence remains pending until its command pas
 - **G8:** Emerald-encoded WAL and redb/history fixtures restart safely on the replacement engine in the Emerald
   follow-up.
 - **G9:** replacement logs retain required severity and structured context without changing control flow.
+
+### rc.3 diagnostic policy
+
+- Prevote, precommit, rebroadcast, and sync request timeouts use rc.3's informational severity.
+- Wrong-peer, wrong-range, and wrong-certificate responses remain warnings and preserve scoring and retry behavior.
+- Saturated sync capacity reports inflight and pending height counts, both lowest starts, and the local tip from one
+  immutable snapshot; the log also retains request counts, the requested height count, and the configured maximum.
+- WAL append, reset, flush, and reply failures remain errors with their causes. Consensus request send and receive
+  failures likewise remain errors while returning the exact `Closed`, `Full`, or `Recv` variant.
+- These logging decisions do not change return values, coroutine resumption, peer scoring, or retry state.
 
 ## Value-sync startup recovery
 
