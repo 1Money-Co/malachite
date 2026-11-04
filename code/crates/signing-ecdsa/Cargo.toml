@@ -36,5 +36,13 @@ base64 = { workspace = true, optional = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 
+[[example]]
+name = "known_answer_fixtures"
+required-features = ["serde", "k256", "p256", "p384"]
+
+[[test]]
+name = "known_answers"
+required-features = ["serde", "k256", "p256", "p384"]
+
 [lints]
 workspace = true

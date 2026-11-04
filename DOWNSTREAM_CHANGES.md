@@ -25,7 +25,7 @@ the approved implementation plan. Evidence remains pending until its command pas
 
 | Behavior | Production | Current fork | Circle rc.3 | Decision | Evidence | Gate |
 | --- | --- | --- | --- | --- | --- | --- |
-| `ecdsa-signing-and-serialization` | Yes | Yes | No | Reconcile in Task 2 | Pending | G1 |
+| `ecdsa-signing-and-serialization` | Yes | Yes | No | Retain; production bytes pinned | E2 | G1 |
 | `sync-response-size-bound` | Yes | Yes | Yes | Reconcile in Task 4 | Pending | G2 |
 | `sync-inflight-and-pending-accounting` | Yes | Yes | Partial | Reconcile in Task 4 | Pending | G3 |
 | `sync-restored-height-startup` | No | Yes | No | Reconcile in Task 4 | Pending | G4 |
@@ -34,6 +34,10 @@ the approved implementation plan. Evidence remains pending until its command pas
 | `consensus-request-errors` | Yes | Yes | Yes | Reconcile in Task 6 | Pending | G7 |
 | `wal-entry-height` | Yes | Yes | Yes | Reconcile in Task 3 | Pending | G8 |
 | `rc3-logging-context` | Partial | Partial | Yes | Reconcile in Task 6 | Pending | G9 |
+
+### Evidence
+
+- **E2:** `cargo test -p informalsystems-malachitebft-signing-ecdsa --all-features --test known_answers`
 
 ### Retirement gates
 
