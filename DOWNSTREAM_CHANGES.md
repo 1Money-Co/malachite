@@ -32,12 +32,15 @@ the approved implementation plan. Evidence remains pending until its command pas
 | `sync-delayed-stale-and-partial-responses` | Partial | Yes | Partial | Reconcile in Task 4 | Pending | G5 |
 | `sync-capacity-diagnostics` | No | Yes | No | Reconcile in Task 4 | Pending | G6 |
 | `consensus-request-errors` | Yes | Yes | Yes | Reconcile in Task 6 | Pending | G7 |
-| `wal-entry-height` | Yes | Yes | Yes | Reconcile in Task 3 | Pending | G8 |
+| `wal-entry-height` | Yes | Yes | Yes | Retain; both baselines pinned | E3 | G8 |
 | `rc3-logging-context` | Partial | Partial | Yes | Reconcile in Task 6 | Pending | G9 |
 
 ### Evidence
 
 - **E2:** `cargo test -p informalsystems-malachitebft-signing-ecdsa --all-features --test known_answers`
+- **E3:** `cargo test -p informalsystems-malachitebft-test --test unit wal_compatibility`
+  and `cargo test -p informalsystems-malachitebft-core-consensus --test wal_height`
+  plus `cargo nextest run -p informalsystems-malachitebft-test --test it wal`
 
 ### Retirement gates
 
@@ -48,7 +51,8 @@ the approved implementation plan. Evidence remains pending until its command pas
 - **G5:** delayed, stale, partial, unsolicited, and wrong-peer responses preserve retry and scoring behavior.
 - **G6:** replacement diagnostics retain inflight and pending counts, lowest starts, and the local tip.
 - **G7:** application requests retain distinct closed, full, and dropped-response failures.
-- **G8:** Emerald-generated WAL and redb/history fixtures restart safely on the replacement engine.
+- **G8:** Emerald-encoded WAL and redb/history fixtures restart safely on the replacement engine in the Emerald
+  follow-up.
 - **G9:** replacement logs retain required severity and structured context without changing control flow.
 
 ## Value-sync startup recovery
