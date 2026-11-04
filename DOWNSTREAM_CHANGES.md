@@ -37,7 +37,7 @@ the approved implementation plan. Evidence remains pending until its command pas
 | `sync-capacity-diagnostics` | No | Yes | No | Retain; snapshot characterized | E4 | G6 |
 | `consensus-request-errors` | Yes | Yes | Yes | Retain; exact variants pinned | E6 | G7 |
 | `wal-entry-height` | Yes | Yes | Yes | Retain; both baselines pinned | E3 | G8 |
-| `rc3-logging-context` | Partial | Partial | Yes | Reconciled; context audited | E6 | G9 |
+| `rc3-logging-context` | Partial | Partial | Yes | Adapt; rc.3 severity plus fork context | E6 | G9 |
 
 ### Evidence
 
@@ -77,6 +77,29 @@ the approved implementation plan. Evidence remains pending until its command pas
 - WAL append, reset, flush, and reply failures remain errors with their causes. Consensus request send and receive
   failures likewise remain errors while returning the exact `Closed`, `Full`, or `Recv` variant.
 - These logging decisions do not change return values, coroutine resumption, peer scoring, or retry state.
+
+### Pending Emerald qualification
+
+This Malachite reconciliation does not complete application integration or production qualification. The Emerald
+follow-up must still:
+
+- pin the exact candidate Malachite revision;
+- run Emerald's k256 address and signed-byte compatibility fixtures against that pin;
+- prove application WAL plus redb/history restart compatibility;
+- rehearse mixed-version validator operation and rolling replacement; and
+- complete the separate production promotion decision and rollout.
+
+Until those steps pass, the fork remains required and this candidate must not be described as production-qualified.
+
+### Local validation record
+
+- `cargo all-tests`: 281 tests ran; 279 passed, 12 were skipped, and two Starknet part-streaming MBT tests failed
+  because the external `quint` executable is not installed. Both failures reproduced the development-base limitation.
+- `cargo lint`: blocked by the existing `derivable_impls` finding in `config` and two existing `type_complexity`
+  findings in `sync` under the installed nightly toolchain.
+- `cargo clippy --tests -- -D warnings`: blocked by the same three existing findings.
+- `cargo +nightly fmt --all --check`: passed.
+- The focused E2–E6 commands passed, including all 22 post-merge WAL/value-sync scenarios without retry.
 
 ## Value-sync startup recovery
 
