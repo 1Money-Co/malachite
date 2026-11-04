@@ -538,7 +538,7 @@ async fn on_received_proposal_part(
 
     // The `part` sequence number must be for the first `ProposalPart` in `parts`.
     // So we start with this sequence and we increment for the debug log.
-    let mut sequence = part.sequence;
+    let sequence = part.sequence;
     let stream_id = part.stream_id;
 
     if parts.height < state.height {
@@ -556,7 +556,7 @@ async fn on_received_proposal_part(
 
     // Emitted parts are stored and simulated (if it is tx)
     // When finish part is stored, proposal value is built from all of them
-    for part in parts.parts {
+    for (sequence, part) in (sequence..).zip(parts.parts) {
         debug!(
             part.sequence = %sequence,
             part.height = %parts.height,
@@ -576,8 +576,6 @@ async fn on_received_proposal_part(
 
             break;
         }
-
-        sequence += 1;
     }
 
     Ok(())

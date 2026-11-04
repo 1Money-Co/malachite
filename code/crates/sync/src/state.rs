@@ -8,6 +8,10 @@ use crate::handle::excise_height;
 use crate::scoring::{ema, PeerScorer, Strategy};
 use crate::{Config, OutboundRequestId, Status};
 
+type PendingConsensusRequest<H> = (Vec<RangeInclusive<H>>, PeerId);
+type PendingConsensusRequestMatch<'a, H> =
+    (OutboundRequestId, PeerId, &'a mut Vec<RangeInclusive<H>>);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeightAllowanceSnapshot<H> {
     pub inflight_heights: u64,
@@ -44,7 +48,7 @@ where
     /// for heights [10..14] and [16..20].
     /// To tackle the above, we store a vec of ranges instead of a single range of heights.
     pub pending_consensus_requests:
-        BTreeMap<OutboundRequestId, (Vec<RangeInclusive<Ctx::Height>>, PeerId)>,
+        BTreeMap<OutboundRequestId, PendingConsensusRequest<Ctx::Height>>,
 
     /// The set of peers we are connected to in order to get values, certificates and votes.
     pub peers: BTreeMap<PeerId, Status<Ctx>>,
@@ -161,11 +165,7 @@ where
     pub fn get_pending_consensus_request_id_by(
         &mut self,
         height: Ctx::Height,
-    ) -> Option<(
-        OutboundRequestId,
-        PeerId,
-        &mut Vec<RangeInclusive<Ctx::Height>>,
-    )> {
+    ) -> Option<PendingConsensusRequestMatch<'_, Ctx::Height>> {
         self.pending_consensus_requests.iter_mut().find_map(
             |(request_id, (ranges, stored_peer_id))| {
                 if ranges.iter().any(|range| range.contains(&height)) {
