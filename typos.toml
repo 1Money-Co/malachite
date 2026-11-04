@@ -2,6 +2,8 @@
 extend-ignore-identifiers-re = []
 
 [default.extend-identifiers]
+bd210ba = "bd210ba"
+eb2405ba = "eb2405ba"
 
 [default.extend-words]
 crate = "crate"
