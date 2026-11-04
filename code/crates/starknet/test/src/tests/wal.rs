@@ -58,7 +58,7 @@ async fn proposer_crashes_after_proposing() {
                     "Proposer just equivocated: expected {:?}, got {:?}",
                     first_value.value,
                     value.value
-                )
+                );
             }
         })
         .success();
@@ -106,7 +106,7 @@ async fn non_proposer_crashes_after_voting() {
         // Check that it is the same value as the first time
         .on_vote(|vote, state| {
             let Some(first_vote) = state.first_vote.as_ref() else {
-                bail!("Non-proposer did not vote")
+                bail!("Non-proposer did not vote");
             };
 
             if first_vote.block_hash == vote.block_hash {
@@ -117,7 +117,7 @@ async fn non_proposer_crashes_after_voting() {
                     "Non-proposer just equivocated: expected {:?}, got {:?}",
                     first_vote.block_hash,
                     vote.block_hash
-                )
+                );
             }
         })
         .success();
