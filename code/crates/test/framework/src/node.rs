@@ -161,7 +161,7 @@ where
             info!("Replaying WAL at height {height} with {count} messages");
 
             if height.as_u64() != at_height {
-                bail!("Unexpected WAL replay at height {height}, expected {at_height}")
+                bail!("Unexpected WAL replay at height {height}, expected {at_height}");
             }
 
             Ok(HandlerResult::ContinueTest)
@@ -182,18 +182,18 @@ where
             let (height, round) = (msg.height(), msg.round());
 
             if height.as_u64() != at_height {
-                bail!("Unexpected vote rebroadcast for height {height}, expected {at_height}")
+                bail!("Unexpected vote rebroadcast for height {height}, expected {at_height}");
             }
 
             if round.as_u32() != Some(at_round) {
-                bail!("Unexpected vote rebroadcast for round {round}, expected {at_round}")
+                bail!("Unexpected vote rebroadcast for round {round}, expected {at_round}");
             }
 
             if vote_type != msg.vote_type() {
                 bail!(
                     "Unexpected vote type {vote_type:?}, expected {:?}",
                     msg.vote_type()
-                )
+                );
             }
 
             info!(%height, %round, ?vote_type, "Rebroadcasted vote");
@@ -215,11 +215,11 @@ where
             let (height, round) = (msg.height, msg.round);
 
             if height.as_u64() != at_height {
-                bail!("Unexpected round certificate rebroadcast for height {height}, expected {at_height}")
+                bail!("Unexpected round certificate rebroadcast for height {height}, expected {at_height}");
             }
 
             if round.as_u32() != Some(at_round) {
-                bail!("Unexpected round certificate rebroadcast for round {round}, expected {at_round}")
+                bail!("Unexpected round certificate rebroadcast for round {round}, expected {at_round}");
             }
 
             info!(%height, %round, "Rebroadcasted round certificate");
@@ -237,11 +237,11 @@ where
             let (height, round) = (msg.height, msg.round);
 
             if height.as_u64() != at_height {
-                bail!("Unexpected round certificate broadcast for height {height}, expected {at_height}")
+                bail!("Unexpected round certificate broadcast for height {height}, expected {at_height}");
             }
 
             if round.as_u32() != Some(at_round) {
-                bail!("Unexpected round certificate broadcast for round {round}, expected {at_round}")
+                bail!("Unexpected round certificate broadcast for round {round}, expected {at_round}");
             }
 
             info!(%height, %round, "Broadcasted skip round certificate");
@@ -259,11 +259,11 @@ where
             let (height, round) = (msg.height, msg.round);
 
             if height.as_u64() != at_height {
-                bail!("Unexpected round certificate rebroadcast for height {height}, expected {at_height}")
+                bail!("Unexpected round certificate rebroadcast for height {height}, expected {at_height}");
             }
 
             if round.as_u32() != Some(at_round) {
-                bail!("Unexpected round certificate rebroadcast for round {round}, expected {at_round}")
+                bail!("Unexpected round certificate rebroadcast for round {round}, expected {at_round}");
             }
 
             info!(%height, %round, "Broadcasted round certificate");
