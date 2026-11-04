@@ -129,8 +129,7 @@ Until those steps pass, the fork remains required and this candidate must not be
 
 ### Local validation record
 
-- `env RUST_LOG=warn cargo all-tests`: 281 tests passed and 12 were skipped in 1,162.008 seconds. The discovery-disabled
-  topology test passed on its configured retry.
+- `env RUST_LOG=warn cargo all-tests`: 282 tests passed and 12 were skipped in 1,147.663 seconds.
 - Quint 0.33.1 emits traces for imported-module tests; the Starknet part-stream generator filters to its four intended
   scenarios, and both random and specified MBT tests pass.
 - `cargo lint`: passed.
