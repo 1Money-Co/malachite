@@ -18,6 +18,10 @@ Development starts at `eb2405ba`; production compatibility starts at `bcac2b2d`.
 engineering checkpoints and provenance anchors, not separate production deployments. The target remains a maintained
 1Money fork until later phases satisfy every retirement gate.
 
+The reconciliation merge includes the exact rc.3 commit in branch ancestry. Conflict resolution retains the fork's
+ECDSA crate and separate inflight/pending value-sync architecture, while accepting compatible rc.3 lifecycle,
+reconnection, workflow, and logging changes. This does not retire the fork or qualify the result for production.
+
 ### Behavior inventory
 
 `Partial` means the source contains some of the behavior but not the complete downstream invariant. Tasks refer to
@@ -46,6 +50,8 @@ the approved implementation plan. Evidence remains pending until its command pas
   The unit suite covers restored startup, saturated inflight/pending accounting and diagnostics, and delayed, stale,
   partial, unsolicited, and wrong-peer responses. The integration suite covers the exact encoded response-size bound
   and the complete value-sync scenario set.
+- **E5:** after the rc.3 merge, `cargo check --workspace --all-targets --all-features` passed, every E2–E4 focused
+  command passed, and the combined WAL/value-sync integration run passed all 22 scenarios without retry.
 
 ### Retirement gates
 

@@ -748,6 +748,43 @@ pub async fn invalid_values() {
 }
 
 #[tokio::test]
+pub async fn validator_persistent_peer_reconnection_discovery_enabled() {
+    const HEIGHT: u64 = 10;
+
+    let mut test = TestBuilder::<()>::new();
+
+    for _ in 0..3 {
+        test.add_node()
+            .with_voting_power(10)
+            .start()
+            .wait_until(HEIGHT)
+            .crash()
+            .restart_after(Duration::from_secs(3))
+            .wait_until(HEIGHT + 5)
+            .success();
+    }
+
+    test.add_node()
+        .with_voting_power(5)
+        .start_after(1, Duration::from_secs(12))
+        .wait_until(HEIGHT + 5)
+        .success();
+
+    test.build()
+        .run_with_params(
+            Duration::from_secs(30),
+            TestParams {
+                enable_value_sync: true,
+                parallel_requests: 3,
+                enable_discovery: true,
+                exclude_from_persistent_peers: vec![4],
+                ..Default::default()
+            },
+        )
+        .await
+}
+
+#[tokio::test]
 pub async fn validator_persistent_peer_reconnection_discovery_disabled() {
     const HEIGHT: u64 = 10;
 
