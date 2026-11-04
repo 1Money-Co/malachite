@@ -35,9 +35,37 @@ the approved implementation plan. Evidence remains pending until its command pas
 | `sync-restored-height-startup` | No | Yes | No | Retain; startup characterized | E4 | G4 |
 | `sync-delayed-stale-and-partial-responses` | Partial | Yes | Partial | Retain; lifecycle characterized | E4 | G5 |
 | `sync-capacity-diagnostics` | No | Yes | No | Retain; snapshot characterized | E4 | G6 |
+| `sync-network-subscription-order` | Yes | Yes | No | Retain; consensus wiring precedes subscribe | E7 | G10 |
+| `consensus-sync-input-queue` | Yes | Yes | No | Retain; dedicated queue and metrics | E7 | G11 |
 | `consensus-request-errors` | Yes | Yes | Yes | Retain; exact variants pinned | E6 | G7 |
 | `wal-entry-height` | Yes | Yes | Yes | Retain; both baselines pinned | E3 | G8 |
 | `rc3-logging-context` | Partial | Partial | Yes | Adapt; rc.3 severity plus fork context | E6 | G9 |
+
+### Provenance and implementation equivalence
+
+- `ecdsa-signing-and-serialization`: `bcac2b2` (fork PR #23). The candidate retains the same crate/API and proves
+  production key, public-key, signature, JSON decoding, and verification bytes; Emerald codecs remain G1 work.
+- `sync-response-size-bound`: `5aac42b`, refined by `25c111a` and `81be837`. The candidate retains the encoded-byte
+  bound before transport and characterizes the exact accepted boundary; a replacement must meet G2.
+- `sync-inflight-and-pending-accounting`: `46a7b11`, building on `fefef41`. The candidate retains distinct network
+  inflight and consensus-pending ranges rather than adopting a later queue model; G3 requires equivalent capacity.
+- `sync-restored-height-startup`: `36c1bc5`. The candidate retains the startup guard unchanged and characterizes
+  status- and tick-triggered requests; G4 requires the same restored-tip ordering.
+- `sync-delayed-stale-and-partial-responses`: `b4428a3`, `94cb854`, and `d9dadcf`. The candidate preserves original
+  request validation, prefix trimming, retry, and scoring semantics; G5 covers replacement equivalence.
+- `sync-capacity-diagnostics`: `bd210ba`. The candidate implements the same fields from one immutable snapshot;
+  G6 requires both counts, both lowest starts, and the local tip.
+- `sync-network-subscription-order`: `aa2908d`. The candidate retains delayed network subscription until the
+  consensus actor is installed, as exercised by E7; G10 requires the same actor-wiring order.
+- `consensus-sync-input-queue`: `2789d7e`, with sync-first draining and metrics from `5695730`. The candidate keeps
+  the dedicated bounded queue, sync-first ordering, and both gauges; G11 requires equivalent isolation and metrics.
+- `consensus-request-errors`: Circle `758bce1` / #1226. The candidate accepts rc.3 behavior without adaptation and
+  pins all three public variants through E6; G7 prevents collapsing them later.
+- `wal-entry-height`: Circle `a07b0dc` / #1233 plus fork E3 fixtures. The candidate accepts the rc.3 height fix while
+  proving both source WALs decode canonically and the production fixture replays without a conflicting vote; G8
+  remains application-specific.
+- `rc3-logging-context`: Circle `4de3493` / #1230 plus the fork diagnostic policy below. The candidate adapts rc.3
+  severity while retaining downstream context and control flow; G9 defines replacement equivalence.
 
 ### Evidence
 
@@ -45,6 +73,8 @@ the approved implementation plan. Evidence remains pending until its command pas
 - **E3:** `cargo test -p informalsystems-malachitebft-test --test unit wal_compatibility`
   and `cargo test -p informalsystems-malachitebft-core-consensus --test wal_height`
   plus `cargo nextest run -p informalsystems-malachitebft-test --test it wal`
+  prove canonical decoding, fixture-backed replay without a conflicting historical vote, height selection, restart,
+  and crash recovery.
 - **E4:** `cargo test -p informalsystems-malachitebft-test --test unit sync_lifecycle`
   and `cargo nextest run -p informalsystems-malachitebft-test --test it value_sync`.
   The unit suite covers restored startup, saturated inflight/pending accounting and diagnostics, and delayed, stale,
@@ -54,6 +84,8 @@ the approved implementation plan. Evidence remains pending until its command pas
   command passed, and the combined WAL/value-sync integration run passed all 22 scenarios without retry.
 - **E6:** `cargo test -p informalsystems-malachitebft-app-channel --test consensus_request` pins `Closed`, `Full`,
   and `Recv`; the E4 lifecycle suite pins capacity state and control flow after the logging reconciliation.
+- **E7:** `cargo nextest run -p informalsystems-malachitebft-test --test it value_sync` exercises the retained sync
+  actor wiring and dedicated consensus sync queue end to end; `cargo all-tests` also covers the Starknet host path.
 
 ### Retirement gates
 
@@ -67,6 +99,10 @@ the approved implementation plan. Evidence remains pending until its command pas
 - **G8:** Emerald-encoded WAL and redb/history fixtures restart safely on the replacement engine in the Emerald
   follow-up.
 - **G9:** replacement logs retain required severity and structured context without changing control flow.
+- **G10:** a replacement installs the consensus actor before subscribing to sync network events and cannot silently
+  lose an early value response.
+- **G11:** a replacement retains a bounded dedicated sync-input queue, sync-first draining, and separate height and
+  input-count gauges.
 
 ### rc.3 diagnostic policy
 

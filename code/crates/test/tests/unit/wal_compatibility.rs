@@ -4,12 +4,21 @@ use std::path::{Path, PathBuf};
 use bytes::Bytes;
 use eyre::{bail, eyre, Result};
 use informalsystems_malachitebft_test::codec::proto::ProtobufCodec;
-use informalsystems_malachitebft_test::{Address, Height, TestContext, ValueId};
+use informalsystems_malachitebft_test::utils::validators::make_validators;
+use informalsystems_malachitebft_test::{
+    Address, Height, Signature, TestContext, ValidatorSet, ValueId, Vote,
+};
 use malachitebft_app::engine::wal::{log_entries, Msg, Wal, WalEntry};
-use malachitebft_app::metrics::SharedRegistry;
+use malachitebft_app::metrics::{Metrics, SharedRegistry};
 use malachitebft_app::wal::Log;
-use malachitebft_core_consensus::{ProposedValue, SignedConsensusMsg};
-use malachitebft_core_types::{NilOrVal, Round, Timeout, TimeoutKind, Validity, Vote as _};
+use malachitebft_core_consensus as consensus;
+use malachitebft_core_consensus::{
+    Effect, Input, Params, ProposedValue, Resumable, Resume, SignedConsensusMsg, State,
+};
+use malachitebft_core_types::{
+    NilOrVal, Round, SignedMessage, Timeout, TimeoutKind, Validity, ValueOrigin, ValuePayload,
+    Vote as _,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -118,6 +127,125 @@ fn assert_entries(entries: &[WalEntry<TestContext>]) {
         Bytes::from_static(b"wal-compatibility-v1")
     );
     assert_eq!(validity, &Validity::Valid);
+}
+
+fn process_replay_input(
+    state: &mut State<TestContext>,
+    input: Input<TestContext>,
+    metrics: &Metrics,
+    signed_votes: &mut Vec<Vote>,
+) {
+    let processed: Result<(), consensus::Error<TestContext>> = consensus::process!(
+        input: input,
+        state: state,
+        metrics: metrics,
+        with: effect => {
+            #[allow(unreachable_patterns)]
+            let result: Result<Resume<TestContext>, consensus::Error<TestContext>> = match effect {
+                Effect::SignVote(vote, resume) => {
+                    signed_votes.push(vote.clone());
+                    Ok(resume.resume_with(SignedMessage::new(vote, Signature::test())))
+                }
+                Effect::SignProposal(proposal, resume) => Ok(resume.resume_with(
+                    SignedMessage::new(proposal, Signature::test()),
+                )),
+                Effect::VerifySignature(_, _, resume) => Ok(resume.resume_with(true)),
+                Effect::ExtendVote(_, _, _, resume) => Ok(resume.resume_with(None)),
+                Effect::VerifyVoteExtension(_, _, _, _, _, resume) => {
+                    Ok(resume.resume_with(Ok(())))
+                }
+                Effect::VerifyCommitCertificate(_, _, _, resume)
+                | Effect::VerifyPolkaCertificate(_, _, _, resume)
+                | Effect::VerifyRoundCertificate(_, _, _, resume) => {
+                    Ok(resume.resume_with(Ok(())))
+                }
+                Effect::ResetTimeouts(resume)
+                | Effect::CancelAllTimeouts(resume)
+                | Effect::PublishConsensusMsg(_, resume)
+                | Effect::PublishLivenessMsg(_, resume)
+                | Effect::RepublishVote(_, resume)
+                | Effect::RepublishRoundCertificate(_, resume)
+                | Effect::WalAppend(_, _, resume) => Ok(resume.resume_with(())),
+                Effect::CancelTimeout(_, resume)
+                | Effect::ScheduleTimeout(_, resume) => Ok(resume.resume_with(())),
+                Effect::StartRound(_, _, _, _, resume) => Ok(resume.resume_with(())),
+                Effect::GetValue(_, _, _, resume) => Ok(resume.resume_with(())),
+                Effect::RestreamProposal(_, _, _, _, _, resume) => Ok(resume.resume_with(())),
+                Effect::ValidSyncValue(_, _, resume) => Ok(resume.resume_with(())),
+                Effect::InvalidSyncValue(_, _, _, resume) => Ok(resume.resume_with(())),
+                Effect::Decide(_, _, resume) => Ok(resume.resume_with(())),
+                other => panic!("unexpected replay effect: {other:?}"),
+            };
+            result
+        }
+    );
+    processed.expect("process replayed WAL input");
+}
+
+#[test]
+fn production_wal_fixture_replays_without_conflicting_vote() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let fixture_path = materialize_fixture(directory.path(), PRODUCTION_WAL, "fixture.log")?;
+    let entries = read_fixture(&fixture_path)?;
+    assert_entries(&entries);
+
+    let WalEntry::ConsensusMsg(SignedConsensusMsg::Vote(historical_vote)) = &entries[0] else {
+        panic!("first entry is not a signed vote");
+    };
+    let historical_vote = historical_vote.message.clone();
+
+    let [(mut validator, _private_key)] = make_validators([1]);
+    validator.address = historical_vote.validator_address;
+    let validator_set = ValidatorSet::new([validator]);
+    let params = Params {
+        initial_height: Height::new(historical_vote.height.as_u64() - 1),
+        initial_validator_set: validator_set.clone(),
+        address: historical_vote.validator_address,
+        threshold_params: Default::default(),
+        value_payload: ValuePayload::ProposalAndParts,
+        enabled: true,
+    };
+    let mut state = State::new(TestContext::new(), params, 32);
+    let metrics = Metrics::default();
+    let mut signed_votes = Vec::new();
+
+    process_replay_input(
+        &mut state,
+        Input::StartHeight(historical_vote.height, validator_set, false),
+        &metrics,
+        &mut signed_votes,
+    );
+    for entry in entries {
+        let input = match entry {
+            WalEntry::ConsensusMsg(SignedConsensusMsg::Vote(vote)) => Input::Vote(vote),
+            WalEntry::ConsensusMsg(SignedConsensusMsg::Proposal(proposal)) => {
+                Input::Proposal(proposal)
+            }
+            WalEntry::Timeout(timeout) => Input::TimeoutElapsed(timeout),
+            WalEntry::ProposedValue(value) => Input::ProposedValue(value, ValueOrigin::Consensus),
+        };
+        process_replay_input(&mut state, input, &metrics, &mut signed_votes);
+    }
+
+    assert_eq!(state.height(), historical_vote.height);
+    assert!(
+        state.round() >= historical_vote.round,
+        "fixture replay must advance consensus through the historical round"
+    );
+
+    for signed_vote in signed_votes {
+        if signed_vote.height == historical_vote.height
+            && signed_vote.round == historical_vote.round
+            && signed_vote.typ == historical_vote.typ
+        {
+            assert_eq!(
+                signed_vote.value, historical_vote.value,
+                "WAL replay must not sign a conflicting historical vote"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 async fn assert_fixture(bytes: &[u8], manifest_json: &str, expected_source: &str) -> Result<()> {

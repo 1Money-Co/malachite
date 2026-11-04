@@ -34,6 +34,9 @@ fn assert_known_answer<C: CurveConfig>(fixture: &Fixture, expected_private_key: 
         serde_json::to_string(&private_key).unwrap(),
         fixture.private_key_json
     );
+    let decoded_private: PrivateKey<C> =
+        serde_json::from_str(&fixture.private_key_json).expect("decode fixture private key JSON");
+    assert_eq!(decoded_private.to_vec(), fixture.private_key);
 
     let public_key = private_key.public_key();
     assert_eq!(public_key.to_vec(), fixture.public_key);
@@ -41,6 +44,9 @@ fn assert_known_answer<C: CurveConfig>(fixture: &Fixture, expected_private_key: 
         serde_json::to_string(&public_key).unwrap(),
         fixture.public_key_json
     );
+    let decoded_public_json: PublicKey<C> =
+        serde_json::from_str(&fixture.public_key_json).expect("decode fixture public key JSON");
+    assert_eq!(decoded_public_json.to_vec(), fixture.public_key);
 
     let signature = private_key.sign(MESSAGE);
     assert_eq!(signature.to_vec(), fixture.signature);
@@ -48,6 +54,12 @@ fn assert_known_answer<C: CurveConfig>(fixture: &Fixture, expected_private_key: 
         serde_json::to_string(&signature).unwrap(),
         fixture.signature_json
     );
+    let decoded_signature_json: Signature<C> =
+        serde_json::from_str(&fixture.signature_json).expect("decode fixture signature JSON");
+    assert_eq!(decoded_signature_json.to_vec(), fixture.signature);
+    decoded_public_json
+        .verify(MESSAGE, &decoded_signature_json)
+        .expect("JSON-decoded fixture signature verifies");
 
     let decoded_public =
         PublicKey::<C>::from_sec1_bytes(&fixture.public_key).expect("decode fixture public key");
