@@ -715,14 +715,17 @@ where
         let asking_for_how_many_heights = range.end().as_u64() - range.start().as_u64() + 1;
         if current_number_of_heights + asking_for_how_many_heights > max_heights {
             let snapshot = height_allowance_snapshot(state);
+            let lowest_inflight_start =
+                snapshot.lowest_inflight_start.map(|height| height.as_u64());
+            let lowest_pending_start = snapshot.lowest_pending_start.map(|height| height.as_u64());
 
             info!(
                 height.tip = %snapshot.tip_height,
                 %current_number_of_heights,
                 inflight_heights = %snapshot.inflight_heights,
                 pending_consensus_heights = %snapshot.pending_heights,
-                lowest_inflight_start = ?snapshot.lowest_inflight_start,
-                lowest_pending_start = ?snapshot.lowest_pending_start,
+                ?lowest_inflight_start,
+                ?lowest_pending_start,
                 inflight_requests = state.inflight_requests.len(),
                 pending_consensus_requests = state.pending_consensus_requests.len(),
                 %asking_for_how_many_heights,
