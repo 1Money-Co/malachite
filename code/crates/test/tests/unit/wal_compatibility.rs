@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use bytes::Bytes;
 use eyre::{bail, eyre, Result};
@@ -317,7 +318,10 @@ async fn repeated_started_height_returns_no_replay_entries() -> Result<()> {
         .success_or(eyre!("WAL Flush call failed"))??;
 
     let repeated = wal
-        .call(|reply| Msg::StartedHeight(Height::new(7), reply), None)
+        .call(
+            |reply| Msg::StartedHeight(Height::new(7), reply),
+            Some(Duration::from_secs(1)),
+        )
         .await?
         .success_or(eyre!("repeated WAL StartedHeight call failed"))??;
     assert!(repeated.is_none());
