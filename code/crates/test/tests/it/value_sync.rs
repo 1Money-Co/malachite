@@ -2,13 +2,19 @@ use crate::{TestBuilder, TestParams};
 use bytes::Bytes;
 use bytesize::ByteSize;
 use eyre::bail;
+use informalsystems_malachitebft_test::codec::json::JsonCodec;
 use informalsystems_malachitebft_test::decided_value::DecidedValue;
 use informalsystems_malachitebft_test::middleware::{Middleware, RotateEpochValidators};
 use informalsystems_malachitebft_test::TestContext;
-use informalsystems_malachitebft_test::{Height, Value, ValueId};
+use informalsystems_malachitebft_test::{Address, Height, PrivateKey, Value, ValueId, Vote};
+use malachitebft_codec::{Codec, HasEncodedLen};
 use malachitebft_config::ValuePayload;
 use malachitebft_core_consensus::ProposedValue;
-use malachitebft_core_types::{CommitCertificate, Round};
+use malachitebft_core_types::{CommitCertificate, NilOrVal, Round, SignedVote};
+use malachitebft_sync::{RawDecidedValue, Response, ValueResponse};
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -516,6 +522,137 @@ pub async fn response_size_limit_exceeded() {
         .await
 }
 
+struct BoundaryDecidedValues {
+    signers: Vec<(Address, PrivateKey)>,
+}
+
+impl fmt::Debug for BoundaryDecidedValues {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BoundaryDecidedValues")
+            .field("signers", &self.signers.len())
+            .finish()
+    }
+}
+
+impl BoundaryDecidedValues {
+    fn new() -> Self {
+        let mut rng = StdRng::seed_from_u64(0x42);
+        let signers = (0..2)
+            .map(|_| {
+                let private_key = PrivateKey::generate(&mut rng);
+                (
+                    Address::from_public_key(&private_key.public_key()),
+                    private_key,
+                )
+            })
+            .collect();
+        Self { signers }
+    }
+
+    fn decided_value(&self, height: Height) -> DecidedValue {
+        let round = Round::new(0);
+        let value = Value::new(height.as_u64());
+        let value_id = value.id();
+        let commits = self
+            .signers
+            .iter()
+            .map(|(address, private_key)| {
+                let vote = Vote::new_precommit(height, round, NilOrVal::Val(value_id), *address);
+                let signature = private_key.sign(&vote.to_sign_bytes());
+                SignedVote::new(vote, signature)
+            })
+            .collect();
+
+        DecidedValue {
+            value,
+            certificate: CommitCertificate::new(height, round, value_id, commits),
+        }
+    }
+
+    fn raw_decided_value(&self, height: Height) -> RawDecidedValue<TestContext> {
+        let decided = self.decided_value(height);
+        RawDecidedValue::new(
+            JsonCodec
+                .encode(&decided.value)
+                .expect("encode decided value"),
+            decided.certificate,
+        )
+    }
+}
+
+impl Middleware for BoundaryDecidedValues {
+    fn get_decided_value(&self, height: Height) -> Option<DecidedValue> {
+        Some(self.decided_value(height))
+    }
+}
+
+#[tokio::test]
+pub async fn response_size_limit_accepts_exact_bound_and_excludes_next_value() {
+    const HEIGHT: u64 = 5;
+
+    let fixture = BoundaryDecidedValues::new();
+    let first = fixture.raw_decided_value(Height::new(1));
+    let second = fixture.raw_decided_value(Height::new(2));
+    let one_value =
+        Response::ValueResponse(ValueResponse::new(Height::new(1), vec![first.clone()]));
+    let two_values =
+        Response::ValueResponse(ValueResponse::new(Height::new(1), vec![first, second]));
+    let exact_bound = JsonCodec
+        .encoded_len(&one_value)
+        .expect("compute one-value response size");
+    assert_eq!(
+        JsonCodec
+            .encode(&one_value)
+            .expect("encode one-value response")
+            .len(),
+        exact_bound
+    );
+    assert!(
+        JsonCodec
+            .encoded_len(&two_values)
+            .expect("compute two-value response size")
+            > exact_bound
+    );
+
+    let mut test = TestBuilder::<()>::new();
+    test.add_node()
+        .with_voting_power(10)
+        .with_middleware(BoundaryDecidedValues::new())
+        .start()
+        .wait_until(HEIGHT)
+        .success();
+    test.add_node()
+        .with_voting_power(10)
+        .with_middleware(BoundaryDecidedValues::new())
+        .start()
+        .wait_until(HEIGHT)
+        .success();
+    test.add_node()
+        .with_voting_power(5)
+        .start()
+        .wait_until(2)
+        .crash()
+        .reset_db()
+        .restart_after(Duration::from_secs(5))
+        .wait_until(HEIGHT)
+        .success();
+
+    test.build()
+        .run_with_params(
+            Duration::from_secs(60),
+            TestParams {
+                enable_value_sync: true,
+                max_response_size: ByteSize::b(exact_bound as u64),
+                rpc_max_size: ByteSize::b(exact_bound as u64),
+                batch_size: 2,
+                parallel_requests: 1,
+                ..Default::default()
+            },
+        )
+        .await
+}
+
 #[derive(Debug)]
 struct InvalidDecidedValue {
     heights: Vec<Height>,
@@ -604,6 +741,43 @@ pub async fn invalid_values() {
                 parallel_requests: 3,
                 enable_discovery: true,
                 exclude_from_persistent_peers: vec![4], // Node 4 is a new validator, others don't have it as persistent peer
+                ..Default::default()
+            },
+        )
+        .await
+}
+
+#[tokio::test]
+pub async fn validator_persistent_peer_reconnection_discovery_enabled() {
+    const HEIGHT: u64 = 10;
+
+    let mut test = TestBuilder::<()>::new();
+
+    for _ in 0..3 {
+        test.add_node()
+            .with_voting_power(10)
+            .start()
+            .wait_until(HEIGHT)
+            .crash()
+            .restart_after(Duration::from_secs(3))
+            .wait_until(HEIGHT + 5)
+            .success();
+    }
+
+    test.add_node()
+        .with_voting_power(5)
+        .start_after(1, Duration::from_secs(12))
+        .wait_until(HEIGHT + 5)
+        .success();
+
+    test.build()
+        .run_with_params(
+            Duration::from_secs(30),
+            TestParams {
+                enable_value_sync: true,
+                parallel_requests: 3,
+                enable_discovery: true,
+                exclude_from_persistent_peers: vec![4],
                 ..Default::default()
             },
         )

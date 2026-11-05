@@ -1,7 +1,6 @@
 use tracing::info;
 
 use malachitebft_core_driver::Driver;
-use malachitebft_core_types::*;
 
 use crate::full_proposal::{FullProposal, FullProposalKeeper};
 use crate::input::Input;

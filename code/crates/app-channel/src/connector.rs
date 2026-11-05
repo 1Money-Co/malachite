@@ -208,11 +208,17 @@ where
                     })
                     .await?;
 
-                let next = rx.await?;
-
-                if let Err(e) = reply_to.send(next) {
-                    error!("Failed to send next height and validator set: {e}");
-                }
+                // Do not block processing of other messages while waiting for the next height
+                tokio::spawn(async move {
+                    match rx.await {
+                        Ok(next) => {
+                            if let Err(e) = reply_to.send(next) {
+                                error!("Failed to send next height and validator set: {e}");
+                            }
+                        }
+                        Err(e) => error!("Application dropped the decided reply: {e}"),
+                    }
+                });
             }
 
             HostMsg::GetDecidedValue { height, reply_to } => {
@@ -286,5 +292,150 @@ where
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::Debug;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use malachitebft_engine::host::HostMsg;
+    use malachitebft_test::{Height, TestContext, ValueId};
+    use ractor::rpc::CallResult;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt};
+    use tracing_subscriber::Layer;
+
+    use super::Connector;
+    use crate::app::metrics::Metrics;
+    use crate::app::types::core::{CommitCertificate, Round, VoteExtensions};
+    use crate::msgs::AppMsg;
+
+    #[derive(Clone, Default)]
+    struct EventRecorder(Arc<Mutex<Vec<(Level, String)>>>);
+
+    impl EventRecorder {
+        fn contains_error(&self, needle: &str) -> bool {
+            self.0
+                .lock()
+                .expect("event recorder lock poisoned")
+                .iter()
+                .any(|(level, message)| *level == Level::ERROR && message.contains(needle))
+        }
+    }
+
+    impl<S> Layer<S> for EventRecorder
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: LayerContext<'_, S>) {
+            let mut visitor = MessageVisitor::default();
+            event.record(&mut visitor);
+            if let Some(message) = visitor.message {
+                self.0
+                    .lock()
+                    .expect("event recorder lock poisoned")
+                    .push((*event.metadata().level(), message));
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct MessageVisitor {
+        message: Option<String>,
+    }
+
+    impl Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+            if field.name() == "message" {
+                self.message = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn decided_reply_is_async_and_logs_when_application_drops_it() {
+        let recorder = EventRecorder::default();
+        let subscriber = tracing_subscriber::registry().with(recorder.clone());
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let (app_tx, mut app_rx) = mpsc::channel(2);
+        let connector = Connector::<TestContext>::spawn(app_tx, Metrics::default())
+            .await
+            .expect("connector should spawn");
+
+        let decided_connector = connector.clone();
+        let decided_call = tokio::spawn(async move {
+            decided_connector
+                .call(
+                    |reply_to| HostMsg::Decided {
+                        certificate: CommitCertificate::new(
+                            Height::new(7),
+                            Round::new(2),
+                            ValueId::new(7002),
+                            Vec::new(),
+                        ),
+                        extensions: VoteExtensions::default(),
+                        reply_to,
+                    },
+                    Some(Duration::from_secs(1)),
+                )
+                .await
+        });
+
+        let decided_reply = match timeout(Duration::from_secs(1), app_rx.recv())
+            .await
+            .expect("connector should forward Decided without blocking")
+            .expect("application channel should remain open")
+        {
+            AppMsg::Decided { reply, .. } => reply,
+            other => panic!("expected Decided, got {other:?}"),
+        };
+
+        let history_connector = connector.clone();
+        let history_call = tokio::spawn(async move {
+            history_connector
+                .call(
+                    |reply_to| HostMsg::GetHistoryMinHeight { reply_to },
+                    Some(Duration::from_secs(1)),
+                )
+                .await
+        });
+
+        match timeout(Duration::from_secs(1), app_rx.recv())
+            .await
+            .expect("connector should process another message while Decided is pending")
+            .expect("application channel should remain open")
+        {
+            AppMsg::GetHistoryMinHeight { reply } => {
+                reply
+                    .send(Height::new(3))
+                    .expect("history reply receiver should remain open");
+            }
+            other => panic!("expected GetHistoryMinHeight, got {other:?}"),
+        }
+
+        let history_result = timeout(Duration::from_secs(1), history_call)
+            .await
+            .expect("history request should complete")
+            .expect("history task should not panic")
+            .expect("history actor call should not fail");
+        assert!(matches!(
+            history_result,
+            CallResult::Success(height) if height == Height::new(3)
+        ));
+
+        drop(decided_reply);
+        timeout(Duration::from_secs(1), decided_call)
+            .await
+            .expect("dropped Decided reply should finish the pending call")
+            .expect("Decided task should not panic")
+            .expect("Decided actor call should not fail");
+        assert!(recorder.contains_error("Application dropped the decided reply"));
     }
 }

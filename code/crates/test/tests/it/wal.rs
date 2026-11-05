@@ -89,7 +89,7 @@ async fn proposer_crashes_after_proposing(params: TestParams) {
                     "Proposer just equivocated: expected {:?}, got {:?}",
                     first_value.value,
                     value.value
-                )
+                );
             }
         })
         .success();
@@ -166,7 +166,7 @@ async fn non_proposer_crashes_after_voting(params: TestParams) {
         // Check that it is the for the same value as the first time
         .on_vote(|vote, state| {
             let Some(first_vote) = state.first_vote.as_ref() else {
-                bail!("Non-proposer did not vote")
+                bail!("Non-proposer did not vote");
             };
 
             if first_vote.value == vote.value {
@@ -177,7 +177,7 @@ async fn non_proposer_crashes_after_voting(params: TestParams) {
                     "Non-proposer just equivocated: expected {:?}, got {:?}",
                     first_vote.value,
                     vote.value
-                )
+                );
             }
         })
         .wait_until(CRASH_HEIGHT + 2)

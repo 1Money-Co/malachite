@@ -5,8 +5,8 @@ use informalsystems_malachitebft_test::{Height, TestContext, ValueId};
 use malachitebft_core_types::{CommitCertificate, Round};
 use malachitebft_sync::{
     co::{CoState, Gen},
-    Config, Effect, HeightStartType, Input, Metrics, OutboundRequestId, PeerId, RawDecidedValue,
-    Resume, State, Status, ValueResponse,
+    height_allowance_snapshot, Config, Effect, HeightStartType, Input, Metrics, OutboundRequestId,
+    PeerId, RawDecidedValue, Resume, State, Status, ValueResponse,
 };
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -270,6 +270,77 @@ fn received_undecided_values_still_enforce_full_height_allowance() {
         requested_ranges(&harness.apply(Input::Tick)),
         vec![Height::new(12_501)..=Height::new(13_000)]
     );
+}
+
+#[test]
+fn wrong_peer_response_keeps_original_request_and_capacity() {
+    let mut harness = Harness::new(5, 1);
+    let original_peer = PeerId::random();
+    let wrong_peer = PeerId::random();
+    harness.start(10);
+    harness.status(original_peer, 14);
+    let inflight_before = harness.state.inflight_requests.clone();
+    let (request_id, (range, stored_peer)) = inflight_before.iter().next().unwrap();
+
+    let effects = harness.apply(Input::ValueResponse(
+        request_id.clone(),
+        wrong_peer,
+        Some(response(range.start().as_u64(), range.end().as_u64())),
+    ));
+
+    assert!(forwarded(&effects).is_empty());
+    assert_eq!(*stored_peer, original_peer);
+    assert_eq!(harness.state.inflight_requests, inflight_before);
+    assert!(requested_ranges(&harness.apply(Input::Tick)).is_empty());
+}
+
+#[test]
+fn unknown_response_does_not_consume_or_release_capacity() {
+    let mut harness = Harness::new(5, 1);
+    let peer = PeerId::random();
+    harness.start(10);
+    harness.status(peer, 14);
+    let inflight_before = harness.state.inflight_requests.clone();
+    let pending_before = harness.state.pending_consensus_requests.clone();
+
+    let effects = harness.apply(Input::ValueResponse(
+        OutboundRequestId::new(999),
+        peer,
+        Some(response(10, 14)),
+    ));
+
+    assert!(forwarded(&effects).is_empty());
+    assert_eq!(harness.state.inflight_requests, inflight_before);
+    assert_eq!(harness.state.pending_consensus_requests, pending_before);
+    assert!(requested_ranges(&harness.apply(Input::Tick)).is_empty());
+}
+
+#[test]
+fn saturated_height_allowance_reports_inflight_and_pending_breakdown() {
+    let mut harness = Harness::new(500, 25);
+    let peer = PeerId::random();
+    harness.start(1);
+    harness.status(peer, 13_000);
+    let (request_id, (range, request_peer)) = harness
+        .state
+        .inflight_requests
+        .iter()
+        .next()
+        .map(|(id, request)| (id.clone(), request.clone()))
+        .unwrap();
+    harness.apply(Input::ValueResponse(
+        request_id,
+        request_peer,
+        Some(response(range.start().as_u64(), range.end().as_u64())),
+    ));
+
+    let snapshot = height_allowance_snapshot(&harness.state);
+    assert_eq!(snapshot.inflight_heights, 12_000);
+    assert_eq!(snapshot.pending_heights, 500);
+    assert_eq!(snapshot.lowest_inflight_start, Some(Height::new(501)));
+    assert_eq!(snapshot.lowest_pending_start, Some(Height::new(1)));
+    assert_eq!(snapshot.tip_height, Height::new(0));
+    assert!(requested_ranges(&harness.apply(Input::Tick)).is_empty());
 }
 
 #[test]
