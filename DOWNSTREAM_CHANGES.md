@@ -91,8 +91,8 @@ intentional fork decision rather than an omitted merge result.
   upstream implementation and its now-unused sync-to-test dev dependency are therefore rejected. E4 characterizes
   the fork lifecycle, while [41642d1][f-1211-test] retains the full-node peer-restart regression scenario.
 - **P6 — #1222:** the asynchronous `Decided` reply is accepted so the connector can process other messages while the
-  application chooses the next height. `98c7517` also reports a dropped application reply instead of silently leaving
-  consensus waiting.
+  application chooses the next height. `98c7517` also reports a dropped application reply. Consensus still waits for
+  the next height, but the stall now emits an operator-visible error.
 - **P7 — #1198:** the discovery and reconnection fix is retained through the fork adaptation; its integration
   parameters preserve downstream controls, and the value-sync peer-restart scenarios remain in E7.
 - **P8 — #1230:** the warning-level changes are adapted through the fork's diagnostic policy below rather than
@@ -231,7 +231,7 @@ Until those steps pass, the fork remains required and this candidate must not be
 
 ### Local validation record
 
-- `env RUST_LOG=warn cargo all-tests`: 282 tests passed and 12 were skipped in 1,147.663 seconds.
+- At `d1d085a0`, `env RUST_LOG=warn cargo all-tests`: 282 tests passed and 12 were skipped in 1,147.663 seconds.
 - Quint 0.33.1 emits traces for imported-module tests; the Starknet part-stream generator filters to its four intended
   scenarios, and both random and specified MBT tests pass.
 - `cargo lint`: passed.

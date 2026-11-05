@@ -190,7 +190,7 @@ The candidate must:
 - decode every production-baseline fixture without data loss;
 - preserve the expected height, round, vote, proposal, timeout, and signed-message contents;
 - re-encode to the expected bytes when the codec contract is canonical;
-- replay a valid fixture without signing a conflicting historical message; and
+- replay a valid fixture and restore its exact signed historical vote into the vote keeper; and
 - fail explicitly on corrupt or unsupported input.
 
 Retain the existing restart and crash-recovery integration tests and add the rc.2 height regression. Never make a
