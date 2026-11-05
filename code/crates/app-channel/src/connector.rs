@@ -210,10 +210,13 @@ where
 
                 // Do not block processing of other messages while waiting for the next height
                 tokio::spawn(async move {
-                    if let Ok(next) = rx.await {
-                        if let Err(e) = reply_to.send(next) {
-                            error!("Failed to send next height and validator set: {e}");
+                    match rx.await {
+                        Ok(next) => {
+                            if let Err(e) = reply_to.send(next) {
+                                error!("Failed to send next height and validator set: {e}");
+                            }
                         }
+                        Err(e) => error!("Application dropped the decided reply: {e}"),
                     }
                 });
             }

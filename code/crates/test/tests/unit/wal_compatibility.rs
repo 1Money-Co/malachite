@@ -183,7 +183,7 @@ fn process_replay_input(
 }
 
 #[test]
-fn production_wal_fixture_replays_without_conflicting_vote() -> Result<()> {
+fn production_wal_fixture_restores_historical_vote() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let fixture_path = materialize_fixture(directory.path(), PRODUCTION_WAL, "fixture.log")?;
     let entries = read_fixture(&fixture_path)?;
@@ -192,7 +192,8 @@ fn production_wal_fixture_replays_without_conflicting_vote() -> Result<()> {
     let WalEntry::ConsensusMsg(SignedConsensusMsg::Vote(historical_vote)) = &entries[0] else {
         panic!("first entry is not a signed vote");
     };
-    let historical_vote = historical_vote.message.clone();
+    let historical_signed_vote = historical_vote.clone();
+    let historical_vote = historical_signed_vote.message.clone();
 
     let [(mut validator, _private_key)] = make_validators([1]);
     validator.address = historical_vote.validator_address;
@@ -232,18 +233,22 @@ fn production_wal_fixture_replays_without_conflicting_vote() -> Result<()> {
         state.round() >= historical_vote.round,
         "fixture replay must advance consensus through the historical round"
     );
-
-    for signed_vote in signed_votes {
-        if signed_vote.height == historical_vote.height
-            && signed_vote.round == historical_vote.round
-            && signed_vote.typ == historical_vote.typ
-        {
-            assert_eq!(
-                signed_vote.value, historical_vote.value,
-                "WAL replay must not sign a conflicting historical vote"
-            );
-        }
-    }
+    let round_votes = state
+        .driver
+        .votes()
+        .per_round(historical_vote.round)
+        .expect("fixture replay must create the historical round in the vote keeper");
+    assert!(
+        round_votes
+            .received_votes()
+            .iter()
+            .any(|vote| vote == &historical_signed_vote),
+        "fixture replay must restore the exact signed historical vote"
+    );
+    assert!(
+        signed_votes.is_empty(),
+        "this fixture restores a vote but does not contain enough inputs to trigger signing"
+    );
 
     Ok(())
 }
@@ -279,6 +284,46 @@ async fn production_wal_fixture_decodes_and_rewrites_canonically() -> Result<()>
 #[tokio::test]
 async fn current_fork_wal_fixture_decodes_and_rewrites_canonically() -> Result<()> {
     assert_fixture(CURRENT_WAL, CURRENT_MANIFEST, CURRENT_SOURCE).await
+}
+
+#[tokio::test]
+async fn repeated_started_height_returns_no_replay_entries() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let wal = Wal::spawn(
+        &TestContext::new(),
+        ProtobufCodec,
+        directory.path().join("wal.log"),
+        SharedRegistry::global().clone(),
+        tracing::Span::none(),
+    )
+    .await?;
+
+    let first = wal
+        .call(|reply| Msg::StartedHeight(Height::new(7), reply), None)
+        .await?
+        .success_or(eyre!("first WAL StartedHeight call failed"))??;
+    assert!(first.is_none());
+
+    let fixture_path = materialize_fixture(directory.path(), PRODUCTION_WAL, "fixture.log")?;
+    let entry = read_fixture(&fixture_path)?
+        .into_iter()
+        .next()
+        .expect("production fixture must contain an entry");
+    wal.call(|reply| Msg::Append(Height::new(7), entry, reply), None)
+        .await?
+        .success_or(eyre!("WAL Append call failed"))??;
+    wal.call(Msg::Flush, None)
+        .await?
+        .success_or(eyre!("WAL Flush call failed"))??;
+
+    let repeated = wal
+        .call(|reply| Msg::StartedHeight(Height::new(7), reply), None)
+        .await?
+        .success_or(eyre!("repeated WAL StartedHeight call failed"))??;
+    assert!(repeated.is_none());
+
+    wal.stop_and_wait(None, None).await?;
+    Ok(())
 }
 
 #[test]
