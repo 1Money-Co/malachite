@@ -184,8 +184,8 @@ intentional fork decision rather than an omitted merge result.
   and `Recv`; the E4 lifecycle suite pins capacity state and control flow after the logging reconciliation.
 - **E7:** `cargo nextest run -p informalsystems-malachitebft-test --test it value_sync` exercises the retained sync
   actor wiring and dedicated consensus sync queue end to end; `cargo all-tests` also covers the Starknet host path.
-- **E8:** review fix `98c7517` preserves the asynchronous task introduced by Circle #1222 and adds the missing error
-  branch for a dropped application reply. The app-channel test and all-target check compile that path.
+- **E8:** the app-channel test `decided_reply_is_async_and_logs_when_application_drops_it` proves that the connector
+  processes another request while `Decided` is pending and emits an error when the application drops its reply.
 
 ### Retirement gates
 
@@ -240,6 +240,7 @@ Until those steps pass, the fork remains required and this candidate must not be
 - The focused E2–E6 commands passed, including all 22 post-merge WAL/value-sync scenarios without retry.
 - Review follow-up `98c7517`: the six WAL compatibility tests, WAL height test, ten sync lifecycle tests, three
   app-channel request tests, affected-crate all-target/all-feature check, clippy, and formatting check passed.
+- The focused asynchronous `Decided` reply regression passed and was mutation-checked against a warning downgrade.
 
 ## Value-sync startup recovery
 
