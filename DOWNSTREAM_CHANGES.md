@@ -27,7 +27,7 @@ invariant or qualifies Emerald.
 | `signer-verifier-split` | `ba1e4217`, `133d78eb` | combined provider | Adopt split; retain bytes | T4 KATs | V7-G3 |
 | `validator-proof-protocol` | `b6f55de4` | no proof protocol | Adopt static peer binding | T4 partial | V7-G4 |
 | `height-parameters` | `155a1fc7`, `d2fc6f47` | engine-owned values | Adopt app callbacks | Emerald | V7-G5 |
-| `sync-queue-scoring` | `1b2a15b2`, `628d8cff`, `5cd137fb` | fork free-window queues | Require parity | T5 | V7-G6 |
+| `sync-queue-scoring` | `1b2a15b2`, `628d8cff`, `5cd137fb` | fork queues | Require parity | T5 passed | V7-G6 |
 | `proposal-part-forwarding` | `3e41a306` | trait part signing | Preserve app authentication | Emerald | V7-G7 |
 | `wal-polka-certificate` | `8ee5d998` | tags `0x01`, `0x02`, `0x04` | Add `0x08`; read old | T6 | V7-G8 |
 | `wal-immediate-replay` | `3c264593` | immediate replay | Reject delay; remove `WaitingForSync` | Pending T6 | V7-G9 |
@@ -39,22 +39,32 @@ Circle `628d8cff` ports later sync-queue behavior, `8ee5d998` ports downstream W
 fixes concurrent sync-height rewind. They are replacement inputs, not evidence that the phase-1 implementation can
 be deleted. The following map keeps each rc.3 row active until its named test passes on the merged candidate.
 
-| Phase-1 behavior | v0.7 replacement | Status before evidence | Required retained evidence |
+| Phase-1 behavior | v0.7 replacement | Status | Required retained evidence |
 | --- | --- | --- | --- |
 | `ecdsa-signing-and-serialization` | upstream ECDSA plus split traits | Passed | four known-answer tests |
-| `sync-response-size-bound` | v0.7 response validation | Partial | exact send/receive byte bounds |
-| `sync-inflight-and-pending-accounting` | queued responses and `sync_height` | Partial | saturated combined allowance |
-| `sync-restored-height-startup` | upstream start-height flow | Partial | status/tick startup ordering |
-| `sync-delayed-stale-and-partial-responses` | `628d8cff`, `5cd137fb` | Partial | complete lifecycle matrix |
-| `sync-capacity-diagnostics` | upstream metrics and queue state | Partial | one-snapshot diagnostic fields |
+| `sync-response-size-bound` | v0.7 response validation | Passed T5 | exact send/receive byte bounds |
+| `sync-inflight-and-pending-accounting` | queued ranges and `sync_height` | Passed T5 | combined allowance |
+| `sync-restored-height-startup` | upstream start-height flow | Passed T5 | status/tick startup ordering |
+| `sync-delayed-stale-and-partial-responses` | `628d8cff`, `5cd137fb` | Passed T5 | complete lifecycle matrix |
+| `sync-capacity-diagnostics` | upstream metrics and queue state | Passed T5 | one-snapshot diagnostic fields |
 | `sync-network-subscription-order` | v0.7 builder wiring | Retained | builder order audit |
-| `consensus-sync-input-queue` | v0.7 consensus input queue | Partial | bounded sync-first isolation |
+| `consensus-sync-input-queue` | v0.7 consensus input queue | Passed T5 | bounded sync-first isolation |
 | `consensus-request-errors` | v0.7 app channel | Passed | `Closed`, `Full`, and `Recv` tests |
 | `wal-entry-height` | `8ee5d998` | Partial | old fixtures and height regression |
 | `wal-same-height-no-replay` | `8ee5d998` | Partial | same-height reply test |
-| `sync-peer-restart-recovery` | `628d8cff`, `5cd137fb` | Partial | peer-restart integration scenario |
+| `sync-peer-restart-recovery` | `628d8cff`, `5cd137fb` | Passed T5 | peer-restart integration scenario |
 | `decided-reply-async-forwarding` | v0.7 builder/app channel | Retained | async path and dropped-reply log |
 | `rc3-logging-context` | v0.7 logging changes | Partial | severity, context, and control-flow audit |
+
+### v0.7 checkpoint evidence
+
+- **T5:** `cargo test -p arc-malachitebft-test --test unit sync_lifecycle` passed all 10 lifecycle cases;
+  `cargo nextest run -p arc-malachitebft-test --test it value_sync --retries 0 --test-threads 1` passed all 18
+  value-sync scenarios with 64 filtered and no retry; and `cargo test -p arc-malachitebft-sync --lib` passed 45 tests
+  with one scoring test ignored. The candidate validates the original response envelope before trimming an obsolete
+  prefix, keeps wrong-peer and unknown replies from consuming the real request, tracks inflight and exact
+  consensus-pending ranges from one snapshot, and retries a locally rejected height without penalizing its peer or
+  discarding the remaining buffered response.
 
 ### v0.7 retirement gates
 

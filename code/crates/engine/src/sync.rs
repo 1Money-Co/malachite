@@ -388,7 +388,7 @@ where
             }
 
             Effect::ProcessValueResponse(peer_id, request_id, response, r) => {
-                self.process_value_response(state, peer_id, request_id, response);
+                self.process_value_response(myself, state, peer_id, request_id, response);
                 Ok(r.resume_with(()))
             }
         }
@@ -396,6 +396,7 @@ where
 
     fn process_value_response(
         &self,
+        myself: &ActorRef<Msg<Ctx>>,
         state: &mut HandlerState<'_, Ctx>,
         peer_id: PeerId,
         request_id: OutboundRequestId,
@@ -422,6 +423,10 @@ where
                         buffered.push(height);
                     } else {
                         warn!(%peer_id, %request_id, %height, "Failed to buffer sync response, queue is full");
+                        if let Err(error) = myself.cast(Msg::ValueProcessingError(peer_id, height))
+                        {
+                            error!(%error, %peer_id, %height, "Failed to release rejected sync value");
+                        }
                     }
                 }
 
@@ -434,6 +439,10 @@ where
                         .cast(ConsensusMsg::ProcessSyncResponse(value))
                     {
                         error!("Failed to forward value response to consensus: {e}");
+                        if let Err(error) = myself.cast(Msg::ValueProcessingError(peer_id, height))
+                        {
+                            error!(%error, %peer_id, %height, "Failed to release unforwarded sync value");
+                        }
                     }
                 }
             }
@@ -502,18 +511,26 @@ where
             }
 
             Msg::NetworkEvent(NetworkEvent::SyncResponse(request_id, peer, response)) => {
+                let Some(inflight) = state.inflight.get(&request_id) else {
+                    debug!(%request_id, %peer, "Received response for unknown request");
+                    return Ok(());
+                };
+
+                if inflight.peer_id != peer {
+                    warn!(
+                        %request_id,
+                        peer.actual = %peer,
+                        peer.expected = %inflight.peer_id,
+                        "Received sync response from different peer than requested"
+                    );
+                    return Ok(());
+                }
+
                 // Cancel the timer associated with the request for which we just received a response
                 state.timers.cancel(&Timeout::Request(request_id.clone()));
 
                 // Remove the in-flight request
-                if state.inflight.remove(&request_id).is_none() {
-                    debug!(%request_id, %peer, "Received response for unknown request");
-
-                    // Ignore response for unknown request
-                    // This can happen if the request timed out and was removed from in-flight requests
-                    // in the meantime or if we receive a duplicate response.
-                    return Ok(());
-                }
+                state.inflight.remove(&request_id);
 
                 let response = response.map(|resp| match resp {
                     Response::ValueResponse(value_response) => value_response,

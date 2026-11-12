@@ -8,6 +8,21 @@ use malachitebft_peer::PeerId;
 use crate::scoring::{ema, PeerScorer, Strategy};
 use crate::{Config, OutboundRequestId, Status};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestStage {
+    Inflight,
+    PendingConsensus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeightAllowanceSnapshot<H> {
+    pub inflight_heights: u64,
+    pub pending_heights: u64,
+    pub lowest_inflight_start: Option<H>,
+    pub lowest_pending_start: Option<H>,
+    pub tip_height: H,
+}
+
 /// The value stored for each pending request.
 #[derive(Debug, Clone)]
 pub struct PendingRequestEntry<H> {
@@ -45,6 +60,11 @@ where
     /// the set of peers already tried (and failed) for this range.
     pub pending_requests: BTreeMap<OutboundRequestId, PendingRequestEntry<Ctx::Height>>,
 
+    /// The exact response ranges waiting for consensus validation, keyed by
+    /// their original request ID. The ranges can become disjoint when a local
+    /// processing failure releases one height for retry.
+    pending_consensus_ranges: BTreeMap<OutboundRequestId, Vec<RangeInclusive<Ctx::Height>>>,
+
     /// The set of peers we are connected to in order to get values, certificates and votes.
     pub peers: BTreeMap<PeerId, Status<Ctx>>,
 
@@ -74,6 +94,7 @@ where
             tip_height: Ctx::Height::ZERO,
             sync_height: Ctx::Height::ZERO,
             pending_requests: BTreeMap::new(),
+            pending_consensus_ranges: BTreeMap::new(),
             peers: BTreeMap::new(),
             peer_scorer,
         }
@@ -96,6 +117,7 @@ where
         range: RangeInclusive<Ctx::Height>,
         excluded_peers: BTreeSet<PeerId>,
     ) {
+        self.pending_consensus_ranges.remove(&request_id);
         self.pending_requests.insert(
             request_id,
             PendingRequestEntry {
@@ -104,6 +126,39 @@ where
                 excluded_peers,
             },
         );
+    }
+
+    pub fn request_stage(&self, request_id: &OutboundRequestId) -> Option<RequestStage> {
+        self.pending_requests.get(request_id).map(|_| {
+            if self.pending_consensus_ranges.contains_key(request_id) {
+                RequestStage::PendingConsensus
+            } else {
+                RequestStage::Inflight
+            }
+        })
+    }
+
+    pub fn mark_pending_consensus(
+        &mut self,
+        request_id: OutboundRequestId,
+        range: RangeInclusive<Ctx::Height>,
+    ) {
+        assert!(self.pending_requests.contains_key(&request_id));
+        self.pending_consensus_ranges
+            .insert(request_id, vec![range]);
+    }
+
+    pub fn remove_request(
+        &mut self,
+        request_id: &OutboundRequestId,
+    ) -> Option<PendingRequestEntry<Ctx::Height>> {
+        self.pending_consensus_ranges.remove(request_id);
+        self.pending_requests.remove(request_id)
+    }
+
+    pub fn clear_requests(&mut self) {
+        self.pending_requests.clear();
+        self.pending_consensus_ranges.clear();
     }
 
     /// Filter peers to only include those that can provide the given range of values, or at least a prefix of the range.
@@ -178,8 +233,64 @@ where
     pub fn get_request_id_by(&self, height: Ctx::Height) -> Option<(OutboundRequestId, PeerId)> {
         self.pending_requests
             .iter()
-            .find(|(_, entry)| entry.range.contains(&height))
+            .find(|(request_id, _entry)| {
+                self.pending_consensus_ranges
+                    .get(*request_id)
+                    .is_some_and(|ranges| ranges.iter().any(|range| range.contains(&height)))
+            })
             .map(|(request_id, entry)| (request_id.clone(), entry.peer))
+    }
+
+    /// Release one locally rejected height from a response that is otherwise
+    /// still pending consensus validation.
+    pub fn release_pending_height(
+        &mut self,
+        height: Ctx::Height,
+    ) -> Option<(OutboundRequestId, PeerId)> {
+        let (request_id, peer) = self.get_request_id_by(height)?;
+        let ranges = self
+            .pending_consensus_ranges
+            .get_mut(&request_id)
+            .expect("located request must have pending consensus ranges");
+        let range_index = ranges
+            .iter()
+            .position(|range| range.contains(&height))
+            .expect("located request must contain the height");
+        let range = ranges.remove(range_index);
+
+        if *range.start() < height {
+            ranges.push(
+                *range.start()
+                    ..=height
+                        .decrement()
+                        .expect("height above range start must be decrementable"),
+            );
+        }
+        if height < *range.end() {
+            ranges.push(height.increment()..=*range.end());
+        }
+        ranges.sort_by_key(|range| *range.start());
+
+        if ranges.is_empty() {
+            self.pending_consensus_ranges.remove(&request_id);
+            self.pending_requests.remove(&request_id);
+        }
+
+        Some((request_id, peer))
+    }
+
+    /// Return the exact ranges currently covered by in-flight requests or by
+    /// values waiting for consensus validation.
+    pub fn covered_ranges(&self) -> Vec<RangeInclusive<Ctx::Height>> {
+        self.pending_requests
+            .iter()
+            .flat_map(|(request_id, entry)| {
+                self.pending_consensus_ranges
+                    .get(request_id)
+                    .cloned()
+                    .unwrap_or_else(|| vec![entry.range.clone()])
+            })
+            .collect()
     }
 
     /// Return a new range of heights, trimming from the beginning any height
@@ -194,7 +305,78 @@ where
 
     /// Remove pending requests that are for heights that have already been validated by consensus.
     pub fn prune_pending_requests(&mut self) {
-        self.pending_requests
-            .retain(|_, entry| entry.range.end() > &self.tip_height);
+        for ranges in self.pending_consensus_ranges.values_mut() {
+            ranges.retain_mut(|range| {
+                if range.end() <= &self.tip_height {
+                    return false;
+                }
+
+                if range.start() <= &self.tip_height {
+                    *range = self.tip_height.increment()..=*range.end();
+                }
+                true
+            });
+        }
+
+        let completed = self
+            .pending_consensus_ranges
+            .iter()
+            .filter_map(|(request_id, ranges)| ranges.is_empty().then_some(request_id.clone()))
+            .collect::<Vec<_>>();
+        for request_id in completed {
+            self.pending_consensus_ranges.remove(&request_id);
+            self.pending_requests.remove(&request_id);
+        }
+
+        self.pending_requests.retain(|request_id, entry| {
+            self.pending_consensus_ranges.contains_key(request_id)
+                || entry.range.end() > &self.tip_height
+        });
     }
+}
+
+pub fn height_allowance_snapshot<Ctx>(state: &State<Ctx>) -> HeightAllowanceSnapshot<Ctx::Height>
+where
+    Ctx: Context,
+{
+    let mut snapshot = HeightAllowanceSnapshot {
+        inflight_heights: 0,
+        pending_heights: 0,
+        lowest_inflight_start: None,
+        lowest_pending_start: None,
+        tip_height: state.tip_height,
+    };
+
+    for (request_id, entry) in &state.pending_requests {
+        match state.request_stage(request_id) {
+            Some(RequestStage::Inflight) => {
+                let height_count = entry.range.end().as_u64() - entry.range.start().as_u64() + 1;
+                snapshot.inflight_heights += height_count;
+                snapshot.lowest_inflight_start = Some(
+                    snapshot
+                        .lowest_inflight_start
+                        .map_or(*entry.range.start(), |height| {
+                            height.min(*entry.range.start())
+                        }),
+                );
+            }
+            Some(RequestStage::PendingConsensus) => {
+                for range in state
+                    .pending_consensus_ranges
+                    .get(request_id)
+                    .expect("pending request must have exact ranges")
+                {
+                    snapshot.pending_heights += range.end().as_u64() - range.start().as_u64() + 1;
+                    snapshot.lowest_pending_start = Some(
+                        snapshot
+                            .lowest_pending_start
+                            .map_or(*range.start(), |height| height.min(*range.start())),
+                    );
+                }
+            }
+            None => unreachable!("iterated request must have a stage"),
+        }
+    }
+
+    snapshot
 }

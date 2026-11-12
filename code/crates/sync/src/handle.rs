@@ -1,6 +1,9 @@
 use std::cmp::{max, min};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
+
+#[cfg(test)]
+use std::collections::BTreeMap;
 
 use derive_where::derive_where;
 use tracing::{debug, error, info, warn};
@@ -12,9 +15,11 @@ use crate::co::Co;
 use crate::scoring::SyncResult;
 use crate::{
     perform, Effect, Error, HeightStartType, InboundRequestId, Metrics, OutboundRequestId, PeerId,
-    PendingRequestEntry, RawDecidedValue, Request, Resume, State, Status, ValueRequest,
-    ValueResponse,
+    RawDecidedValue, Request, Resume, State, Status, ValueRequest, ValueResponse,
 };
+
+#[cfg(test)]
+use crate::PendingRequestEntry;
 
 #[derive_where(Debug)]
 pub enum Input<Ctx: Context> {
@@ -126,7 +131,7 @@ where
             "Received response from different peer than expected"
         );
 
-        return on_invalid_value_response(co, state, metrics, request_id, peer_id).await;
+        return Ok(());
     }
 
     let start = response.start_height;
@@ -265,7 +270,7 @@ where
     if start_type.is_restart() {
         // Consensus is retrying the height, so we should sync starting from it.
         // Clear pending requests, as we are restarting the height.
-        state.pending_requests.clear();
+        state.clear_requests();
         set_sync_height(state, height);
     } else {
         // If consensus is voting on a height that is currently being synced from a peer, do not update the sync height.
@@ -412,7 +417,7 @@ pub async fn on_valid_value_response<Ctx>(
     metrics: &Metrics,
     request_id: OutboundRequestId,
     peer_id: PeerId,
-    response: ValueResponse<Ctx>,
+    mut response: ValueResponse<Ctx>,
 ) -> Result<(), Error<Ctx>>
 where
     Ctx: Context,
@@ -458,11 +463,35 @@ where
             .update_score_with_metrics(peer_id, result, &metrics.scoring);
     }
 
-    // Tell consensus to process the response.
-    perform!(
-        co,
-        Effect::ProcessValueResponse(peer_id, request_id.clone(), response, Default::default())
-    );
+    let entry = state
+        .remove_request(&request_id)
+        .expect("validated response must still have a pending request");
+    let response_end = response
+        .end_height()
+        .expect("validated response must contain at least one value");
+
+    if response_end > state.tip_height {
+        if response.start_height <= state.tip_height {
+            let first_undecided = state.tip_height.increment();
+            let obsolete_count =
+                (first_undecided.as_u64() - response.start_height.as_u64()) as usize;
+            response.values.drain(..obsolete_count);
+            response.start_height = first_undecided;
+        }
+
+        let pending_range = response.start_height..=response_end;
+        perform!(
+            co,
+            Effect::ProcessValueResponse(peer_id, request_id.clone(), response, Default::default())
+        );
+        state.update_request(
+            request_id.clone(),
+            peer_id,
+            pending_range.clone(),
+            entry.excluded_peers.clone(),
+        );
+        state.mark_pending_consensus(request_id.clone(), pending_range);
+    }
 
     if values_count < requested_len {
         // NOTE: We cannot simply call `re_request_values_from_peer_except` here.
@@ -477,10 +506,6 @@ where
         // `on_value_response` guarantees `values_count >= 1` at this point, so the
         // `increment_by`/`decrement` arithmetic below is well-defined.
         let new_start = range_start.increment_by(values_count as u64);
-
-        let entry = state.pending_requests.remove(&request_id).unwrap();
-        let updated_range = range_start..=new_start.decrement().unwrap_or_default();
-        state.update_request(request_id, peer_id, updated_range, entry.excluded_peers);
 
         // Issue a new request for the remaining values to any peer (not necessarily the same one).
         let new_range = new_start..=range_end;
@@ -629,7 +654,7 @@ where
     Ctx: Context,
 {
     error!(%peer_id, %height, "Error while processing value");
-    penalize_peer_and_retry(co, state, metrics, peer_id, height).await
+    retry_failed_height(co, state, metrics, peer_id, height, false).await
 }
 
 // Penalize the peer and re-request the batch covering `height` from a different peer.
@@ -643,18 +668,44 @@ async fn penalize_peer_and_retry<Ctx>(
 where
     Ctx: Context,
 {
-    state.peer_scorer.update_score(peer_id, SyncResult::Failure);
+    retry_failed_height(co, state, metrics, peer_id, height, true).await
+}
 
-    if let Some((request_id, stored_peer_id)) = state.get_request_id_by(height) {
+async fn retry_failed_height<Ctx>(
+    co: Co<Ctx>,
+    state: &mut State<Ctx>,
+    metrics: &Metrics,
+    peer_id: PeerId,
+    height: Ctx::Height,
+    penalize_peer: bool,
+) -> Result<(), Error<Ctx>>
+where
+    Ctx: Context,
+{
+    if penalize_peer {
+        state.peer_scorer.update_score(peer_id, SyncResult::Failure);
+
+        if let Some((request_id, stored_peer_id)) = state.get_request_id_by(height) {
+            if stored_peer_id != peer_id {
+                error!(
+                    %request_id, peer.actual = %peer_id, peer.expected = %stored_peer_id,
+                    "Received response from different peer than expected"
+                );
+            }
+            re_request_values_from_peer_except(co, state, metrics, request_id, Some(peer_id))
+                .await?;
+        } else {
+            error!(%peer_id, %height, "Received height for unknown request");
+        }
+    } else if let Some((request_id, stored_peer_id)) = state.release_pending_height(height) {
         if stored_peer_id != peer_id {
-            // Defensive check: `on_value_response` already rejects responses from
-            // a different peer than the one recorded in the pending entry.
             error!(
                 %request_id, peer.actual = %peer_id, peer.expected = %stored_peer_id,
-                "Received response from different peer than expected"
+                "Received processing error from different peer than expected"
             );
         }
-        re_request_values_from_peer_except(co, state, metrics, request_id, Some(peer_id)).await?;
+
+        request_values_range(co, state, metrics, height..=height).await?;
     } else {
         error!(%peer_id, %height, "Received height for unknown request");
     }
@@ -674,9 +725,15 @@ where
     let max_parallel_requests = state.max_parallel_requests();
 
     if state.pending_requests.len() >= max_parallel_requests {
+        let snapshot = crate::height_allowance_snapshot(state);
         info!(
             max_parallel_requests,
             pending_requests = state.pending_requests.len(),
+            height.tip = %snapshot.tip_height,
+            inflight_heights = snapshot.inflight_heights,
+            pending_consensus_heights = snapshot.pending_heights,
+            lowest_inflight_start = ?snapshot.lowest_inflight_start,
+            lowest_pending_start = ?snapshot.lowest_pending_start,
             "Maximum number of parallel requests reached, skipping request for values"
         );
 
@@ -686,10 +743,11 @@ where
     while state.pending_requests.len() < max_parallel_requests {
         // Find the next uncovered range starting from current sync_height
         let initial_height = state.sync_height;
-        let range = find_next_uncovered_range_from::<Ctx>(
+        let covered_ranges = state.covered_ranges();
+        let range = find_next_uncovered_range_from_ranges::<Ctx>(
             initial_height,
             state.config.batch_size as u64,
-            &state.pending_requests,
+            &covered_ranges,
         );
 
         // Get a random peer that can provide the values in the range.
@@ -796,14 +854,7 @@ where
     };
 
     // Store the pending request
-    state.pending_requests.insert(
-        request_id,
-        PendingRequestEntry {
-            range: final_range.clone(),
-            peer,
-            excluded_peers,
-        },
-    );
+    state.update_request(request_id, peer, final_range.clone(), excluded_peers);
 
     // Advance sync_height past this range only if it sat inside the range.
     // If sync_height is already below the range — because a concurrent
@@ -886,7 +937,7 @@ where
 {
     info!(%request_id, except_peer_id = ?except_peer_id, "Re-requesting values from peer");
 
-    let Some(mut entry) = state.pending_requests.remove(&request_id) else {
+    let Some(mut entry) = state.remove_request(&request_id) else {
         warn!(%request_id, "Unknown request ID when re-requesting values");
         return Ok(());
     };
@@ -949,7 +1000,8 @@ where
 /// routine post-decide/rollback path and is not logged.
 fn set_sync_height<Ctx: Context>(state: &mut State<Ctx>, candidate: Ctx::Height) {
     let floor = max(state.tip_height.increment(), candidate);
-    let new_sync_height = find_next_uncovered_height::<Ctx>(floor, &state.pending_requests);
+    let new_sync_height =
+        find_next_uncovered_height_in_ranges::<Ctx>(floor, &state.covered_ranges());
 
     if new_sync_height != floor {
         warn!(
@@ -976,10 +1028,26 @@ fn set_sync_height<Ctx: Context>(state: &mut State<Ctx>, candidate: Ctx::Height)
 /// by advancing to the first uncovered height after the conflicting range.
 ///
 /// Returns the range that should be requested.
+#[cfg(test)]
 fn find_next_uncovered_range_from<Ctx>(
-    mut initial_height: Ctx::Height,
+    initial_height: Ctx::Height,
     max_range_size: u64,
     pending_requests: &BTreeMap<OutboundRequestId, PendingRequestEntry<Ctx::Height>>,
+) -> RangeInclusive<Ctx::Height>
+where
+    Ctx: Context,
+{
+    let ranges = pending_requests
+        .values()
+        .map(|entry| entry.range.clone())
+        .collect::<Vec<_>>();
+    find_next_uncovered_range_from_ranges::<Ctx>(initial_height, max_range_size, &ranges)
+}
+
+fn find_next_uncovered_range_from_ranges<Ctx>(
+    mut initial_height: Ctx::Height,
+    max_range_size: u64,
+    covered_ranges: &[RangeInclusive<Ctx::Height>],
 ) -> RangeInclusive<Ctx::Height>
 where
     Ctx: Context,
@@ -988,7 +1056,7 @@ where
 
     // If initial_height is inside a pending request, recover by advancing past it.
     // This should not happen if all sync_height writes go through set_sync_height.
-    let adjusted = find_next_uncovered_height::<Ctx>(initial_height, pending_requests);
+    let adjusted = find_next_uncovered_height_in_ranges::<Ctx>(initial_height, covered_ranges);
     if adjusted != initial_height {
         error!(
             initial_height = %initial_height.as_u64(),
@@ -999,9 +1067,8 @@ where
     }
 
     // Find the pending request with the smallest range.start where range.end >= initial_height
-    let next_range = pending_requests
-        .values()
-        .map(|entry| &entry.range)
+    let next_range = covered_ranges
+        .iter()
         .filter(|range| *range.end() >= initial_height)
         .min_by_key(|range| range.start());
 
@@ -1022,6 +1089,7 @@ where
 }
 
 /// Find the next height that's not covered by any pending request starting from starting_height.
+#[cfg(test)]
 fn find_next_uncovered_height<Ctx>(
     starting_height: Ctx::Height,
     pending_requests: &BTreeMap<OutboundRequestId, PendingRequestEntry<Ctx::Height>>,
@@ -1029,12 +1097,26 @@ fn find_next_uncovered_height<Ctx>(
 where
     Ctx: Context,
 {
-    let mut next_height = starting_height;
-    while let Some(entry) = pending_requests
+    let ranges = pending_requests
         .values()
-        .find(|entry| entry.range.contains(&next_height))
+        .map(|entry| entry.range.clone())
+        .collect::<Vec<_>>();
+    find_next_uncovered_height_in_ranges::<Ctx>(starting_height, &ranges)
+}
+
+fn find_next_uncovered_height_in_ranges<Ctx>(
+    starting_height: Ctx::Height,
+    covered_ranges: &[RangeInclusive<Ctx::Height>],
+) -> Ctx::Height
+where
+    Ctx: Context,
+{
+    let mut next_height = starting_height;
+    while let Some(range) = covered_ranges
+        .iter()
+        .find(|range| range.contains(&next_height))
     {
-        next_height = entry.range.end().increment();
+        next_height = range.end().increment();
     }
     next_height
 }
@@ -1926,10 +2008,10 @@ mod tests {
         assert_eq!(state.sync_height, Height::new(11));
     }
 
-    // -- on_value_processing_error: peer fault handling --
+    // -- on_value_processing_error: local fault handling --
 
     #[test]
-    fn test_value_processing_error_penalizes_peer_and_retries_via_other_peer() {
+    fn test_value_processing_error_preserves_score_and_retries() {
         let mut state = make_test_state();
         state.started = true;
         let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
@@ -1957,14 +2039,16 @@ mod tests {
             },
         );
 
+        let request_id = OutboundRequestId::new("req1");
         state.pending_requests.insert(
-            OutboundRequestId::new("req1"),
+            request_id.clone(),
             PendingRequestEntry {
                 range: Height::new(11)..=Height::new(15),
                 peer: peer_a,
                 excluded_peers: BTreeSet::new(),
             },
         );
+        state.mark_pending_consensus(request_id, Height::new(11)..=Height::new(15));
 
         let initial_score = state.peer_scorer.get_score(&peer_a);
 
@@ -1975,10 +2059,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            state.peer_scorer.get_score(&peer_a) < initial_score,
-            "Peer A should be penalized for serving an undecodable value"
-        );
+        assert_eq!(state.peer_scorer.get_score(&peer_a), initial_score);
 
         assert!(
             effects
@@ -1987,14 +2068,18 @@ mod tests {
             "Expected a re-request after ValueProcessingError"
         );
 
-        assert_eq!(state.pending_requests.len(), 1);
-        let (_, entry) = state.pending_requests.iter().next().unwrap();
-        assert_ne!(entry.peer, peer_a, "Retry should not go back to peer A");
-        assert_eq!(entry.peer, peer_b);
-        assert!(
-            entry.excluded_peers.contains(&peer_a),
-            "Peer A should be in the excluded set"
-        );
+        assert_eq!(state.pending_requests.len(), 2);
+        let snapshot = crate::height_allowance_snapshot(&state);
+        assert_eq!(snapshot.pending_heights, 4);
+        assert_eq!(snapshot.inflight_heights, 1);
+        assert!(state
+            .pending_requests
+            .values()
+            .all(|entry| entry.peer == peer_a || entry.peer == peer_b));
+        assert!(state
+            .pending_requests
+            .values()
+            .all(|entry| entry.excluded_peers.is_empty()));
     }
 
     // -- on_value_response: certificate height validation --

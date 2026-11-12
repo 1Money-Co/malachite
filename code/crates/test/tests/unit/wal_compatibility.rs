@@ -58,7 +58,9 @@ fn read_fixture(path: &Path) -> Result<Vec<WalEntry<TestContext>>> {
         bail!("opening the WAL discarded an invalid suffix");
     }
 
-    log_entries(&mut log, &ProtobufCodec)?.collect()
+    log_entries(&mut log, &ProtobufCodec)?
+        .map(|entry| entry.map_err(Into::into))
+        .collect()
 }
 
 async fn rewrite_fixture(path: PathBuf, entries: Vec<WalEntry<TestContext>>) -> Result<()> {
@@ -158,8 +160,7 @@ fn process_replay_input(
                 | Effect::VerifyRoundCertificate(_, _, _, resume) => {
                     Ok(resume.resume_with(Ok(())))
                 }
-                Effect::ResetTimeouts(resume)
-                | Effect::CancelAllTimeouts(resume)
+                Effect::CancelAllTimeouts(resume)
                 | Effect::PublishConsensusMsg(_, resume)
                 | Effect::PublishLivenessMsg(_, resume)
                 | Effect::RepublishVote(_, resume)
@@ -198,20 +199,25 @@ fn production_wal_fixture_restores_historical_vote() -> Result<()> {
     validator.address = historical_vote.validator_address;
     let validator_set = ValidatorSet::new([validator]);
     let params = Params {
-        initial_height: Height::new(historical_vote.height.as_u64() - 1),
-        initial_validator_set: validator_set.clone(),
         address: historical_vote.validator_address,
         threshold_params: Default::default(),
         value_payload: ValuePayload::ProposalAndParts,
         enabled: true,
     };
-    let mut state = State::new(TestContext::new(), params, 32);
+    let mut state = State::new(
+        TestContext::new(),
+        historical_vote.height,
+        validator_set.clone(),
+        params,
+        32,
+        32,
+    );
     let metrics = Metrics::default();
     let mut signed_votes = Vec::new();
 
     process_replay_input(
         &mut state,
-        Input::StartHeight(historical_vote.height, validator_set, false),
+        Input::StartHeight(historical_vote.height, validator_set, false, None),
         &metrics,
         &mut signed_votes,
     );
@@ -221,6 +227,7 @@ fn production_wal_fixture_restores_historical_vote() -> Result<()> {
             WalEntry::ConsensusMsg(SignedConsensusMsg::Proposal(proposal)) => {
                 Input::Proposal(proposal)
             }
+            WalEntry::PolkaCertificate(certificate) => Input::PolkaCertificate(certificate),
             WalEntry::Timeout(timeout) => Input::TimeoutElapsed(timeout),
             WalEntry::ProposedValue(value) => Input::ProposedValue(value, ValueOrigin::Consensus),
         };
@@ -313,7 +320,7 @@ async fn repeated_started_height_returns_no_replay_entries() -> Result<()> {
         .call(|reply| Msg::StartedHeight(Height::new(7), reply), None)
         .await?
         .success_or(eyre!("first WAL StartedHeight call failed"))??;
-    assert!(first.is_none());
+    assert!(first.is_empty());
 
     let fixture_path = materialize_fixture(directory.path(), PRODUCTION_WAL, "fixture.log")?;
     let entry = read_fixture(&fixture_path)?
@@ -334,7 +341,7 @@ async fn repeated_started_height_returns_no_replay_entries() -> Result<()> {
         )
         .await?
         .success_or(eyre!("repeated WAL StartedHeight call failed"))??;
-    assert!(repeated.is_none());
+    assert!(repeated.is_empty());
 
     wal.stop_and_wait(None, None).await?;
     Ok(())
