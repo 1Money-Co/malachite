@@ -16,22 +16,28 @@ rename. The release commit is merged only after the implementation candidate is 
 `0.7.0-pre` packages to `0.7.0` and stamps release metadata. Neither checkpoint by itself retires a downstream
 invariant or qualifies Emerald.
 
+The exact Malachite code candidate for Emerald is
+`b34343ee2fabd4cef0c9d100d74eee3ca66eef85`. Its parent `722b45fc1d74509b18c11215237db5cbb4dda2fc`
+received the full workspace and networked integration gate; `b34343ee` changes no production code and only registers
+the retained validator-proof compatibility module in the unit-test target. The evidence-only documentation commit
+that follows this record is not part of the code candidate.
+
 ### v0.7 behavior inventory
 
-`Pending Tn` means the named implementation-plan task owns the evidence and no compatibility claim exists yet.
+Evidence IDs below resolve to the exact commands and results in the checkpoint evidence section.
 
 | Behavior | Circle input | Phase-1 behavior | Decision | Evidence | Gate |
 | --- | --- | --- | --- | --- | --- |
-| `builder-lifecycle` | `b24e55c8`, `18915cd8` | `Node` actor order | Retain order/errors | T4 tests | V7-G1 |
-| `arc-package-identity` | `8d8c224c` | `informalsystems-*` names | Adopt `arc-*`; keep aliases | T3/T7 | V7-G2 |
-| `signer-verifier-split` | `ba1e4217`, `133d78eb` | combined provider | Adopt split; retain bytes | T4 KATs | V7-G3 |
-| `validator-proof-protocol` | `b6f55de4` | no proof protocol | Adopt static peer binding | T4 partial | V7-G4 |
+| `builder-lifecycle` | `b24e55c8`, `18915cd8` | `Node` actor order | Retain order/errors | V7-E1 | V7-G1 |
+| `arc-package-identity` | `8d8c224c` | `informalsystems-*` names | Adopt `arc-*`; keep aliases | V7-E2 | V7-G2 |
+| `signer-verifier-split` | `ba1e4217`, `133d78eb` | combined provider | Adopt split; retain bytes | V7-E3 | V7-G3 |
+| `validator-proof-protocol` | `b6f55de4` | no proof protocol | Adopt static peer binding | V7-E4 | V7-G4 |
 | `height-parameters` | `155a1fc7`, `d2fc6f47` | engine-owned values | Adopt app callbacks | Emerald | V7-G5 |
-| `sync-queue-scoring` | `1b2a15b2`, `628d8cff`, `5cd137fb` | fork queues | Require parity | T5 passed | V7-G6 |
+| `sync-queue-scoring` | `1b2a15b2`, `628d8cff`, `5cd137fb` | fork queues | Require parity | V7-E5 | V7-G6 |
 | `proposal-part-forwarding` | `3e41a306` | trait part signing | Preserve app authentication | Emerald | V7-G7 |
-| `wal-polka-certificate` | `8ee5d998` | tags `0x01`, `0x02`, `0x04` | Add `0x08`; read old | T6 passed | V7-G8 |
-| `wal-immediate-replay` | `3c264593` | immediate replay | Reject delay; remove wait phase | T6 passed | V7-G9 |
-| `wal-feature-matrix` | none | raw fixtures assume raw rewrites | Test raw/forced modes | T2 passed | V7-G10 |
+| `wal-polka-certificate` | `8ee5d998` | tags `0x01`, `0x02`, `0x04` | Add `0x08`; read old | V7-E6 | V7-G8 |
+| `wal-immediate-replay` | `3c264593` | immediate replay | Reject delay; remove wait phase | V7-E6 | V7-G9 |
+| `wal-feature-matrix` | none | raw fixtures assume raw rewrites | Test raw/forced modes | V7-E7 | V7-G10 |
 
 ### Replacement inputs and phase-1 retention
 
@@ -58,20 +64,50 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
 
 ### v0.7 checkpoint evidence
 
-- **T5:** `cargo test -p arc-malachitebft-test --test unit sync_lifecycle` passed all 10 lifecycle cases;
+- **V7-E1 — builder and request lifecycle:** `cargo test -p arc-malachitebft-app-channel` passed both builder tests,
+  all three `consensus_request` tests, and its library target. The final focused command
+  `cargo test -p arc-malachitebft-app-channel --test consensus_request` again passed 3/3.
+- **V7-E2 — package identity and release ancestry:** `cargo metadata --no-deps --format-version 1` reported every
+  `arc-malachitebft-*` workspace package at `0.7.0`; `rg '0.7.0-pre' Cargo.toml Cargo.lock` found none.
+  `cargo check --workspace --all-targets --all-features` passed. Merge `12483bfc` has first parent `c78247db` and
+  second parent Circle release `32abf3cf`; both `5cd137fb` and `32abf3cf` are ancestors of the candidate.
+- **V7-E3 — signing:** `cargo test -p arc-malachitebft-signing-ecdsa --all-features --test known_answers` passed
+  all 4 known-answer and mutation-rejection tests.
+- **V7-E4 — validator proofs:** `cargo test -p arc-malachitebft-network` passed all 54 state, classification,
+  anti-spam, and reconnect tests. After registering the retained proof module,
+  `cargo test -p arc-malachitebft-test --test unit validator_proof` passed 7/7 preimage, round-trip, mismatch,
+  tamper, and malformed-key cases; the complete unit target then passed 94/94.
+- **V7-E5 — sync queue and recovery:** `cargo test -p arc-malachitebft-test --test unit sync_lifecycle` passed all
+  10 lifecycle cases;
   `cargo nextest run -p arc-malachitebft-test --test it value_sync --retries 0 --test-threads 1` passed all 18
-  value-sync scenarios with 64 filtered and no retry; and `cargo test -p arc-malachitebft-sync --lib` passed 45 tests
+  value-sync scenarios with 65 filtered and no retry; and `cargo test -p arc-malachitebft-sync --lib` passed 45 tests
   with one scoring test ignored. The candidate validates the original response envelope before trimming an obsolete
   prefix, keeps wrong-peer and unknown replies from consuming the real request, tracks inflight and exact
   consensus-pending ranges from one snapshot, and retries a locally rejected height without penalizing its peer or
   discarding the remaining buffered response.
-- **T6:** the `wal_codec` and `wal_compatibility` unit filters each passed 6 tests; the serial WAL suite passed all 7
-  enabled scenarios with 76 filtered and no retry; and the config crate passed all 15 tests. Recovery replays a
+- **V7-E6 — WAL codec and recovery:** the `wal_codec` and `wal_compatibility` unit filters each passed 6 tests;
+  the serial WAL suite passed all 7 enabled scenarios with 76 filtered and no retry; and the config crate passed all
+  15 tests. Recovery replays a
   non-empty validator WAL before notifying sync, while empty WALs and full nodes start without replay. The `0x08`
   polka-certificate entry fixture has SHA-256
   `252be25c27c1ee934f606a80b38f6effda7902b0eaaaa7920c9ae96275f9bf50`. A detached worktree at phase-1 commit
   `6f544d7efca221ee8e7d2da9af37795ed6745f99` proved its old decoder rejects that fixture with `invalid tag` and
   leaves the WAL bytes and hash unchanged. Legacy `wal_replay_delay` TOML is ignored and has no runtime effect.
+- **V7-E7 — WAL feature matrix:** package-default, explicit `wal-force-compression`, and workspace `--all-features`
+  `wal_compatibility` nextest runs each passed 6/6. The checked-in phase-1 fixture paths and hashes were unchanged.
+- **V7-E8 — complete development gate:** `cargo build --workspace --all-features` passed. Outside the restricted
+  sandbox, `make tests` passed 522/522 main tests with 13 intentional skips, then 13/13 discovery tests with one
+  intentional skip. `cargo clippy --tests -- -D warnings` and `cargo +nightly fmt --all --check` passed. The final
+  test-registration-only commit then passed 94/94 unit tests plus fresh clippy and format checks.
+- **V7-E9 — branch audit:** `git diff --check origin/main...HEAD` passed; no phase-1 fixture path changed; no
+  `informalsystems-malachitebft` package name remains in a manifest or lockfile; and the lockfile resolves reviewed
+  `0.7.0` workspace manifests.
+
+The first sandboxed `make tests` attempt was stopped after 325/330 completed tests passed and five networked
+byzantine cases timed out. The required unrestricted rerun passed those same cases in 1–3 seconds and completed the
+entire main and discovery matrices. This development evidence does not include Phase-1 Emerald qualification,
+Emerald integration, mixed-version rolling validation, deployment, or production readiness. Phase-1 testing remains
+parallel work, and the Phase-2 pull request must not merge before its linked evidence and explicit human approval.
 
 ### v0.7 retirement gates
 

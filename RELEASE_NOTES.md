@@ -11,6 +11,15 @@
 
 - Reconcile the 1Money fork with Circle's v0.7 implementation while retaining downstream ECDSA, value-sync, WAL,
   and actor-lifecycle compatibility behavior. Production qualification remains tracked separately.
+- The exact Malachite code candidate for Emerald is
+  `b34343ee2fabd4cef0c9d100d74eee3ca66eef85`. It contains Circle implementation `5cd137fb` and release
+  `32abf3cf` in ancestry, uses `arc-malachitebft-*` package version `0.7.0`, and removes delayed WAL replay.
+- Development validation passed the focused ECDSA, request, validator-proof, sync, and WAL suites; the unrestricted
+  workspace gate passed 522/522 main tests and 13/13 discovery tests, followed by 94/94 unit tests after registering
+  the retained validator-proof module. Build, clippy with warnings denied, and nightly formatting checks passed.
+- This candidate is not Phase-1 qualification or production readiness. Emerald integration, mixed-version rolling
+  validation, deployment evidence, and explicit human approval remain required before the Phase-2 pull request can
+  merge.
 
 ### `app-channel`
 - Add builder pattern for custom actor injection
@@ -23,8 +32,10 @@
 - Add an ability to add/remove persistent peers at runtime via `Network` handle
 - Add `persistent_peers_only` config option to allow connections ONLY from/to persistent peers
 - Allow dynamic adjustment of timeout parameters ([#1227](https://github.com/circlefin/malachite/pull/1227))
-- Allow providing both the validator set and the timeouts for a height in `StartHeight`, `RestartHeight` and `ConsensusReady` reply ([#1227](https://github.com/circlefin/malachite/pull/1227))
-- Remove `initial_validator_set` and `initial_height` fields from `Params` struct ([#1190](https://github.com/circlefin/malachite/pull/1190))
+- Allow providing both the validator set and the timeouts for a height in `StartHeight`, `RestartHeight` and
+  `ConsensusReady` reply ([#1227](https://github.com/circlefin/malachite/pull/1227))
+- Remove `initial_validator_set` and `initial_height` fields from `Params` struct
+  ([#1190](https://github.com/circlefin/malachite/pull/1190))
 - Drop synced values whose id does not match the accompanying commit certificate before forwarding to consensus
 
 ### `discovery`
@@ -42,17 +53,22 @@
 - Clear scheduled timeouts when skipping to a higher round
 - Ensure `PrecommitAny` does not shadow `PolkaNil` and `PolkaAny` pending inputs
 - Ensure polka certificate is matched against a proposal for the same value
-- Produce `InvalidProposalAndPolkaPrevious` when receiving a polka certificate matching the POL round of a proposal with an invalid value
+- Produce `InvalidProposalAndPolkaPrevious` when receiving a polka certificate matching the POL round of a proposal
+  with an invalid value
 
 ### `engine-byzantine`
-- Introduce a new crate that simulates Byzantine faults at the engine layer via `ByzantineNetworkProxy` and a context-generic `Amnesia<Ctx>` tracker decoupled from `TestContext`
-- Add `force_precommit_nil` and `drop_inbound_proposals` attacks, backed by a new `InboundFilter` actor and an `AtHeightsAndRounds` trigger variant
-- Remove the `TestContext`-specific `ByzantineMiddleware` (relocated to `malachitebft_test::byzantine`); `malachitebft-test` is no longer a regular dependency of this crate
+- Introduce a new crate that simulates Byzantine faults at the engine layer via `ByzantineNetworkProxy` and a
+  context-generic `Amnesia<Ctx>` tracker decoupled from `TestContext`
+- Add `force_precommit_nil` and `drop_inbound_proposals` attacks, backed by a new `InboundFilter` actor and an
+  `AtHeightsAndRounds` trigger variant
+- Remove the `TestContext`-specific `ByzantineMiddleware` (relocated to `malachitebft_test::byzantine`);
+  `malachitebft-test` is no longer a regular dependency of this crate
 
 ### `network`
 - Add `persistent_peers_only` config option to allow connections ONLY from/to persistent peers
 - Add a mechanism to dump the network state
-- Add application-specific peer scoring for Gossipsub to prioritize nodes based on their types, in mesh formation and maintenance
+- Add application-specific peer scoring for Gossipsub to prioritize nodes based on their types, in mesh formation
+  and maintenance
 - Add network metrics for peer identification and tracking
 - Add transport level connection limits
 - Limit the number of peers that can connect from same IP address
@@ -63,51 +79,67 @@
 - Implement `Verifier` and `Signer` for `&T`, `Box<T>`, and `Arc<T>`
 - Remove signing of proposal parts
 - Remove `Signer::sign_bytes` and `Verifier::verify_signed_bytes`; every signing purpose is now a named trait method
-- Promote `sign_validator_proof` and `verify_validator_proof` to required methods on `Signer` and `Verifier`; remove the `SignerExt` trait
+- Promote `sign_validator_proof` and `verify_validator_proof` to required methods on `Signer` and `Verifier`;
+  remove the `SignerExt` trait
 
 ### `sync`
 - Validate sync response length against the requested range and credit partial
   responses through a new `SyncResult::PartialSuccess` variant, scaling the
   peer-score update by the `received / requested` ratio
-- Reject sync responses with non-contiguous certificate heights ([#1541](https://github.com/circlefin/malachite/issues/1541))
+- Reject sync responses with non-contiguous certificate heights
+  ([#1541](https://github.com/circlefin/malachite/issues/1541))
 - Fix partial range request not being tracked in pending requests
-- Preserve a sync_height rewind when a concurrent re-request to a different range succeeds, so the rewound range is picked up by the next request cycle instead of being silently abandoned
+- Preserve a `sync_height` rewind when a concurrent re-request to a different range succeeds, so the rewound range
+  is picked up by the next request cycle instead of being silently abandoned
 - Initial random (fixed) period adjustment in sync status ticker
 - Refactor sync actor to notify consensus of sync responses
 - Support batch retrieval of decided values
 - Validate value request ranges before processing
-- Introduce a new mode that sends a status update as soon as a new height is started rather than at a fixed interval ([#1452](https://github.com/circlefin/malachite/pull/1452))
+- Introduce a new mode that sends a status update as soon as a new height is started rather than at a fixed interval
+  ([#1452](https://github.com/circlefin/malachite/pull/1452))
   To enable this mode, set `status_update_interval = 0`.
 - Queue sync responses for future heights in the Sync actor ([#1467](https://github.com/circlefin/malachite/pull/1467))
-  Instead of buffering sync responses in the core-consensus input queue, sync responses are now buffered directly in the Sync actor.
+  Instead of buffering sync responses in the core-consensus input queue, sync responses are now buffered directly
+  in the Sync actor.
   This prevents sync responses and consensus messages from contending over the input queue.
 
 ### `test`
-- `ByzantineMiddleware` now lives under `malachitebft_test::byzantine` (previously under `malachitebft_engine_byzantine`); its constructor takes 5 args `(ignore_locks, force_precommit_nil, inner, self_address, seed)` and internally delegates to `Amnesia<TestContext>`
+- `ByzantineMiddleware` now lives under `malachitebft_test::byzantine` (previously under
+  `malachitebft_engine_byzantine`); its constructor takes 5 args
+  `(ignore_locks, force_precommit_nil, inner, self_address, seed)` and internally delegates to
+  `Amnesia<TestContext>`
 
 ## 0.6.0
 
 *November 19th, 2025*
 
-- Remove `Effect::GetValidatorSet`, `AppMsg::GetValidatorSet` and `HostMsg::GetValidatorSet` ([#1189](https://github.com/circlefin/malachite/pull/1189))
-- Introduce `malachitebft-signing` crate for exposing the `SigningProvider` and `SigningProviderExt` traits ([#1191](https://github.com/circlefin/malachite/pull/1191))
+- Remove `Effect::GetValidatorSet`, `AppMsg::GetValidatorSet` and `HostMsg::GetValidatorSet`
+  ([#1189](https://github.com/circlefin/malachite/pull/1189))
+- Introduce `malachitebft-signing` crate for exposing the `SigningProvider` and `SigningProviderExt` traits
+  ([#1191](https://github.com/circlefin/malachite/pull/1191))
 - Make `SigningProvider` trait methods fallible ([#1191](https://github.com/circlefin/malachite/pull/1191))
 - Make `SigningProvider` trait methods async ([#1151](https://github.com/circlefin/malachite/issues/1151))
 - Make GossipSub topic names configurable ([#849](https://github.com/circlefin/malachite/issues/849))
-- Fix bug in WAL recovery logic where a corrupted entry would not be detected in some circumstances ([#1127](https://github.com/circlefin/malachite/pull/1127))
-- Add facility for app to request a consensus state dump at any time ([#1176](https://github.com/circlefin/malachite/pull/1176))
+- Fix bug in WAL recovery logic where a corrupted entry would not be detected in some circumstances
+  ([#1127](https://github.com/circlefin/malachite/pull/1127))
+- Add facility for app to request a consensus state dump at any time
+  ([#1176](https://github.com/circlefin/malachite/pull/1176))
 - Make libp2p protocol names configurable ([#1161](https://github.com/circlefin/malachite/issues/1161))
-- Fix mismatched height of WAL entries emitted when processing `StartHeight` input ([#1232](https://github.com/circlefin/malachite/issues/1232))
+- Fix mismatched height of WAL entries emitted when processing `StartHeight` input
+  ([#1232](https://github.com/circlefin/malachite/issues/1232))
 
 ## 0.5.0
 
 *July 31st, 2025*
 
 - Update libp2p to v0.56.x ([#1124](https://github.com/circlefin/malachite/pull/1124))
-- Rename `Effect::RebroadcastVote` to `Effect::RepublishVote` and `Effect::RebroadcastRoundCertificate` to `Effect::RepublishRoundCertificate` ([#1011](https://github.com/circlefin/malachite/issues/1011))
+- Rename `Effect::RebroadcastVote` to `Effect::RepublishVote` and `Effect::RebroadcastRoundCertificate` to
+  `Effect::RepublishRoundCertificate` ([#1011](https://github.com/circlefin/malachite/issues/1011))
 - Decouple `Host` messages from the `Consensus` actor ([#1109](https://github.com/circlefin/malachite/pull/1109))
-- Fix a bug where values synced from other peers were assigned the current node's address instead of their proposer's address ([#1141](https://github.com/circlefin/malachite/pull/1141))
-- Buffer sync values for heights higher than current height in consensus and replay when running consensus for those heights ([#1149](https://github.com/circlefin/malachite/pull/1149))
+- Fix a bug where values synced from other peers were assigned the current node's address instead of their
+  proposer's address ([#1141](https://github.com/circlefin/malachite/pull/1141))
+- Buffer sync values for heights higher than current height in consensus and replay when running consensus for those
+  heights ([#1149](https://github.com/circlefin/malachite/pull/1149))
 - Add value batching to sync messages ([#1070](https://github.com/circlefin/malachite/issues/1070))
 
 ## 0.4.0
@@ -120,21 +152,31 @@
 
 *July 7th, 2025*
 
-- Derive [Borsh](https://borsh.io) encoding for all core types, behind a `borsh` feature flag ([#1098](https://github.com/circlefin/malachite/pull/1098))
-- Fixed a bug where the consensus engine would panic when the validator set is empty, now an error is properly emitted in the logs ([#1111](https://github.com/circlefin/malachite/pull/1111))
-- When the sync module receives an invalid commit certificate from another peer, it will now drop the associated synced value altogether instead of passing it up to the application ([#1112](https://github.com/circlefin/malachite/pull/1112))
+- Derive [Borsh](https://borsh.io) encoding for all core types, behind a `borsh` feature flag
+  ([#1098](https://github.com/circlefin/malachite/pull/1098))
+- Fixed a bug where the consensus engine would panic when the validator set is empty; an error is now properly
+  emitted in the logs ([#1111](https://github.com/circlefin/malachite/pull/1111))
+- When the sync module receives an invalid commit certificate from another peer, it will now drop the associated
+  synced value instead of passing it to the application
+  ([#1112](https://github.com/circlefin/malachite/pull/1112))
 
 ## 0.3.0
 
 *June 17th, 2025*
 
-- Removed the VoteSet synchronization protocol, as it is neither required nor sufficient for liveness ([#998](https://github.com/circlefin/malachite/issues/998))
+- Removed the VoteSet synchronization protocol, as it is neither required nor sufficient for liveness
+  ([#998](https://github.com/circlefin/malachite/issues/998))
 - Reply to `GetValidatorSet` is now optional ([#990](https://github.com/circlefin/malachite/issues/990))
-- Clarify and improve the application handling of multiple proposals for same height and round ([#833](https://github.com/circlefin/malachite/issues/833))
-- Prune votes and polka certificates that are from lower rounds than node's `locked_round` ([#1019](https://github.com/circlefin/malachite/issues/1019))
-- Add support for making progress in the presence of equivocating proposals ([#1018](https://github.com/circlefin/malachite/issues/1018))
-- Take minimum available height into account when requesting values from peers ([#1074](https://github.com/circlefin/malachite/issues/1074))
-- Add peer scoring system to the sync module with customizable scoring strategy ([#1072](https://github.com/circlefin/malachite/issues/1072))
+- Clarify and improve the application handling of multiple proposals for same height and round
+  ([#833](https://github.com/circlefin/malachite/issues/833))
+- Prune votes and polka certificates that are from lower rounds than node's `locked_round`
+  ([#1019](https://github.com/circlefin/malachite/issues/1019))
+- Add support for making progress in the presence of equivocating proposals
+  ([#1018](https://github.com/circlefin/malachite/issues/1018))
+- Take minimum available height into account when requesting values from peers
+  ([#1074](https://github.com/circlefin/malachite/issues/1074))
+- Add peer scoring system to the sync module with customizable scoring strategy
+  ([#1072](https://github.com/circlefin/malachite/issues/1072))
   [See the corresponding PR](https://github.com/circlefin/malachite/pull/1071) for more details.
 
 ## 0.2.0
@@ -158,7 +200,8 @@ This version introduces production-ready functionality with improved performance
 - [The tutorial][tutorial] for building a simple application on top of Malachite using the high-level channel-based API.
 - [ADR 003][adr-003] describes the architecture adopted in Malachite for handling the propagation of proposed values.
 - [ADR 004][adr-004] describes the coroutine effect system used in Malachite.
-  It is relevant if you are interested in building your own engine on top of the core consensus implementation of Malachite.
+  It is relevant if you are interested in building your own engine on top of the core consensus implementation of
+  Malachite.
 
 [tutorial]: ./docs/tutorials/channels.md
 [adr-003]: ./docs/architecture/adr-003-values-propagation.md
