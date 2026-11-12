@@ -22,13 +22,13 @@ invariant or qualifies Emerald.
 
 | Behavior | Circle input | Phase-1 behavior | Decision | Evidence | Gate |
 | --- | --- | --- | --- | --- | --- |
-| `builder-lifecycle` | `b24e55c8`, `18915cd8` | `Node` actor order | Adopt builder; retain order/errors | T4 | V7-G1 |
+| `builder-lifecycle` | `b24e55c8`, `18915cd8` | `Node` actor order | Retain order/errors | T4 tests | V7-G1 |
 | `arc-package-identity` | `8d8c224c` | `informalsystems-*` names | Adopt `arc-*`; keep aliases | T3/T7 | V7-G2 |
-| `signer-verifier-split` | `ba1e4217`, `133d78eb` | combined provider | Adopt split; retain bytes | T4 | V7-G3 |
-| `validator-proof-protocol` | `b6f55de4` | no proof protocol | Adopt exact static peer binding | Pending T4 | V7-G4 |
-| `height-parameters` | `155a1fc7`, `d2fc6f47` | engine-owned values | Adopt app callbacks | T4/Emerald | V7-G5 |
+| `signer-verifier-split` | `ba1e4217`, `133d78eb` | combined provider | Adopt split; retain bytes | T4 KATs | V7-G3 |
+| `validator-proof-protocol` | `b6f55de4` | no proof protocol | Adopt static peer binding | T4 partial | V7-G4 |
+| `height-parameters` | `155a1fc7`, `d2fc6f47` | engine-owned values | Adopt app callbacks | Emerald | V7-G5 |
 | `sync-queue-scoring` | `1b2a15b2`, `628d8cff`, `5cd137fb` | fork free-window queues | Require parity | T5 | V7-G6 |
-| `proposal-part-forwarding` | `3e41a306` | trait part signing | Preserve app authentication | T4/Emerald | V7-G7 |
+| `proposal-part-forwarding` | `3e41a306` | trait part signing | Preserve app authentication | Emerald | V7-G7 |
 | `wal-polka-certificate` | `8ee5d998` | tags `0x01`, `0x02`, `0x04` | Add `0x08`; read old | T6 | V7-G8 |
 | `wal-immediate-replay` | `3c264593` | immediate replay | Reject delay; remove `WaitingForSync` | Pending T6 | V7-G9 |
 | `wal-feature-matrix` | none | raw fixtures assume raw rewrites | Test raw/forced modes | T2 passed | V7-G10 |
@@ -41,19 +41,19 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
 
 | Phase-1 behavior | v0.7 replacement | Status before evidence | Required retained evidence |
 | --- | --- | --- | --- |
-| `ecdsa-signing-and-serialization` | upstream ECDSA plus split traits | Partial | known-answer fixture suite |
+| `ecdsa-signing-and-serialization` | upstream ECDSA plus split traits | Passed | four known-answer tests |
 | `sync-response-size-bound` | v0.7 response validation | Partial | exact send/receive byte bounds |
 | `sync-inflight-and-pending-accounting` | queued responses and `sync_height` | Partial | saturated combined allowance |
 | `sync-restored-height-startup` | upstream start-height flow | Partial | status/tick startup ordering |
 | `sync-delayed-stale-and-partial-responses` | `628d8cff`, `5cd137fb` | Partial | complete lifecycle matrix |
 | `sync-capacity-diagnostics` | upstream metrics and queue state | Partial | one-snapshot diagnostic fields |
-| `sync-network-subscription-order` | v0.7 builder wiring | Partial | consensus-before-subscribe test |
+| `sync-network-subscription-order` | v0.7 builder wiring | Retained | builder order audit |
 | `consensus-sync-input-queue` | v0.7 consensus input queue | Partial | bounded sync-first isolation |
-| `consensus-request-errors` | v0.7 app channel | Partial | `Closed`, `Full`, and `Recv` tests |
+| `consensus-request-errors` | v0.7 app channel | Passed | `Closed`, `Full`, and `Recv` tests |
 | `wal-entry-height` | `8ee5d998` | Partial | old fixtures and height regression |
 | `wal-same-height-no-replay` | `8ee5d998` | Partial | same-height reply test |
 | `sync-peer-restart-recovery` | `628d8cff`, `5cd137fb` | Partial | peer-restart integration scenario |
-| `decided-reply-async-forwarding` | v0.7 builder/app channel | Partial | async reply plus dropped-reply error |
+| `decided-reply-async-forwarding` | v0.7 builder/app channel | Retained | async path and dropped-reply log |
 | `rc3-logging-context` | v0.7 logging changes | Partial | severity, context, and control-flow audit |
 
 ### v0.7 retirement gates

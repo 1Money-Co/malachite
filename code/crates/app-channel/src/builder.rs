@@ -993,7 +993,8 @@ pub use byzantine::ByzantineContext;
 mod tests {
     use malachitebft_test::codec::json::JsonCodec;
     use malachitebft_test::codec::proto::ProtobufCodec;
-    use malachitebft_test::{Ed25519Signer, Ed25519Verifier, TestContext};
+    use malachitebft_test::{Address, Ed25519Signer, Ed25519Verifier, PrivateKey, TestContext};
+    use rand::{rngs::StdRng, SeedableRng};
 
     use super::*;
 
@@ -1023,6 +1024,28 @@ mod tests {
         fn value_sync_mut(&mut self) -> &mut malachitebft_config::ValueSyncConfig {
             todo!()
         }
+    }
+
+    #[test]
+    fn validator_context_requires_signer() {
+        let private_key = PrivateKey::generate(StdRng::seed_from_u64(1));
+        let context = ConsensusContext::<TestContext>::new_validator(
+            Address::new([0; 20]),
+            Box::new(Ed25519Verifier),
+            Box::new(Ed25519Signer::new(private_key)),
+        );
+
+        assert!(context.signer.is_some());
+    }
+
+    #[test]
+    fn full_node_context_uses_verifier_only() {
+        let context = ConsensusContext::<TestContext>::new_full_node(
+            Address::new([0; 20]),
+            Box::new(Ed25519Verifier),
+        );
+
+        assert!(context.signer.is_none());
     }
 
     // All default actors

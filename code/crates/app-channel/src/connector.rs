@@ -210,10 +210,13 @@ where
 
                 // Do not block processing of other messages while the app commits the decision
                 tokio::spawn(async move {
-                    if let Ok(()) = rx.await {
-                        if let Err(e) = reply_to.send(()) {
-                            error!("Decided: connector failed to send ack: {e}");
+                    match rx.await {
+                        Ok(()) => {
+                            if let Err(e) = reply_to.send(()) {
+                                error!("Decided: connector failed to send ack: {e}");
+                            }
                         }
+                        Err(e) => error!("Application dropped the decided reply: {e}"),
                     }
                 });
             }
@@ -237,10 +240,13 @@ where
 
                 // Do not block processing of other messages while waiting for the next height
                 tokio::spawn(async move {
-                    if let Ok(next) = rx.await {
-                        if let Err(e) = reply_to.send(next) {
-                            error!("Finalized: connector failed to send StartHeight: {e}");
+                    match rx.await {
+                        Ok(next) => {
+                            if let Err(e) = reply_to.send(next) {
+                                error!("Finalized: connector failed to send StartHeight: {e}");
+                            }
                         }
+                        Err(e) => error!("Application dropped the finalized reply: {e}"),
                     }
                 });
             }

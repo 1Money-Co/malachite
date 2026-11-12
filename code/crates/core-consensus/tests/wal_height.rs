@@ -1,4 +1,4 @@
-use informalsystems_malachitebft_core_consensus as consensus;
+use arc_malachitebft_core_consensus as consensus;
 use malachitebft_core_types::{
     NilOrVal, Round, SignedMessage, SignedProposal, SignedVote, Timeout, TimeoutKind, Validity,
     ValueOrigin, ValuePayload,
