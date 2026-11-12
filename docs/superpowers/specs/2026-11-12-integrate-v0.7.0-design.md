@@ -1,7 +1,7 @@
 # Integrate Circle Malachite v0.7.0 into the 1Money fork
 
 **Date:** 2026-11-12
-**Status:** Draft for approval
+**Status:** Approved
 **Tracking issue:** [1Money-Co/om-emerald#48](https://github.com/1Money-Co/om-emerald/issues/48)
 
 ## Intent
@@ -88,8 +88,9 @@ release delta. Record full SHAs again at implementation start and before opening
 ### 1. Two-stage upstream merge — selected
 
 From the phase-1 fork, merge Circle implementation parent `5cd137fb` and reconcile implementation conflicts by
-behavior. After that merge is stable, merge its v0.7.0 child `32abf3cf` separately for the release and package-name
-delta. Preserve both merge ancestries.
+behavior. This checkpoint already contains the `arc-malachitebft-*` rename from `8d8c224c`. After that merge is
+stable, merge its v0.7.0 child `32abf3cf` separately for the `0.7.0-pre` to `0.7.0` promotion and release metadata.
+Preserve both merge ancestries.
 
 This separates the architectural reconciliation from the release metadata, keeps exact upstream provenance, and
 makes the final tree easy to compare with both the common implementation parent and the named v0.7.0 release. It
@@ -98,8 +99,9 @@ also keeps omission from becoming the default failure mode.
 ### 2. Direct merge of the v0.7.0 release commit — rejected
 
 Merge `32abf3cf` into the phase-1 fork in one step. This preserves tag ancestry with one merge, but combines the
-large implementation reconciliation with package aliases, versions, release notes, and lockfile changes. The mixed
-conflict surface makes behavior review and regression attribution harder without reducing the actual work.
+large implementation reconciliation, including package aliases, with final versions, release notes, and lockfile
+changes. The mixed conflict surface makes behavior review and regression attribution harder without reducing the
+actual work.
 
 ### 3. Fresh v0.7.0 base with selected downstream ports — rejected
 
