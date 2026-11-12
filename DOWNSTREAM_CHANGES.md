@@ -17,10 +17,10 @@ rename. The release commit is merged only after the implementation candidate is 
 invariant or qualifies Emerald.
 
 The exact Malachite code candidate for Emerald is
-`b34343ee2fabd4cef0c9d100d74eee3ca66eef85`. Its parent `722b45fc1d74509b18c11215237db5cbb4dda2fc`
-received the full workspace and networked integration gate; `b34343ee` changes no production code and only registers
-the retained validator-proof compatibility module in the unit-test target. The evidence-only documentation commit
-that follows this record is not part of the code candidate.
+`2001721ef3c67ef7588b776dadb2dc4862c6ffb3`. It includes the final review fix that makes builder startup
+transactional: a failed default-actor spawn stops and awaits every default actor already created, in reverse
+dependency order, without stopping caller-owned custom actors. The evidence-only documentation commit that follows
+this record is not part of the code candidate.
 
 ### v0.7 behavior inventory
 
@@ -64,9 +64,10 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
 
 ### v0.7 checkpoint evidence
 
-- **V7-E1 — builder and request lifecycle:** `cargo test -p arc-malachitebft-app-channel` passed both builder tests,
-  all three `consensus_request` tests, and its library target. The final focused command
-  `cargo test -p arc-malachitebft-app-channel --test consensus_request` again passed 3/3.
+- **V7-E1 — builder and request lifecycle:** `cargo test -p arc-malachitebft-app-channel` passed all 3 builder
+  tests, all 3 `consensus_request` tests, and its library target. The startup rollback regression forces sync spawn
+  to fail after network, WAL, host, and consensus startup, then proves the default network listener is stopped before
+  `build()` returns. The builder tracks and rolls back only default actors; caller-owned custom actors remain live.
 - **V7-E2 — package identity and release ancestry:** `cargo metadata --no-deps --format-version 1` reported every
   `arc-malachitebft-*` workspace package at `0.7.0`; `rg '0.7.0-pre' Cargo.toml Cargo.lock` found none.
   `cargo check --workspace --all-targets --all-features` passed. Merge `12483bfc` has first parent `c78247db` and
@@ -96,9 +97,11 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
 - **V7-E7 — WAL feature matrix:** package-default, explicit `wal-force-compression`, and workspace `--all-features`
   `wal_compatibility` nextest runs each passed 6/6. The checked-in phase-1 fixture paths and hashes were unchanged.
 - **V7-E8 — complete development gate:** `cargo build --workspace --all-features` passed. Outside the restricted
-  sandbox, `make tests` passed 522/522 main tests with 13 intentional skips, then 13/13 discovery tests with one
-  intentional skip. `cargo clippy --tests -- -D warnings` and `cargo +nightly fmt --all --check` passed. The final
-  test-registration-only commit then passed 94/94 unit tests plus fresh clippy and format checks.
+  sandbox, the final candidate's `make tests` passed 530/530 main tests with 13 intentional skips, then 13/13
+  discovery tests with one intentional skip. One discovery topology case crossed its 30-second threshold on its
+  first attempt, passed its configured retry in 29.05 seconds, and passed a separate no-retry run in 29.03 seconds.
+  `cargo check --workspace --all-targets --all-features`, `cargo clippy --tests -- -D warnings`, and
+  `cargo +nightly fmt --all --check` passed.
 - **V7-E9 — branch audit:** `git diff --check origin/main...HEAD` passed; no phase-1 fixture path changed; no
   `informalsystems-malachitebft` package name remains in a manifest or lockfile; and the lockfile resolves reviewed
   `0.7.0` workspace manifests.

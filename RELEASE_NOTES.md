@@ -12,11 +12,14 @@
 - Reconcile the 1Money fork with Circle's v0.7 implementation while retaining downstream ECDSA, value-sync, WAL,
   and actor-lifecycle compatibility behavior. Production qualification remains tracked separately.
 - The exact Malachite code candidate for Emerald is
-  `b34343ee2fabd4cef0c9d100d74eee3ca66eef85`. It contains Circle implementation `5cd137fb` and release
+  `2001721ef3c67ef7588b776dadb2dc4862c6ffb3`. It contains Circle implementation `5cd137fb` and release
   `32abf3cf` in ancestry, uses `arc-malachitebft-*` package version `0.7.0`, and removes delayed WAL replay.
 - Development validation passed the focused ECDSA, request, validator-proof, sync, and WAL suites; the unrestricted
-  workspace gate passed 522/522 main tests and 13/13 discovery tests, followed by 94/94 unit tests after registering
-  the retained validator-proof module. Build, clippy with warnings denied, and nightly formatting checks passed.
+  final-candidate gate passed 530/530 main tests and 13/13 discovery tests. One near-threshold discovery case passed
+  a configured retry and a separate no-retry run. Build, all-target check, clippy with warnings denied, and nightly
+  formatting checks passed.
+- Builder startup is transactional: if a later default actor fails to spawn, every default actor already created is
+  stopped and awaited in reverse dependency order, while caller-owned custom actors remain untouched.
 - This candidate is not Phase-1 qualification or production readiness. Emerald integration, mixed-version rolling
   validation, deployment evidence, and explicit human approval remain required before the Phase-2 pull request can
   merge.
