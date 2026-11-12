@@ -28,6 +28,7 @@ fn test_itf() {
         "consensus/quint/tests/consensus/consensusTest.qnt",
         &temp_path.to_string_lossy(),
         quint_seed,
+        None,
     );
 
     for json_fixture in glob(&format!("{}/*.itf.json", temp_path.display()))

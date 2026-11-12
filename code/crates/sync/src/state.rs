@@ -8,6 +8,19 @@ use crate::handle::excise_height;
 use crate::scoring::{ema, PeerScorer, Strategy};
 use crate::{Config, OutboundRequestId, Status};
 
+type PendingConsensusRequest<H> = (Vec<RangeInclusive<H>>, PeerId);
+type PendingConsensusRequestMatch<'a, H> =
+    (OutboundRequestId, PeerId, &'a mut Vec<RangeInclusive<H>>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeightAllowanceSnapshot<H> {
+    pub inflight_heights: u64,
+    pub pending_heights: u64,
+    pub lowest_inflight_start: Option<H>,
+    pub lowest_pending_start: Option<H>,
+    pub tip_height: H,
+}
+
 pub struct State<Ctx>
 where
     Ctx: Context,
@@ -35,7 +48,7 @@ where
     /// for heights [10..14] and [16..20].
     /// To tackle the above, we store a vec of ranges instead of a single range of heights.
     pub pending_consensus_requests:
-        BTreeMap<OutboundRequestId, (Vec<RangeInclusive<Ctx::Height>>, PeerId)>,
+        BTreeMap<OutboundRequestId, PendingConsensusRequest<Ctx::Height>>,
 
     /// The set of peers we are connected to in order to get values, certificates and votes.
     pub peers: BTreeMap<PeerId, Status<Ctx>>,
@@ -152,11 +165,7 @@ where
     pub fn get_pending_consensus_request_id_by(
         &mut self,
         height: Ctx::Height,
-    ) -> Option<(
-        OutboundRequestId,
-        PeerId,
-        &mut Vec<RangeInclusive<Ctx::Height>>,
-    )> {
+    ) -> Option<PendingConsensusRequestMatch<'_, Ctx::Height>> {
         self.pending_consensus_requests.iter_mut().find_map(
             |(request_id, (ranges, stored_peer_id))| {
                 if ranges.iter().any(|range| range.contains(&height)) {
@@ -188,5 +197,41 @@ where
             ranges.retain(|range| range.end() > up_to_height);
             !ranges.is_empty()
         });
+    }
+}
+
+pub fn height_allowance_snapshot<Ctx>(state: &State<Ctx>) -> HeightAllowanceSnapshot<Ctx::Height>
+where
+    Ctx: Context,
+{
+    let inflight_heights = state
+        .inflight_requests
+        .values()
+        .map(|(range, _)| range.end().as_u64() - range.start().as_u64() + 1)
+        .sum();
+    let pending_heights = state
+        .pending_consensus_requests
+        .values()
+        .flat_map(|(ranges, _)| ranges)
+        .map(|range| range.end().as_u64() - range.start().as_u64() + 1)
+        .sum();
+    let lowest_inflight_start = state
+        .inflight_requests
+        .values()
+        .map(|(range, _)| *range.start())
+        .min();
+    let lowest_pending_start = state
+        .pending_consensus_requests
+        .values()
+        .flat_map(|(ranges, _)| ranges)
+        .map(|range| *range.start())
+        .min();
+
+    HeightAllowanceSnapshot {
+        inflight_heights,
+        pending_heights,
+        lowest_inflight_start,
+        lowest_pending_start,
+        tip_height: state.tip_height,
     }
 }

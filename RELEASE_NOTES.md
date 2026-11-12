@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Reconcile the 1Money fork through Circle Malachite v0.6.0-rc.3 while retaining downstream ECDSA signing and
+  value-sync compatibility behavior. This is a development reconciliation; the fork remains in use and production
+  qualification is tracked separately.
 - Remove `Effect::GetValidatorSet`, `AppMsg::GetValidatorSet` and `HostMsg::GetValidatorSet` ([#1189](https://github.com/circlefin/malachite/pull/1189))
 - Introduce `malachitebft-signing` crate for exposing the `SigningProvider` and `SigningProviderExt` traits ([#1191](https://github.com/informalsystems/malachite/pull/1191))
 - Make `SigningProvider` trait methods fallible ([#1191](https://github.com/informalsystems/malachite/pull/1191))

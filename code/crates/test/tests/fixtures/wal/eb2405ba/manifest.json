@@ -1,0 +1,13 @@
+{
+  "source_commit": "eb2405ba78fc2d5c4465652364299f3217428a36",
+  "entry_kinds": [
+    "vote",
+    "timeout",
+    "proposed_value"
+  ],
+  "height": 7,
+  "round": 2,
+  "value_id": 7002,
+  "wal_byte_length": 251,
+  "sha256": "a9e244eafdf9915e774a4bbf291cfc8a4608eac8c02052067ced483e8b3d7125"
+}

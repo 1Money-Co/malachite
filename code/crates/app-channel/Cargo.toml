@@ -31,3 +31,4 @@ workspace = true
 [dev-dependencies]
 malachitebft-test.workspace = true
 rand.workspace = true
+tracing-subscriber.workspace = true
