@@ -9,6 +9,10 @@ repository.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+wal-force-compression = ["malachitebft-wal/force-compression"]
+
 [dependencies]
 malachitebft-engine = { workspace = true }
 malachitebft-app = { workspace = true }
@@ -21,6 +25,7 @@ malachitebft-peer = { workspace = true, features = ["rand", "serde"] }
 malachitebft-signing = { workspace = true }
 malachitebft-signing-ed25519 = { workspace = true, features = ["rand", "serde"] }
 malachitebft-sync = { workspace = true }
+malachitebft-wal = { workspace = true }
 
 async-trait = { workspace = true }
 base64 = { workspace = true }

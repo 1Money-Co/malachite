@@ -31,7 +31,7 @@ invariant or qualifies Emerald.
 | `proposal-part-forwarding` | `3e41a306` | trait part signing | Preserve app authentication | T4/Emerald | V7-G7 |
 | `wal-polka-certificate` | `8ee5d998` | tags `0x01`, `0x02`, `0x04` | Add `0x08`; read old | T6 | V7-G8 |
 | `wal-immediate-replay` | `3c264593` | immediate replay | Reject delay; remove `WaitingForSync` | Pending T6 | V7-G9 |
-| `wal-feature-matrix` | none | raw fixtures assume raw rewrites | Test raw/forced modes | T2 | V7-G10 |
+| `wal-feature-matrix` | none | raw fixtures assume raw rewrites | Test raw/forced modes | T2 passed | V7-G10 |
 
 ### Replacement inputs and phase-1 retention
 

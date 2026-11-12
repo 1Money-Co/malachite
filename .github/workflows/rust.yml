@@ -66,6 +66,19 @@ jobs:
             --exclude informalsystems-malachitebft-starknet-test \
             --exclude informalsystems-malachitebft-starknet-test-mbt \
             --exclude informalsystems-malachitebft-discovery-test
+      - name: Run WAL compatibility tests without compression
+        run: |
+          cargo nextest run \
+            -p informalsystems-malachitebft-test \
+            --test unit \
+            wal_compatibility
+      - name: Run WAL compatibility tests with forced compression
+        run: |
+          cargo nextest run \
+            -p informalsystems-malachitebft-test \
+            --features wal-force-compression \
+            --test unit \
+            wal_compatibility
 
   integration:
     name: Integration Tests

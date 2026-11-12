@@ -2625,6 +2625,7 @@ dependencies = [
  "informalsystems-malachitebft-sync",
  "informalsystems-malachitebft-test-app",
  "informalsystems-malachitebft-test-framework",
+ "informalsystems-malachitebft-wal",
  "prost",
  "prost-build",
  "prost-types",

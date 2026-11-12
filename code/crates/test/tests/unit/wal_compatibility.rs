@@ -271,8 +271,20 @@ async fn assert_fixture(bytes: &[u8], manifest_json: &str, expected_source: &str
 
     let rewritten_path = directory.path().join("rewritten.log");
     rewrite_fixture(rewritten_path.clone(), entries).await?;
-    let rewritten = fs::read(rewritten_path)?;
-    assert_eq!(sha256(&rewritten), manifest.sha256);
+    let rewritten = fs::read(&rewritten_path)?;
+    if cfg!(feature = "wal-force-compression") {
+        assert_ne!(sha256(&rewritten), manifest.sha256);
+        assert_eq!(
+            rewritten.get(12),
+            Some(&1),
+            "first WAL entry must be compressed"
+        );
+
+        let rewritten_entries = read_fixture(&rewritten_path)?;
+        assert_entries(&rewritten_entries);
+    } else {
+        assert_eq!(sha256(&rewritten), manifest.sha256);
+    }
 
     Ok(())
 }
