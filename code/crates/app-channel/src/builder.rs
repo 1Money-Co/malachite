@@ -11,6 +11,8 @@ use eyre::Result;
 use tokio::sync::mpsc::{self, Sender};
 
 use malachitebft_app::types::codec::HasEncodedLen;
+use malachitebft_engine::consensus::ConsensusRef;
+use malachitebft_engine::host::HostRef;
 use malachitebft_engine::network::{NetworkIdentity, NetworkRef};
 use malachitebft_engine::sync::SyncRef;
 use malachitebft_engine::util::events::TxEvent;
@@ -161,6 +163,58 @@ pub enum ConsensusBuilder<Ctx: Context> {
 pub enum RequestBuilder {
     /// Use the default request channel configuration.
     Default(RequestContext),
+}
+
+struct BuildRollback<Ctx: Context> {
+    network: Option<NetworkRef<Ctx>>,
+    wal: Option<WalRef<Ctx>>,
+    host: Option<HostRef<Ctx>>,
+    consensus: Option<ConsensusRef<Ctx>>,
+    sync: Option<SyncRef<Ctx>>,
+}
+
+impl<Ctx: Context> BuildRollback<Ctx> {
+    fn new() -> Self {
+        Self {
+            network: None,
+            wal: None,
+            host: None,
+            consensus: None,
+            sync: None,
+        }
+    }
+
+    async fn fail<T>(&mut self, error: eyre::Report) -> Result<T> {
+        self.stop_default_actors().await;
+        Err(error)
+    }
+
+    async fn stop_default_actors(&mut self) {
+        if let Some(sync) = self.sync.take() {
+            stop_actor(sync, "sync").await;
+        }
+        if let Some(consensus) = self.consensus.take() {
+            stop_actor(consensus, "consensus").await;
+        }
+        if let Some(host) = self.host.take() {
+            stop_actor(host, "host").await;
+        }
+        if let Some(wal) = self.wal.take() {
+            stop_actor(wal, "wal").await;
+        }
+        if let Some(network) = self.network.take() {
+            stop_actor(network, "network").await;
+        }
+    }
+}
+
+async fn stop_actor<M: ractor::Message>(actor: ractor::ActorRef<M>, name: &'static str) {
+    if let Err(error) = actor
+        .stop_and_wait(Some("engine build failed".to_owned()), None)
+        .await
+    {
+        tracing::warn!(actor = name, ?error, "Failed to roll back spawned actor");
+    }
 }
 
 /// Builder for constructing the consensus engine with optional custom actors.
@@ -743,6 +797,7 @@ where
         let wal_builder = self.wal.unwrap();
         let network_builder = self.network.unwrap();
         let sync_builder = self.sync.unwrap();
+        let mut rollback = BuildRollback::new();
 
         // Set up metrics
         let registry = SharedRegistry::global().with_moniker(self.config.moniker());
@@ -752,14 +807,20 @@ where
         let (network, tx_network) = match network_builder {
             NetworkBuilder::Custom(custom) => custom,
             NetworkBuilder::Default(network_ctx) => {
-                spawn_network_actor(
+                let spawned = match spawn_network_actor(
                     network_ctx.identity,
                     self.config.consensus(),
                     self.config.value_sync(),
                     &registry,
                     network_ctx.codec,
                 )
-                .await?
+                .await
+                {
+                    Ok(spawned) => spawned,
+                    Err(error) => return rollback.fail(error).await,
+                };
+                rollback.network = Some(spawned.0.clone());
+                spawned
             }
         };
 
@@ -767,18 +828,29 @@ where
         let wal = match wal_builder {
             WalBuilder::Custom(wal_ref) => wal_ref,
             WalBuilder::Default(wal_ctx) => {
-                spawn_wal_actor(&self.ctx, wal_ctx.codec, &wal_ctx.path, &registry).await?
+                let spawned =
+                    match spawn_wal_actor(&self.ctx, wal_ctx.codec, &wal_ctx.path, &registry).await
+                    {
+                        Ok(spawned) => spawned,
+                        Err(error) => return rollback.fail(error).await,
+                    };
+                rollback.wal = Some(spawned.clone());
+                spawned
             }
         };
 
         // 3. Host actor (use the default channel-based Connector)
-        let (connector, rx_consensus) = spawn_host_actor(metrics.clone()).await?;
+        let (connector, rx_consensus) = match spawn_host_actor(metrics.clone()).await {
+            Ok(spawned) => spawned,
+            Err(error) => return rollback.fail(error).await,
+        };
+        rollback.host = Some(connector.clone());
 
         let tx_event = TxEvent::new();
         let sync_port = Arc::new(OutputPort::new());
 
         // 4. Consensus actor (spawned before sync so sync can reference it)
-        let consensus = spawn_consensus_actor(
+        let consensus = match spawn_consensus_actor(
             self.ctx.clone(),
             consensus_ctx.address,
             self.config.consensus().clone(),
@@ -791,13 +863,18 @@ where
             metrics,
             tx_event.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(spawned) => spawned,
+            Err(error) => return rollback.fail(error).await,
+        };
+        rollback.consensus = Some(consensus.clone());
 
         // 5. Sync actor (default or custom)
         let sync = match sync_builder {
             SyncBuilder::Custom(sync_ref) => sync_ref,
             SyncBuilder::Default(sync_ctx) => {
-                spawn_sync_actor(
+                let spawned = match spawn_sync_actor(
                     self.ctx.clone(),
                     network.clone(),
                     connector.clone(),
@@ -806,7 +883,13 @@ where
                     self.config.value_sync(),
                     &registry,
                 )
-                .await?
+                .await
+                {
+                    Ok(spawned) => spawned,
+                    Err(error) => return rollback.fail(error).await,
+                };
+                rollback.sync = spawned.clone();
+                spawned
             }
         };
 
@@ -816,7 +899,7 @@ where
         }
 
         // 6. Node actor
-        let (node, handle) = spawn_node_actor(
+        let (node, handle) = match spawn_node_actor(
             self.ctx,
             network.clone(),
             consensus.clone(),
@@ -824,7 +907,11 @@ where
             sync,
             connector,
         )
-        .await?;
+        .await
+        {
+            Ok(spawned) => spawned,
+            Err(error) => return rollback.fail(error).await,
+        };
 
         // Spawn request handling tasks
         let (tx_request, rx_request) = mpsc::channel(request_ctx.channel_size);
@@ -991,8 +1078,13 @@ pub use byzantine::ByzantineContext;
 
 #[cfg(test)]
 mod tests {
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    use malachitebft_config::{ConsensusConfig, ValueSyncConfig};
     use malachitebft_test::codec::json::JsonCodec;
     use malachitebft_test::codec::proto::ProtobufCodec;
+    use malachitebft_test::node::Keypair;
     use malachitebft_test::{Address, Ed25519Signer, Ed25519Verifier, PrivateKey, TestContext};
     use rand::{rngs::StdRng, SeedableRng};
 
@@ -1003,6 +1095,33 @@ mod tests {
     }
 
     struct Config;
+
+    struct FailingSyncConfig {
+        consensus: ConsensusConfig,
+        value_sync: ValueSyncConfig,
+    }
+
+    impl NodeConfig for FailingSyncConfig {
+        fn moniker(&self) -> &str {
+            "failing-sync-test"
+        }
+
+        fn consensus(&self) -> &ConsensusConfig {
+            &self.consensus
+        }
+
+        fn consensus_mut(&mut self) -> &mut ConsensusConfig {
+            &mut self.consensus
+        }
+
+        fn value_sync(&self) -> &ValueSyncConfig {
+            &self.value_sync
+        }
+
+        fn value_sync_mut(&mut self) -> &mut ValueSyncConfig {
+            &mut self.value_sync
+        }
+    }
 
     impl NodeConfig for Config {
         fn moniker(&self) -> &str {
@@ -1046,6 +1165,56 @@ mod tests {
         );
 
         assert!(context.signer.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_failure_stops_default_actors() {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).expect("reserve test port");
+        let listen_addr = probe.local_addr().expect("read test port");
+        drop(probe);
+
+        let mut consensus = ConsensusConfig::default();
+        consensus.p2p.listen_addr = format!("/ip4/127.0.0.1/tcp/{}", listen_addr.port())
+            .parse()
+            .expect("valid listen multiaddr");
+
+        let value_sync = ValueSyncConfig {
+            batch_size: 0,
+            ..Default::default()
+        };
+
+        let config = FailingSyncConfig {
+            consensus,
+            value_sync,
+        };
+        let wal_dir = tempfile::tempdir().expect("create WAL directory");
+        let wal_path = wal_dir.path().join("consensus.wal");
+        let identity = NetworkIdentity::new(
+            config.moniker().to_owned(),
+            Keypair::generate_ed25519(),
+            None,
+        );
+
+        let result = EngineBuilder::new(TestContext::default(), config)
+            .with_default_wal(WalContext::new(wal_path, ProtobufCodec))
+            .with_default_network(NetworkContext::new(identity, JsonCodec))
+            .with_default_sync(SyncContext::new(JsonCodec))
+            .with_default_consensus(ConsensusContext::new_full_node(
+                Address::new([0; 20]),
+                Box::new(Ed25519Verifier),
+            ))
+            .with_default_request(RequestContext::new(1))
+            .build()
+            .await;
+
+        assert!(result.is_err_and(|error| error
+            .to_string()
+            .contains("Value sync batch size cannot be zero")));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            TcpStream::connect_timeout(&listen_addr, Duration::from_secs(1)).is_err(),
+            "failed build must stop the network listener"
+        );
     }
 
     // All default actors

@@ -232,6 +232,7 @@ dependencies = [
  "eyre",
  "ractor",
  "rand 0.8.5",
+ "tempfile",
  "thiserror 2.0.16",
  "tokio",
  "tracing",
