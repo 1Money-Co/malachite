@@ -29,8 +29,8 @@ invariant or qualifies Emerald.
 | `height-parameters` | `155a1fc7`, `d2fc6f47` | engine-owned values | Adopt app callbacks | Emerald | V7-G5 |
 | `sync-queue-scoring` | `1b2a15b2`, `628d8cff`, `5cd137fb` | fork queues | Require parity | T5 passed | V7-G6 |
 | `proposal-part-forwarding` | `3e41a306` | trait part signing | Preserve app authentication | Emerald | V7-G7 |
-| `wal-polka-certificate` | `8ee5d998` | tags `0x01`, `0x02`, `0x04` | Add `0x08`; read old | T6 | V7-G8 |
-| `wal-immediate-replay` | `3c264593` | immediate replay | Reject delay; remove `WaitingForSync` | Pending T6 | V7-G9 |
+| `wal-polka-certificate` | `8ee5d998` | tags `0x01`, `0x02`, `0x04` | Add `0x08`; read old | T6 passed | V7-G8 |
+| `wal-immediate-replay` | `3c264593` | immediate replay | Reject delay; remove wait phase | T6 passed | V7-G9 |
 | `wal-feature-matrix` | none | raw fixtures assume raw rewrites | Test raw/forced modes | T2 passed | V7-G10 |
 
 ### Replacement inputs and phase-1 retention
@@ -50,8 +50,8 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
 | `sync-network-subscription-order` | v0.7 builder wiring | Retained | builder order audit |
 | `consensus-sync-input-queue` | v0.7 consensus input queue | Passed T5 | bounded sync-first isolation |
 | `consensus-request-errors` | v0.7 app channel | Passed | `Closed`, `Full`, and `Recv` tests |
-| `wal-entry-height` | `8ee5d998` | Partial | old fixtures and height regression |
-| `wal-same-height-no-replay` | `8ee5d998` | Partial | same-height reply test |
+| `wal-entry-height` | `8ee5d998` | Passed T6 | old fixtures and height regression |
+| `wal-same-height-no-replay` | `8ee5d998` | Passed T6 | same-height reply test |
 | `sync-peer-restart-recovery` | `628d8cff`, `5cd137fb` | Passed T5 | peer-restart integration scenario |
 | `decided-reply-async-forwarding` | v0.7 builder/app channel | Retained | async path and dropped-reply log |
 | `rc3-logging-context` | v0.7 logging changes | Partial | severity, context, and control-flow audit |
@@ -65,6 +65,13 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
   prefix, keeps wrong-peer and unknown replies from consuming the real request, tracks inflight and exact
   consensus-pending ranges from one snapshot, and retries a locally rejected height without penalizing its peer or
   discarding the remaining buffered response.
+- **T6:** the `wal_codec` and `wal_compatibility` unit filters each passed 6 tests; the serial WAL suite passed all 7
+  enabled scenarios with 76 filtered and no retry; and the config crate passed all 15 tests. Recovery replays a
+  non-empty validator WAL before notifying sync, while empty WALs and full nodes start without replay. The `0x08`
+  polka-certificate entry fixture has SHA-256
+  `252be25c27c1ee934f606a80b38f6effda7902b0eaaaa7920c9ae96275f9bf50`. A detached worktree at phase-1 commit
+  `6f544d7efca221ee8e7d2da9af37795ed6745f99` proved its old decoder rejects that fixture with `invalid tag` and
+  leaves the WAL bytes and hash unchanged. Legacy `wal_replay_delay` TOML is ignored and has no runtime effect.
 
 ### v0.7 retirement gates
 

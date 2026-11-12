@@ -11,7 +11,6 @@ use derive_where::derive_where;
 use eyre::eyre;
 use itertools::Itertools;
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, error, error_span, info, warn};
 
@@ -133,10 +132,6 @@ pub enum Msg<Ctx: Context> {
     /// This triggers notifying the sync actor about the decided height.
     DecisionCommitted(Ctx::Height),
 
-    /// The WAL replay delay has elapsed for the given height; if we are still in
-    /// `WaitingForSync` at the same height, replay the WAL.
-    WalReplayDelayElapsed(Ctx::Height),
-
     /// Request to dump the current consensus state
     DumpState(RpcReplyPort<Option<StateDump<Ctx>>>),
 }
@@ -187,9 +182,6 @@ impl<Ctx: Context> fmt::Display for Msg<Ctx> {
                 write!(f, "RestartHeight(height={height} params={params:?})")
             }
             Msg::DecisionCommitted(height) => write!(f, "DecisionCommitted(height={height})"),
-            Msg::WalReplayDelayElapsed(height) => {
-                write!(f, "WalReplayDelayElapsed(height={height})")
-            }
             Msg::DumpState(_) => write!(f, "DumpState"),
         }
     }
@@ -217,9 +209,6 @@ enum Phase {
     Ready,
     Running,
     Recovering,
-    /// Waiting for sync to attempt retrieving a certificate for
-    /// the crash height before replaying the WAL.
-    WaitingForSync,
 }
 
 /// Maximum number of messages to buffer while consensus is
@@ -250,12 +239,6 @@ pub struct State<Ctx: Context> {
     /// A buffer of messages that were received while
     /// consensus was not in the `Running` phase
     msg_buffer: MessageBuffer<Ctx>,
-
-    /// WAL entries pending replay during the `WaitingForSync` phase.
-    pending_wal_entries: Vec<io::Result<WalEntry<Ctx>>>,
-
-    /// Handle for the WAL replay delay timer, used for cancellation.
-    wal_replay_timer: Option<JoinHandle<()>>,
 }
 
 impl<Ctx> State<Ctx>
@@ -400,12 +383,6 @@ where
                     return Err(eyre!("Validator set for height {height} is empty").into());
                 }
 
-                // Reset per-height state
-                state.pending_wal_entries.clear();
-                if let Some(handle) = state.wal_replay_timer.take() {
-                    handle.abort();
-                }
-
                 // Initialize consensus state if this is the first height we start
                 if state.consensus.is_none() {
                     state.consensus = Some(ConsensusState::new(
@@ -466,11 +443,6 @@ where
                 // Update the timeouts
                 state.timeouts = params.timeouts;
 
-                let wal_replay_delay = self.consensus_config.wal_replay_delay;
-                // Note: both `is_restart` and non-validator paths yield empty
-                // `wal_entries`, so the delay is inherently skipped in those cases.
-                let should_delay = !wal_entries.is_empty() && !wal_replay_delay.is_zero();
-
                 // Start consensus for the given height
                 let result = self
                     .process_input(
@@ -489,34 +461,8 @@ where
                     error!(%height, "Error when starting height: {e}");
                 }
 
-                if should_delay {
-                    // Defer WAL replay to give sync a chance to retrieve a certificate
-                    info!(
-                        %height,
-                        entries = wal_entries.len(),
-                        delay = ?wal_replay_delay,
-                        "Deferring WAL replay to wait for sync"
-                    );
-
-                    state.set_phase(Phase::WaitingForSync);
-                    state.pending_wal_entries = wal_entries;
-
-                    // Notify sync so it can start fetching certificates during the delay
-                    let start_type = HeightStartType::from_is_restart(is_restart);
-                    self.sync.send(SyncMsg::StartedHeight(height, start_type));
-
-                    // Schedule the WAL replay delay timer
-                    let actor = myself.clone();
-                    let timer_height = height;
-                    state.wal_replay_timer = Some(tokio::spawn(async move {
-                        tokio::time::sleep(wal_replay_delay).await;
-                        let _ = actor.cast(Msg::WalReplayDelayElapsed(timer_height));
-                    }));
-
-                    return Ok(());
-                }
-
-                // No delay: proceed with immediate WAL replay (original behavior)
+                // A validator must reconstruct its recorded crash state before
+                // sync can advance the height or apply a certificate.
                 if !wal_entries.is_empty() {
                     state.set_phase(Phase::Recovering);
 
@@ -535,8 +481,6 @@ where
                 // which fires when the app confirms the decision commit (after Effect::Decide).
                 let start_type = HeightStartType::from_is_restart(is_restart);
 
-                // If the WAL replay is not delayed, notify sync here.
-                // (The delay path at L472 already sends StartedHeight earlier.)
                 self.sync.send(SyncMsg::StartedHeight(height, start_type));
 
                 // Process any buffered messages, now that we are in the `Running` phase
@@ -786,48 +730,6 @@ where
                     state.height(),
                     "DecisionCommitted height must match current state height"
                 );
-
-                // If we were waiting for a sync certificate to apply, the cert has
-                // now driven the state machine to a decision. Transition out of
-                // `WaitingForSync`: cancel the timer, discard the unused pending
-                // WAL entries, and process any buffered messages.
-                if state.phase == Phase::WaitingForSync && height == state.height() {
-                    info!(
-                        %height,
-                        "Sync certificate applied; transitioning out of WaitingForSync"
-                    );
-
-                    if let Some(handle) = state.wal_replay_timer.take() {
-                        handle.abort();
-                    }
-                    state.pending_wal_entries.clear();
-
-                    state.set_phase(Phase::Running);
-                    self.process_buffered_msgs(&myself, state, false).await;
-                }
-
-                Ok(())
-            }
-
-            Msg::WalReplayDelayElapsed(timer_height) => {
-                if state.phase != Phase::WaitingForSync || state.height() != timer_height {
-                    // Stale timer fire: we have moved past `WaitingForSync` of the height
-                    // the timer was set up for.
-                    return Ok(());
-                }
-
-                // The driver has already decided this height; the in-flight
-                // `Msg::DecisionCommitted` will handle the transition out of
-                // `WaitingForSync`. Resetting here would wipe the decision.
-                if state
-                    .consensus
-                    .as_ref()
-                    .is_some_and(|c| c.driver.step_is_commit())
-                {
-                    return Ok(());
-                }
-
-                self.end_wal_wait(&myself, state).await;
 
                 Ok(())
             }
@@ -1186,70 +1088,6 @@ where
         }
 
         Ok(())
-    }
-
-    /// End the `WaitingForSync` phase by replaying the WAL.
-    ///
-    /// Called when the WAL-replay delay timer elapses without consensus having
-    /// reached a decision via the sync-certificate path. Resets the consensus
-    /// state (discarding any partial sync-certificate data), replays the
-    /// pending WAL entries to restore the pre-crash consensus state,
-    /// transitions to `Running`, then drains the message buffer.
-    ///
-    /// The pre-replay consensus reset preserves the assumption that WAL replay
-    /// only reconstructs state, it does not lead to e.g. a new decision.
-    async fn end_wal_wait(&self, myself: &ActorRef<Msg<Ctx>>, state: &mut State<Ctx>) {
-        if let Some(handle) = state.wal_replay_timer.take() {
-            handle.abort();
-        }
-
-        let height = state.height();
-        let wal_entries = std::mem::take(&mut state.pending_wal_entries);
-
-        if !wal_entries.is_empty() {
-            info!(
-                %height,
-                entries = wal_entries.len(),
-                "WAL replay delay elapsed without consensus reaching a decision, replaying WAL"
-            );
-
-            // Transition to `Recovering` *before* the driver reset so that any effects
-            // emitted during the StartHeight result in no-op `wal_flush` calls.
-            state.set_phase(Phase::Recovering);
-
-            let validator_set = state
-                .consensus
-                .as_ref()
-                .expect("consensus must be initialized when leaving WaitingForSync")
-                .validator_set()
-                .clone();
-
-            hang_on_failure(
-                self.process_input(
-                    myself,
-                    state,
-                    ConsensusInput::StartHeight(
-                        height,
-                        validator_set,
-                        false, // not a `Msg::RestartHeight`; we're just resetting consensus state
-                        None,  // a target time here would be moot
-                    ),
-                ),
-                |e| {
-                    error!(%height, "Error re-initializing core state before WAL replay: {e}");
-                },
-            )
-            .await;
-
-            hang_on_failure(self.wal_replay(myself, state, height, wal_entries), |e| {
-                error!(%height, "Error when replaying WAL: {e}");
-                error!(%height, "Consensus may be in an inconsistent state after WAL replay failure");
-            })
-            .await;
-        }
-
-        state.set_phase(Phase::Running);
-        self.process_buffered_msgs(myself, state, false).await;
     }
 
     async fn handle_effect(
@@ -1720,8 +1558,6 @@ where
             phase: Phase::Unstarted,
             is_validator: false,
             msg_buffer: MessageBuffer::new(MAX_BUFFER_SIZE),
-            pending_wal_entries: Vec::new(),
-            wal_replay_timer: None,
         })
     }
 
@@ -1757,10 +1593,7 @@ where
         msg: Msg<Ctx>,
         state: &mut State<Ctx>,
     ) -> Result<(), ActorProcessingErr> {
-        // During `WaitingForSync`, sync-related messages must flow through.
-        let bypass_buffer = state.phase == Phase::WaitingForSync && is_sync_application_msg(&msg);
-
-        if !bypass_buffer && state.phase != Phase::Running && should_buffer(&msg) {
+        if state.phase != Phase::Running && should_buffer(&msg) {
             let _span = error_span!("buffer", phase = ?state.phase).entered();
             state.msg_buffer.buffer(msg);
             return Ok(());
@@ -1789,9 +1622,6 @@ where
     ) -> Result<(), ActorProcessingErr> {
         info!("Consensus has stopped");
         state.timers.cancel_all();
-        if let Some(handle) = state.wal_replay_timer.take() {
-            handle.abort();
-        }
         Ok(())
     }
 }
@@ -1801,18 +1631,9 @@ fn should_buffer<Ctx: Context>(msg: &Msg<Ctx>) -> bool {
         msg,
         Msg::StartHeight(..)
             | Msg::DecisionCommitted(..)
-            | Msg::WalReplayDelayElapsed(..)
             | Msg::NetworkEvent(NetworkEvent::Listening(..))
             | Msg::NetworkEvent(NetworkEvent::PeerConnected(..))
             | Msg::NetworkEvent(NetworkEvent::PeerDisconnected(..))
-    )
-}
-
-/// Whether `msg` is part of the sync-certificate application chain.
-fn is_sync_application_msg<Ctx: Context>(msg: &Msg<Ctx>) -> bool {
-    matches!(
-        msg,
-        Msg::ProcessSyncResponse(..) | Msg::ReceivedProposedValue(_, ValueOrigin::Sync)
     )
 }
 

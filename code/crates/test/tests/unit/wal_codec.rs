@@ -19,6 +19,7 @@ use malachitebft_core_types::{
     Validity,
 };
 use malachitebft_engine::wal::{decode_entry, encode_entry};
+use sha2::{Digest, Sha256};
 
 fn round_trip(entry: &WalEntry<TestContext>) -> WalEntry<TestContext> {
     let codec = ProtobufCodec;
@@ -123,7 +124,16 @@ fn wal_entry_polka_certificate_round_trip() {
     };
 
     let entry = WalEntry::PolkaCertificate(cert.clone());
-    let decoded = round_trip(&entry);
+    let codec = ProtobufCodec;
+    let mut encoded = Vec::new();
+    encode_entry(&entry, &codec, &mut encoded).expect("encode_entry");
+    assert_eq!(encoded.first(), Some(&0x08), "polka certificate tag");
+    assert_eq!(
+        hex::encode(Sha256::digest(&encoded)),
+        "252be25c27c1ee934f606a80b38f6effda7902b0eaaaa7920c9ae96275f9bf50",
+        "polka certificate fixture hash"
+    );
+    let decoded = decode_entry(&codec, Cursor::new(encoded)).expect("decode_entry");
 
     let WalEntry::PolkaCertificate(got) = decoded else {
         panic!("expected PolkaCertificate variant, got {decoded:?}");

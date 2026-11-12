@@ -99,7 +99,8 @@ the driver is also responsible for removing the non-determinism present in
 Tendermint's [pseudo-code][pseudo-code], which in situations when multiple
 `upon` clauses can be activated, assumes that any of them could be chosen at
 random.
-The driver establishes priorities among potentially complex events, thereby making Malachite’s operation deterministic.
+The driver establishes priorities among potentially complex events, thereby
+making Malachite’s operation deterministic.
 
 The third layer of the consensus implementation,
 the [malachitebft-core-consensus][consensus-crate] crate,
@@ -275,7 +276,8 @@ persist all the outstanding inputs.
 
 All previous discussion boils down to this point: how is the operation of a
 recovery process?
-A key initial consideration is that, a priori, Malachite does not know whether it is operating in ordinary or recovery mode.
+A key initial consideration is that, a priori, Malachite does not know whether
+it is operating in ordinary or recovery mode.
 The consensus layer, in either operation mode, waits for a `StartHeight` input
 from the application indicating the height number `H` to start.
 At this point Malachite should open and load the WAL contents to check if it
@@ -413,6 +415,7 @@ pub enum WalEntry<Ctx: Context> {
     ConsensusMsg(SignedConsensusMsg<Ctx>),
     ProposedValue(ProposedValue<Ctx>),
     Timeout(Timeout),
+    PolkaCertificate(PolkaCertificate<Ctx>),
 }
 ```
 
@@ -422,12 +425,12 @@ When compared to the [malachitebft-core-consensus][consensus-crate] crate's
 - `Vote` and `Proposal` inputs were merged into `WalEntry::ConsensusMsg`
 - `Propose` and `ProposedValue` inputs were merged into `WalEntry::ProposedValue`
 - `TimeoutElapsed` is directly mapped to `WalEntry::Timeout`
+- `PolkaCertificate` is directly mapped to `WalEntry::PolkaCertificate`
 
 So, all the [list of inputs](#inputs) that must be persisted were contemplated.
 There are, however, important exceptions: some inputs produced by the
 synchronization protocol (`SyncValueResponse`, which includes a `CommitCertificate`)
-and by the liveness protocol (`PolkaCertificate` and `RoundCertificate`) are
-not persisted.
+and the liveness protocol (`RoundCertificate`) are not persisted.
 They are all **Certificate**s, namely types that aggregate multiple `Vote` inputs.
 By not persisting those inputs - namely, the `Vote` inputs not already persisted -
 recovering processes may behave inconsistently (see [issue #1445][issue-certs]).
@@ -466,6 +469,12 @@ The `fetch_entries` method is used to iterate through the WAL and collect all st
 `WalEntry` instances, that are returned to the consensus engine.
 If `WalEntry` instances are returned, the consensus engine is set to
 `Phase::Recovering` and the persisted inputs are replayed by the `wal_replay` method.
+For a validator with a non-empty WAL, this replay happens immediately, before the
+synchronization actor is told that the height has started. A sync certificate
+therefore cannot replace or skip reconstruction of the recorded crash state.
+The former `wal_replay_delay` configuration key is no longer part of
+`ConsensusConfig`. Serde accepts it as an unknown legacy TOML key, but it has no
+runtime effect.
 This method reconstructs the associated consensus `Input`s and apply them using the
 `process_input` method, which is the same used to process ordinary inputs.
 The `Phase::Recovering` flag is only used for: (i) blocking the `WalAppend`
@@ -483,6 +492,12 @@ The WAL is not [reset](#reset-1) and the replayed inputs remain in the WAL for
 the case in which the process crashes or is shut down again.
 In addition, all inputs processed during normal operation are appended to the
 WAL as usual.
+
+The entry framing uses stable tag bytes: `0x01` for a signed consensus message,
+`0x02` for a timeout, `0x04` for a proposed value, and `0x08` for a polka
+certificate. Versions predating the `0x08` entry reject it as an unknown tag and
+must leave the WAL unchanged. Once a validator writes `0x08`, recovery requires
+this version or a later compatible decoder; downgrading that WAL is unsupported.
 
 ### Persistence
 
@@ -513,10 +528,13 @@ The Write-Ahead Log is a crucial component for the operation of a consensus
 process.
 As a result, errors when attempting to append inputs to the WAL
 **must be critical**.
-At the moment, from this [commit](https://github.com/circlefin/malachite/commit/38f113f6c81da0af32a748718b2d87ab64e3a72f),
+At the moment, from
+[this commit](https://github.com/circlefin/malachite/commit/38f113f6c81da0af32a748718b2d87ab64e3a72f),
 consensus hangs forever in case of any WAL operational error.
 
-A second source of errors occurs during WAL replay and requires special attention: an error at a given entry implies that all subsequent WAL entries are corrupted.
+A second source of errors occurs during WAL replay and requires special
+attention: an error at a given entry implies that all subsequent WAL entries
+are corrupted.
 Notice that crashes can happen at any time of the execution, including the
 instant at which a WAL entry is being persisted to stable storage.
 A crash at this point will likely render a suffix of the WAL corrupted.
@@ -526,12 +544,10 @@ associated state-machine transition are only emitted after the WAL is
 Since the append operation has not been concluded with success, the output was
 not emitted, therefore it is just like it has never been produced.
 
-In summary, as discussed in [issue #1434][issue-corrupt], corruptions at
-the tail of the WAL should not produce a critical error.
-The entries successfully decoded should be replayed, and the WAL should be
-truncated to the end of the latest successfully decoded entry.
-The last step is needed to enable further appending inputs to the WAL when the
-recovery is concluded and new inputs are processed in "normal" operation.
+In summary, replay fails closed at the first corrupt or unknown entry. Consensus
+does not transition to normal operation after that error. A frame-level read
+failure may truncate an incomplete tail to the last complete frame; a decoded
+unknown tag such as `0x08` on an older binary does not mutate the WAL.
 
 ## Status
 

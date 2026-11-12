@@ -358,12 +358,14 @@ fn truncated_production_wal_fails_without_returning_a_prefix() -> Result<()> {
 }
 
 #[test]
-fn corrupt_production_wal_fails_without_returning_a_prefix() -> Result<()> {
+fn corrupt_replay_fails_closed() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let mut corrupt = PRODUCTION_WAL.to_vec();
     let last = corrupt.len() - 1;
     corrupt[last] ^= 1;
     let path = materialize_fixture(directory.path(), &corrupt, "corrupt.log")?;
+    let hash_before = sha256(&std::fs::read(&path)?);
     assert!(read_fixture(&path).is_err());
+    assert_eq!(sha256(&std::fs::read(&path)?), hash_before);
     Ok(())
 }
