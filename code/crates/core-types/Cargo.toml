@@ -1,5 +1,5 @@
 [package]
-name = "informalsystems-malachitebft-core-types"
+name = "arc-malachitebft-core-types"
 description = "Core type definitions and interfaces for the Malachite BFT consensus engine"
 version.workspace = true
 edition.workspace = true
@@ -27,3 +27,6 @@ bytes = { workspace = true, default-features = false }
 derive-where = { workspace = true }
 thiserror = { workspace = true, default-features = false }
 serde = { workspace = true, default-features = false, features = ["derive"], optional = true }
+
+[dev-dependencies]
+rand = { workspace = true }

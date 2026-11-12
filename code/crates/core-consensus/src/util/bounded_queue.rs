@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
-use tracing::warn;
+use std::fmt::Display;
+
+use tracing::{debug, trace};
 
 /// A data structure that maintains a queue of values associated with monotonically increasing indices.
 ///
@@ -9,6 +11,7 @@ use tracing::warn;
 #[derive(Clone, Debug)]
 pub struct BoundedQueue<I, T> {
     capacity: usize,
+    per_key_capacity: usize,
     queue: BTreeMap<I, Vec<T>>,
 }
 
@@ -16,41 +19,63 @@ impl<I, T> BoundedQueue<I, T>
 where
     I: Ord,
 {
-    /// Creates a new `BoundedQueue` with the specified capacity.
-    pub fn new(capacity: usize) -> Self {
+    /// Creates a new `BoundedQueue` with the specified capacity (max distinct keys)
+    /// and per-key capacity (max values per key).
+    pub fn new(capacity: usize, per_key_capacity: usize) -> Self {
         Self {
             capacity,
+            per_key_capacity,
             queue: BTreeMap::new(),
         }
     }
 
     /// Push a value into the queue associated with the given index.
+    ///
+    /// Returns `true` if the value was successfully added,
+    /// or `false` if the queue is full and the value could not be added.
     pub fn push(&mut self, index: I, value: T) -> bool
     where
-        I: Clone + Ord,
+        I: Clone + Display + Ord,
     {
-        // If the index already exists, append the value to the existing vector.
+        // If the index already exists, append the value to the existing vector,
+        // but only if the per-key capacity has not been reached.
         if let Some(values) = self.queue.get_mut(&index) {
+            if values.len() >= self.per_key_capacity {
+                debug!(
+                    index = %index,
+                    per_key_capacity = self.per_key_capacity,
+                    "Per-key capacity reached, rejecting value"
+                );
+                return false;
+            }
             values.push(value);
             return true;
         }
 
         // If the index does not exist, check if we can add a new entry.
-        if self.queue.len() < self.capacity {
+        if !self.is_full() {
             self.queue.insert(index, vec![value]);
             return true;
         }
 
+        let queue_length = self.queue.len();
+
         // If the queue is full, evict the highest index and insert the new value.
-        if let Some((max_index, _)) = self.queue.last_key_value() {
+        if let Some(max_entry) = self.queue.last_entry() {
+            let max_index = max_entry.key();
+
             // If the new index is less than the maximum index, we can evict the maximum index.
             if &index < max_index {
-                let max_index = max_index.clone();
+                debug!(
+                    index = %index,
+                    evicted_index = %max_index,
+                    capacity = self.capacity,
+                    len = queue_length,
+                    "Bounded queue is full, evicting highest index"
+                );
 
-                warn!("Bounded queue is full, dropping value");
-
-                // Remove the highest index
-                self.queue.remove(&max_index);
+                // Remove the entry at the highest index
+                max_entry.remove();
 
                 // Insert the new index with its value
                 self.queue.insert(index, vec![value]);
@@ -59,19 +84,45 @@ where
             }
         }
 
-        warn!("Bounded queue is full, no value is inserted");
+        debug!(
+            index = %index,
+            capacity = self.capacity,
+            len = self.queue.len(),
+            "Bounded queue is full, rejecting value"
+        );
+
         false
     }
 
     /// Combination of `shift` and `take` methods.
-    pub fn shift_and_take(&mut self, min_index: &I) -> impl Iterator<Item = T> {
+    pub fn shift_and_take(&mut self, min_index: &I) -> impl Iterator<Item = T>
+    where
+        I: Display,
+    {
         self.shift(min_index);
         self.take(min_index)
     }
 
     /// Remove all entries with indices less than `min_index`.
-    pub fn shift(&mut self, min_index: &I) {
-        self.queue.retain(|index, _| index >= min_index);
+    pub fn shift(&mut self, min_index: &I)
+    where
+        I: Display,
+    {
+        let before = self.queue.len();
+
+        // split_off returns a new BTreeMap with all entries >= min_index in O(log n),
+        // which is more efficient than retain's O(n) scan.
+        self.queue = self.queue.split_off(min_index);
+
+        let removed = before - self.queue.len();
+        if removed > 0 {
+            trace!(
+                min_index = %min_index,
+                removed,
+                remaining = self.queue.len(),
+                "Shifted bounded queue"
+            );
+        }
     }
 
     /// Take all entries with indices equal to `index` and return them.
@@ -80,6 +131,32 @@ where
             .remove(index)
             .into_iter()
             .flat_map(|values| values.into_iter())
+    }
+
+    /// Retain only the values for which the predicate returns `true`.
+    ///
+    /// Values are tested per-entry: for each index, the predicate receives
+    /// the index and each value. If all values for a given index are removed,
+    /// the index entry itself is removed as well.
+    ///
+    /// Returns the number of values removed.
+    pub fn retain<F>(&mut self, mut f: F) -> usize
+    where
+        F: FnMut(&I, &T) -> bool,
+    {
+        let mut removed = 0;
+        self.queue.retain(|index, values| {
+            let before = values.len();
+            values.retain(|value| f(index, value));
+            removed += before - values.len();
+            !values.is_empty()
+        });
+        removed
+    }
+
+    /// Remove all entries from the queue.
+    pub fn clear(&mut self) {
+        self.queue.clear();
     }
 
     /// Whether the queue is full
@@ -109,7 +186,7 @@ mod tests {
 
     #[test]
     fn push_within_capacity() {
-        let mut queue = BoundedQueue::new(3);
+        let mut queue = BoundedQueue::new(3, 1000);
 
         assert!(queue.push(1, "value1"));
         assert!(queue.push(2, "value2"));
@@ -123,7 +200,7 @@ mod tests {
 
     #[test]
     fn push_to_existing_index() {
-        let mut queue = BoundedQueue::new(2);
+        let mut queue = BoundedQueue::new(2, 1000);
         queue.push(10, "a");
 
         // Push another value to the same index
@@ -137,8 +214,68 @@ mod tests {
     }
 
     #[test]
+    fn per_key_growth_is_bounded() {
+        let per_key_cap = 5;
+        let mut queue = BoundedQueue::new(3, per_key_cap);
+
+        // Push values up to the per-key capacity
+        for i in 0..per_key_cap {
+            assert!(queue.push(10, i), "push #{i} should succeed");
+        }
+        assert_eq!(queue.size(), per_key_cap);
+
+        // The next push to the same key should be rejected
+        assert!(
+            !queue.push(10, 999),
+            "push beyond per-key capacity should fail"
+        );
+        assert_eq!(
+            queue.size(),
+            per_key_cap,
+            "size must not grow beyond per-key capacity"
+        );
+    }
+
+    #[test]
+    fn per_key_limit_independent_per_key() {
+        let mut queue = BoundedQueue::new(5, 2);
+
+        // Fill key 10 to per-key capacity
+        assert!(queue.push(10, "a"));
+        assert!(queue.push(10, "b"));
+        assert!(!queue.push(10, "c"), "key 10 is full");
+
+        // Key 20 should still accept values independently
+        assert!(queue.push(20, "x"));
+        assert!(queue.push(20, "y"));
+        assert!(!queue.push(20, "z"), "key 20 is full");
+
+        assert_eq!(queue.size(), 4);
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn per_key_limit_with_queue_full() {
+        // 2 keys max, 3 values per key
+        let mut queue = BoundedQueue::new(2, 3);
+
+        queue.push(10, "a");
+        queue.push(10, "b");
+        queue.push(20, "c");
+
+        // Queue is full (2 keys). New key rejected.
+        assert!(!queue.push(30, "d"));
+
+        // But existing keys can still accept values up to per-key limit.
+        assert!(queue.push(10, "e")); // 3rd value for key 10
+        assert!(!queue.push(10, "f")); // 4th value — rejected by per-key limit
+
+        assert_eq!(queue.size(), 4); // a, b, e for key 10 + c for key 20
+    }
+
+    #[test]
     fn push_to_full_queue_fails_for_new_index() {
-        let mut queue = BoundedQueue::new(2);
+        let mut queue = BoundedQueue::new(2, 1000);
         queue.push(10, "a");
         queue.push(20, "b");
 
@@ -158,7 +295,7 @@ mod tests {
 
     #[test]
     fn push_to_full_queue_succeeds_for_existing_index() {
-        let mut queue = BoundedQueue::new(2);
+        let mut queue = BoundedQueue::new(2, 1000);
         queue.push(10, "a");
         queue.push(20, "b");
 
@@ -183,7 +320,7 @@ mod tests {
 
     #[test]
     fn push_to_zero_capacity_queue() {
-        let mut queue = BoundedQueue::new(0);
+        let mut queue = BoundedQueue::new(0, 1000);
         let result = queue.push(1, "a");
 
         assert!(!result);
@@ -192,7 +329,7 @@ mod tests {
 
     #[test]
     fn take_existing_index() {
-        let mut queue = BoundedQueue::new(3);
+        let mut queue = BoundedQueue::new(3, 1000);
         queue.push(10, "a");
         queue.push(10, "b");
         queue.push(20, "c");
@@ -218,7 +355,7 @@ mod tests {
 
     #[test]
     fn take_non_existent_index() {
-        let mut queue = BoundedQueue::new(3);
+        let mut queue = BoundedQueue::new(3, 1000);
         queue.push(10, "a");
 
         // Take a non-existent index
@@ -230,14 +367,14 @@ mod tests {
 
     #[test]
     fn take_empty_queue() {
-        let mut queue: BoundedQueue<i32, String> = BoundedQueue::new(5);
+        let mut queue: BoundedQueue<i32, String> = BoundedQueue::new(5, 1000);
         let values: Vec<_> = queue.take(&1).collect();
         assert!(values.is_empty());
     }
 
     #[test]
     fn shift_removes_older_entries() {
-        let mut queue = BoundedQueue::new(5);
+        let mut queue = BoundedQueue::new(5, 1000);
         queue.push(10, 1);
         queue.push(20, 2);
         queue.push(30, 3);
@@ -255,7 +392,7 @@ mod tests {
 
     #[test]
     fn shift_all_and_none() {
-        let mut queue = BoundedQueue::new(5);
+        let mut queue = BoundedQueue::new(5, 1000);
         queue.push(10, 1);
         queue.push(20, 2);
 
@@ -278,7 +415,7 @@ mod tests {
 
     #[test]
     fn shift_on_empty_queue() {
-        let mut queue = BoundedQueue::<u32, i32>::new(5);
+        let mut queue = BoundedQueue::<u32, i32>::new(5, 1000);
         // Shift on an empty queue should not panic
         queue.shift(&100);
         assert!(queue.queue.is_empty());
@@ -286,7 +423,7 @@ mod tests {
 
     #[test]
     fn shift_and_take_removes_older_and_takes_target() {
-        let mut queue = BoundedQueue::new(5);
+        let mut queue = BoundedQueue::new(5, 1000);
         queue.push(1, "value1");
         queue.push(2, "value2a");
         queue.push(2, "value2b");
@@ -306,7 +443,7 @@ mod tests {
 
     #[test]
     fn shift_and_take_with_non_existent_target() {
-        let mut queue = BoundedQueue::new(5);
+        let mut queue = BoundedQueue::new(5, 1000);
         queue.push(1, "value1");
         queue.push(3, "value3");
         queue.push(5, "value5");
@@ -326,7 +463,7 @@ mod tests {
 
     #[test]
     fn clone_trait() {
-        let mut queue = BoundedQueue::new(3);
+        let mut queue = BoundedQueue::new(3, 1000);
         queue.push(1, "value1");
         queue.push(2, "value2");
 
@@ -341,7 +478,7 @@ mod tests {
 
     #[test]
     fn debug_trait() {
-        let mut queue = BoundedQueue::new(2);
+        let mut queue = BoundedQueue::new(2, 1000);
         queue.push(1, "value1");
 
         let debug_str = format!("{queue:?}");
@@ -353,7 +490,7 @@ mod tests {
     #[test]
     fn with_different_types() {
         // Test with different index and value types to ensure generics work
-        let mut queue: BoundedQueue<String, i32> = BoundedQueue::new(3);
+        let mut queue: BoundedQueue<String, i32> = BoundedQueue::new(3, 1000);
 
         assert!(queue.push("key1".to_string(), 100));
         assert!(queue.push("key2".to_string(), 200));
@@ -365,7 +502,7 @@ mod tests {
 
     #[test]
     fn ordering_with_btreemap() {
-        let mut queue = BoundedQueue::new(5);
+        let mut queue = BoundedQueue::new(5, 1000);
 
         // Insert in non-sequential order
         queue.push(3, "value3");
@@ -380,7 +517,7 @@ mod tests {
 
     #[test]
     fn edge_case_single_capacity() {
-        let mut queue = BoundedQueue::new(1);
+        let mut queue = BoundedQueue::new(1, 1000);
 
         assert!(queue.push(1, "value1"));
 
@@ -401,7 +538,7 @@ mod tests {
 
     #[test]
     fn multiple_operations_sequence() {
-        let mut queue = BoundedQueue::new(4);
+        let mut queue = BoundedQueue::new(4, 1000);
 
         // Initial setup
         queue.push(1, "a");
@@ -438,7 +575,7 @@ mod tests {
 
     #[test]
     fn push_out_of_order_to_full_queue() {
-        let mut queue = BoundedQueue::new(2);
+        let mut queue = BoundedQueue::new(2, 1000);
         queue.push(10, "a");
         queue.push(30, "b");
 
@@ -460,5 +597,69 @@ mod tests {
             !queue.queue.contains_key(&30),
             "The high value element should be removed"
         );
+    }
+
+    #[test]
+    fn retain_removes_matching_values() {
+        let mut queue = BoundedQueue::new(5, 1000);
+        queue.push(10, "a");
+        queue.push(10, "b");
+        queue.push(20, "c");
+        queue.push(30, "d");
+
+        // Remove all values that are "a" or "c"
+        let removed = queue.retain(|_, v| *v != "a" && *v != "c");
+
+        assert_eq!(removed, 2);
+        // Index 10 should still exist with only "b"
+        assert_eq!(queue.queue.get(&10), Some(&vec!["b"]));
+        // Index 20 should be removed entirely since its only value was "c"
+        assert!(!queue.queue.contains_key(&20));
+        // Index 30 should remain unchanged
+        assert_eq!(queue.queue.get(&30), Some(&vec!["d"]));
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn retain_removes_all_values() {
+        let mut queue = BoundedQueue::new(5, 1000);
+        queue.push(10, "a");
+        queue.push(20, "b");
+
+        let removed = queue.retain(|_, _| false);
+
+        assert_eq!(removed, 2);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn retain_keeps_all_values() {
+        let mut queue = BoundedQueue::new(5, 1000);
+        queue.push(10, "a");
+        queue.push(20, "b");
+
+        let removed = queue.retain(|_, _| true);
+
+        assert_eq!(removed, 0);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.size(), 2);
+    }
+
+    #[test]
+    fn retain_uses_index() {
+        let mut queue = BoundedQueue::new(5, 1000);
+        queue.push(10, "a");
+        queue.push(10, "b");
+        queue.push(20, "c");
+        queue.push(30, "d");
+
+        // Remove all values at index 10
+        let removed = queue.retain(|index, _| *index != 10);
+
+        assert_eq!(removed, 2);
+        assert!(!queue.queue.contains_key(&10));
+        assert!(queue.queue.contains_key(&20));
+        assert!(queue.queue.contains_key(&30));
+        assert_eq!(queue.len(), 2);
     }
 }

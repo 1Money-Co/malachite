@@ -1,23 +1,25 @@
-use std::cmp::Ordering;
+use std::cmp::{max, min};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 
 use derive_where::derive_where;
 use tracing::{debug, error, info, warn};
 
+use malachitebft_core_types::utils::height::{DisplayRange, HeightRangeExt};
 use malachitebft_core_types::{Context, Height};
 
 use crate::co::Co;
 use crate::scoring::SyncResult;
 use crate::{
-    height_allowance_snapshot, perform, Effect, Error, HeightStartType, InboundRequestId, Metrics,
-    OutboundRequestId, PeerId, RawDecidedValue, Request, Resume, State, Status, ValueRequest,
+    perform, Effect, Error, HeightStartType, InboundRequestId, Metrics, OutboundRequestId, PeerId,
+    PendingRequestEntry, RawDecidedValue, Request, Resume, State, Status, ValueRequest,
     ValueResponse,
 };
 
 #[derive_where(Debug)]
 pub enum Input<Ctx: Context> {
-    /// A tick has occurred
-    Tick,
+    /// Periodical event triggering the broadcast of a status update
+    SendStatusUpdate,
 
     /// A status update has been received from a peer
     Status(Status<Ctx>),
@@ -62,11 +64,13 @@ where
     Ctx: Context,
 {
     match input {
-        Input::Tick => on_tick(co, state, metrics).await,
+        Input::SendStatusUpdate => on_send_status_update(co, state, metrics).await,
 
         Input::Status(status) => on_status(co, state, metrics, status).await,
 
-        Input::StartedHeight(height, restart) => on_started_height(state, height, restart).await,
+        Input::StartedHeight(height, restart) => {
+            on_started_height(co, state, metrics, height, restart).await
+        }
 
         Input::Decided(height) => on_decided(state, metrics, height).await,
 
@@ -74,112 +78,12 @@ where
             on_value_request(co, state, metrics, request_id, peer_id, request).await
         }
 
-        Input::ValueResponse(request_id, peer_id, response) => {
-            let requested_range = match take_inflight_if_peer_matches(state, &request_id, peer_id) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("Failed taking inflight request: {e}");
+        Input::ValueResponse(request_id, peer_id, Some(response)) => {
+            on_value_response(co, state, metrics, request_id, peer_id, response).await
+        }
 
-                    // This peer sent a response for a request id that is not related to the peer, and
-                    // hence we update the score of the peer accordingly.
-                    state.peer_scorer.update_score(peer_id, SyncResult::Failure);
-
-                    return Ok(());
-                }
-            };
-
-            let Some(mut response) = response else {
-                debug!(%request_id, %peer_id, "Received invalid response");
-
-                // Received an invalid value from this peer and hence update the peer's score accordingly.
-                state.peer_scorer.update_score(peer_id, SyncResult::Failure);
-
-                return Ok(());
-            };
-
-            let start = response.start_height;
-            let end = response.end_height().unwrap_or(start);
-            let range_len = end.as_u64() - start.as_u64() + 1;
-
-            // verify that the heights of the certificates are also correct
-            let mut current_height = start;
-            for value in response.values.iter() {
-                if value.certificate.height != current_height {
-                    warn!(%request_id, %peer_id, "Received response with wrong certificate heights: expected {}, got {}",
-                        current_height, value.certificate.height);
-
-                    // Received a value with invalid range of heights from this peer and hence update the peer's score accordingly.
-                    state.peer_scorer.update_score(peer_id, SyncResult::Failure);
-
-                    return Ok(());
-                }
-                current_height = current_height.increment();
-            }
-
-            // Check if the response is valid. A valid response starts at the requested start height,
-            // has at least one value, and no more than the requested range.
-            let is_valid = start.as_u64() == requested_range.start().as_u64()
-                && start.as_u64() <= end.as_u64()
-                && end.as_u64() <= requested_range.end().as_u64()
-                && response.values.len() as u64 == range_len;
-
-            if !is_valid {
-                warn!(%request_id, %peer_id, "Received response for wrong range of heights: expected {}..={} ({} values), got {}..={} ({} values)",
-                        requested_range.start().as_u64(), requested_range.end().as_u64(), range_len,
-                        start.as_u64(), end.as_u64(), response.values.len() as u64);
-
-                // Received a value with invalid range of heights from this peer and hence update the peer's score accordingly.
-                state.peer_scorer.update_score(peer_id, SyncResult::Failure);
-
-                return Ok(());
-            }
-
-            // Account for the original response even when consensus advanced while it was in flight.
-            debug!(start = %start, num_values = %response.values.len(), %peer_id, "Received response from peer");
-            if let Some(response_time) = metrics.value_response_received(start.as_u64()) {
-                state.peer_scorer.update_score_with_metrics(
-                    peer_id,
-                    SyncResult::Success(response_time),
-                    &metrics.scoring,
-                );
-            }
-
-            // Validate the original range and every certificate before trimming. With separate
-            // inflight/pending maps, already-decided values must not reserve queue capacity.
-            if end <= state.tip_height {
-                debug!(%request_id, %peer_id, %start, %end, height.tip = %state.tip_height,
-                    "Discarding obsolete sync response");
-                return Ok(());
-            }
-
-            if start <= state.tip_height {
-                let first_undecided = state.tip_height.increment();
-                let discarded_values = (first_undecided.as_u64() - start.as_u64()) as usize;
-                response.values.drain(..discarded_values);
-                response.start_height = first_undecided;
-                debug!(%request_id, %peer_id, %start, %first_undecided, %discarded_values,
-                    "Trimming obsolete prefix from sync response");
-            }
-
-            let pending_start = response.start_height;
-            // Only notify consensus after validation and removal of already-decided values.
-            perform!(
-                co,
-                Effect::NotifyConsensusToProcessSyncResponse(
-                    request_id.clone(),
-                    peer_id,
-                    response.clone(),
-                    Default::default()
-                )
-            );
-
-            // Only the received, undecided suffix consumes the consensus queue allowance.
-            state.pending_consensus_requests.insert(
-                request_id,
-                (vec![RangeInclusive::new(pending_start, end)], peer_id),
-            );
-
-            Ok(())
+        Input::ValueResponse(request_id, peer_id, None) => {
+            on_invalid_value_response(co, state, metrics, request_id, peer_id).await
         }
 
         Input::GotDecidedValues(request_id, range, values) => {
@@ -187,57 +91,100 @@ where
         }
 
         Input::SyncRequestTimedOut(request_id, peer_id, request) => {
-            match request {
-                Request::ValueRequest(value_request) => {
-                    info!(%peer_id, range = %DisplayRange::<Ctx>(&value_request.range), "Sync request timed out");
-
-                    state.peer_scorer.update_score(peer_id, SyncResult::Timeout);
-
-                    match take_inflight_if_peer_matches(state, &request_id, peer_id) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            // This should NEVER happen because we should only be able to receive
-                            // a time out from a request that we send.
-                            error!("Failed taking inflight request: {e}");
-                            return Ok(());
-                        }
-                    };
-
-                    metrics.value_request_timed_out(value_request.range.start().as_u64());
-                }
-            };
-
-            Ok(())
+            on_sync_request_timed_out(co, state, metrics, request_id, peer_id, request).await
         }
 
-        Input::InvalidValue(peer_id, height) => {
-            error!(%peer_id, %height, "Received invalid value");
+        Input::InvalidValue(peer, value) => on_invalid_value(co, state, metrics, peer, value).await,
 
-            state.peer_scorer.update_score(peer_id, SyncResult::Failure);
-
-            on_invalid_value(state, height, peer_id)
-        }
-
-        Input::ValueProcessingError(peer_id, height) => {
-            error!(%peer_id, %height, "Error while processing value");
-
-            // NOTE: In contrast to `Input::InvalidValue` we do not update the peer score here, as
-            // this is an internal error and not a failure from the peer's side.
-
-            on_invalid_value(state, height, peer_id)
+        Input::ValueProcessingError(peer, height) => {
+            on_value_processing_error(co, state, metrics, peer, height).await
         }
     }
 }
 
-pub async fn on_tick<Ctx>(
+async fn on_value_response<Ctx>(
     co: Co<Ctx>,
     state: &mut State<Ctx>,
     metrics: &Metrics,
+    request_id: OutboundRequestId,
+    peer_id: PeerId,
+    response: ValueResponse<Ctx>,
 ) -> Result<(), Error<Ctx>>
 where
     Ctx: Context,
 {
-    debug!(height.tip = %state.tip_height, "Broadcasting status");
+    let Some(entry) = state.pending_requests.get(&request_id) else {
+        warn!(%request_id, %peer_id, "Received response for unknown request ID");
+        return Ok(());
+    };
+    let requested_range = &entry.range;
+    let stored_peer_id = &entry.peer;
+
+    if stored_peer_id != &peer_id {
+        warn!(
+            %request_id, actual_peer = %peer_id, expected_peer = %stored_peer_id,
+            "Received response from different peer than expected"
+        );
+
+        return on_invalid_value_response(co, state, metrics, request_id, peer_id).await;
+    }
+
+    let start = response.start_height;
+    let received_len = response.values.len();
+    let requested_len = requested_range.len();
+
+    // A valid response starts at the requested start height and covers a
+    // non-empty prefix (possibly all) of the requested range. Shorter prefixes
+    // are accepted so peers returning truncated responses under
+    // `max_response_size` still make progress; they are credited less through
+    // `SyncResult::PartialSuccess` scoring below.
+    let range_valid =
+        start == *requested_range.start() && received_len > 0 && received_len <= requested_len;
+
+    if !range_valid {
+        warn!(
+            %request_id, %peer_id,
+            "Received response with wrong range: expected {} ({requested_len} values max), got {received_len} values starting at {start}",
+            DisplayRange(requested_range),
+        );
+
+        return on_invalid_value_response(co, state, metrics, request_id, peer_id).await;
+    }
+
+    if !validate_value_response_heights::<Ctx>(&response) {
+        warn!(
+            %request_id, %peer_id,
+            "Received response with non-contiguous certificate heights for range {}",
+            DisplayRange(requested_range),
+        );
+
+        return on_invalid_value_response(co, state, metrics, request_id, peer_id).await;
+    }
+
+    on_valid_value_response(co, state, metrics, request_id, peer_id, response).await
+}
+
+/// Validate that each value in the response has the expected height,
+/// ie. heights are contiguous starting from `start_height`.
+fn validate_value_response_heights<Ctx>(response: &ValueResponse<Ctx>) -> bool
+where
+    Ctx: Context,
+{
+    response.values.iter().enumerate().all(|(i, value)| {
+        let expected = response.start_height.increment_by(i as u64);
+        value.height() == expected
+    })
+}
+
+pub async fn on_send_status_update<Ctx>(
+    co: Co<Ctx>,
+    state: &mut State<Ctx>,
+    _metrics: &Metrics,
+) -> Result<(), Error<Ctx>>
+where
+    Ctx: Context,
+{
+    debug!(tip_height = %state.tip_height, "Broadcasting status");
 
     perform!(
         co,
@@ -251,28 +198,7 @@ where
             .reset_inactive_peers_scores(inactive_threshold);
     }
 
-    debug!("Peer scores: {:#?}", state.peer_scorer.get_scores());
-
-    // Like on_status, wait for consensus to initialize the restored tip before
-    // cached peer statuses can trigger requests.
-    if !state.started {
-        return Ok(());
-    }
-
-    // In the exceptional case where we stop getting `Status` updates from other peers, we initiate
-    // the request of values from here up to the maximum `tip_height` we have seen so far.
-    // See https://github.com/informalsystems/malachite/pull/15#pullrequestreview-3262021218
-    let max_tip_height = state
-        .peers
-        .values()
-        .map(|s| s.tip_height)
-        .max()
-        .unwrap_or(state.tip_height);
-
-    // Only request values in case we're lagging behind.
-    if state.tip_height < max_tip_height {
-        request_values(co, state, max_tip_height, metrics).await?;
-    }
+    debug!("Peer scores: {:?}", state.peer_scorer.get_scores());
 
     Ok(())
 }
@@ -289,51 +215,65 @@ where
     let peer_id = status.peer_id;
     let peer_height = status.tip_height;
 
-    debug!(peer.id = %peer_id, peer.height = %peer_height, "Received peer status");
+    debug!(%peer_id, %peer_height, "Received peer status");
 
     state.update_status(status);
+    metrics.status_received(state.peers.len() as u64);
 
     if !state.started {
         // Consensus has not started yet, no need to sync (yet).
         return Ok(());
     }
 
-    if peer_height > state.tip_height {
+    if peer_height >= state.sync_height {
         info!(
-            height.tip = %state.tip_height,
-            height.peer = %peer_height,
+            tip_height = %state.tip_height,
+            sync_height = %state.sync_height,
+            peer_height = %peer_height,
             "SYNC REQUIRED: Falling behind"
         );
 
         // We are lagging behind on one of our peers at least.
         // Request values from any peer already at or above that peer's height.
-        request_values(co, state, peer_height, metrics).await?;
+        request_values(co, state, metrics).await?;
     }
 
     Ok(())
 }
 
 pub async fn on_started_height<Ctx>(
+    co: Co<Ctx>,
     state: &mut State<Ctx>,
+    metrics: &Metrics,
     height: Ctx::Height,
     start_type: HeightStartType,
 ) -> Result<(), Error<Ctx>>
 where
     Ctx: Context,
 {
-    debug!(%height, is_restart=%start_type.is_restart(), "Consensus started new height");
+    debug!(%height, is_restart = %start_type.is_restart(), "Consensus started new height");
 
     state.started = true;
-
-    // Keep inflight IDs until their response or timeout. Removing obsolete IDs here
-    // would make this implementation penalize honest peers for valid late replies.
-
-    // In case of a start, core-consensus should have "consumed" everything from the `sync_input_queue`
-    // up to the `height` height, so we remove those pending consensus requests.
-    state.prune_pending_consensus_requests(&height);
+    state.consensus_height = height;
 
     // The tip is the last decided value.
     state.tip_height = height.decrement().unwrap_or_default();
+
+    // Garbage collect fully-validated requests.
+    state.prune_pending_requests();
+
+    if start_type.is_restart() {
+        // Consensus is retrying the height, so we should sync starting from it.
+        // Clear pending requests, as we are restarting the height.
+        state.pending_requests.clear();
+        set_sync_height(state, height);
+    } else {
+        // If consensus is voting on a height that is currently being synced from a peer, do not update the sync height.
+        set_sync_height(state, max(state.sync_height, height));
+    }
+
+    // Trigger potential requests if possible.
+    request_values(co, state, metrics).await?;
 
     Ok(())
 }
@@ -350,16 +290,27 @@ where
 
     state.tip_height = height;
 
-    // In case of decision, core-consensus should have "consumed" everything from the `sync_input_queue`
-    // up to the `tip_height = height` height, so we remove those pending consensus requests.
-    state.prune_pending_consensus_requests(&height);
+    // Garbage collect pending requests for heights up to the new tip.
+    state.prune_pending_requests();
+
+    // Re-validate sync_height after tip advanced.
+    set_sync_height(state, state.sync_height);
 
     Ok(())
 }
 
+#[tracing::instrument(
+    name = "on_value_request",
+    skip_all,
+    fields(
+        peer_id = %peer_id,
+        request_id = %request_id,
+        range = %DisplayRange(&request.range)
+    )
+)]
 pub async fn on_value_request<Ctx>(
     co: Co<Ctx>,
-    _state: &mut State<Ctx>,
+    state: &mut State<Ctx>,
     metrics: &Metrics,
     request_id: InboundRequestId,
     peer_id: PeerId,
@@ -368,14 +319,196 @@ pub async fn on_value_request<Ctx>(
 where
     Ctx: Context,
 {
-    debug!(range = %DisplayRange::<Ctx>(&request.range), %peer_id, "Received request for values");
+    debug!("Received request for values");
+
+    if !validate_request_range::<Ctx>(&request.range, state.tip_height, state.config.batch_size) {
+        debug!("Sending empty response to peer");
+
+        perform!(
+            co,
+            Effect::SendValueResponse(
+                request_id.clone(),
+                ValueResponse::new(*request.range.start(), vec![]),
+                Default::default()
+            )
+        );
+
+        return Ok(());
+    }
 
     metrics.value_request_received(request.range.start().as_u64());
 
+    let range = clamp_request_range::<Ctx>(&request.range, state.tip_height);
+
+    if range != request.range {
+        debug!(
+            requested = %DisplayRange(&request.range),
+            clamped = %DisplayRange(&range),
+            "Clamped request range to our tip height"
+        );
+    }
+
     perform!(
         co,
-        Effect::GetDecidedValues(request_id, request.range, Default::default())
+        Effect::GetDecidedValues(request_id, range, Default::default())
     );
+
+    Ok(())
+}
+
+fn validate_request_range<Ctx>(
+    range: &RangeInclusive<Ctx::Height>,
+    tip_height: Ctx::Height,
+    batch_size: usize,
+) -> bool
+where
+    Ctx: Context,
+{
+    if range.is_empty() {
+        debug!("Received request for empty range of values");
+        return false;
+    }
+
+    if range.start() > range.end() {
+        debug!("Received request for invalid range of values");
+        return false;
+    }
+
+    if range.start() > &tip_height {
+        debug!("Received request for values beyond our tip height {tip_height}");
+        return false;
+    }
+
+    let len = (range.end().as_u64() - range.start().as_u64()).saturating_add(1) as usize;
+    if len > batch_size {
+        warn!("Received request for too many values: requested {len}, max is {batch_size}");
+        return false;
+    }
+
+    true
+}
+
+fn clamp_request_range<Ctx>(
+    range: &RangeInclusive<Ctx::Height>,
+    tip_height: Ctx::Height,
+) -> RangeInclusive<Ctx::Height>
+where
+    Ctx: Context,
+{
+    assert!(!range.is_empty(), "Cannot clamp an empty range");
+    assert!(
+        *range.start() <= tip_height,
+        "Cannot clamp range starting above tip height"
+    );
+
+    let start = *range.start();
+    let end = min(*range.end(), tip_height);
+    start..=end
+}
+
+pub async fn on_valid_value_response<Ctx>(
+    co: Co<Ctx>,
+    state: &mut State<Ctx>,
+    metrics: &Metrics,
+    request_id: OutboundRequestId,
+    peer_id: PeerId,
+    response: ValueResponse<Ctx>,
+) -> Result<(), Error<Ctx>>
+where
+    Ctx: Context,
+{
+    let start = response.start_height;
+    let values_count = response.values.len();
+    debug!(start = %start, num_values = %values_count, %peer_id, "Received response from peer");
+
+    // Extract cheap Copy data from the pending entry. NLL releases the borrow
+    // once the Copy values are bound, so mutable access to `state` is free
+    // afterwards.
+    let Some(entry) = state.pending_requests.get(&request_id) else {
+        return Ok(());
+    };
+    let entry_peer = entry.peer;
+    let range_start = *entry.range.start();
+    let range_end = *entry.range.end();
+    let requested_len = entry.range.len();
+
+    if entry_peer != peer_id {
+        // Defensive check: `on_value_response` already rejects responses from
+        // a different peer than the one recorded in the pending entry.
+        error!(
+            %request_id, peer.actual = %peer_id, peer.expected = %entry_peer,
+            "Received response from different peer than expected"
+        );
+        return on_invalid_value_response(co, state, metrics, request_id, peer_id).await;
+    }
+
+    if let Some(response_time) = metrics.value_response_received(start.as_u64()) {
+        let result = if values_count < requested_len {
+            SyncResult::PartialSuccess {
+                received: values_count,
+                requested: requested_len,
+                response_time,
+            }
+        } else {
+            SyncResult::Success(response_time)
+        };
+
+        state
+            .peer_scorer
+            .update_score_with_metrics(peer_id, result, &metrics.scoring);
+    }
+
+    // Tell consensus to process the response.
+    perform!(
+        co,
+        Effect::ProcessValueResponse(peer_id, request_id.clone(), response, Default::default())
+    );
+
+    if values_count < requested_len {
+        // NOTE: We cannot simply call `re_request_values_from_peer_except` here.
+        // Although we received some values from the peer, these values have not yet been processed
+        // by the consensus engine. If we called `re_request_values_from_peer_except`, we would
+        // end up re-requesting the entire original range (including values we already received),
+        // causing the syncing peer to repeatedly send multiple requests until the already-received
+        // values are fully processed.
+        // To tackle this, we first update the current pending request with the range of values
+        // we received, and then issue a new request for the remaining values.
+        //
+        // `on_value_response` guarantees `values_count >= 1` at this point, so the
+        // `increment_by`/`decrement` arithmetic below is well-defined.
+        let new_start = range_start.increment_by(values_count as u64);
+
+        let entry = state.pending_requests.remove(&request_id).unwrap();
+        let updated_range = range_start..=new_start.decrement().unwrap_or_default();
+        state.update_request(request_id, peer_id, updated_range, entry.excluded_peers);
+
+        // Issue a new request for the remaining values to any peer (not necessarily the same one).
+        let new_range = new_start..=range_end;
+        request_values_range(co, state, metrics, new_range).await?;
+    }
+    // Full response — entry stays as-is; prune_pending_requests cleans it up
+    // once consensus advances past this range.
+
+    Ok(())
+}
+
+pub async fn on_invalid_value_response<Ctx>(
+    co: Co<Ctx>,
+    state: &mut State<Ctx>,
+    metrics: &Metrics,
+    request_id: OutboundRequestId,
+    peer_id: PeerId,
+) -> Result<(), Error<Ctx>>
+where
+    Ctx: Context,
+{
+    debug!(%request_id, %peer_id, "Received invalid response");
+
+    state.peer_scorer.update_score(peer_id, SyncResult::Failure);
+
+    // We do not trust the response, so we remove the pending request and re-request
+    // the whole range from another peer.
+    re_request_values_from_peer_except(co, state, metrics, request_id, Some(peer_id)).await?;
 
     Ok(())
 }
@@ -386,38 +519,50 @@ pub async fn on_got_decided_values<Ctx>(
     metrics: &Metrics,
     request_id: InboundRequestId,
     range: RangeInclusive<Ctx::Height>,
-    values: Vec<RawDecidedValue<Ctx>>,
+    mut values: Vec<RawDecidedValue<Ctx>>,
 ) -> Result<(), Error<Ctx>>
 where
     Ctx: Context,
 {
-    info!(range = %DisplayRange::<Ctx>(&range), "Received {} values from host", values.len());
+    info!(%request_id, range = %DisplayRange(&range), "Received {} values from host", values.len());
 
     let start = range.start();
     let end = range.end();
 
-    // Validate response from host
+    // Log if host returned a different number of values than expected.
+    // This can happen legitimately (e.g. truncation due to response size limits)
+    // so we only warn but do not reject the response.
     let batch_size = end.as_u64() - start.as_u64() + 1;
     if batch_size != values.len() as u64 {
         warn!(
+            %request_id,
             "Received {} values from host, expected {batch_size}",
             values.len()
-        )
+        );
     }
 
-    // Validate the height of each received value
+    // Validate the height of each received value.
+    // Truncate at the first value with an unexpected height and forward
+    // the valid contiguous prefix so the requesting peer can still use it.
     let mut height = *start;
-    for value in values.clone() {
+    let mut valid_count = 0;
+    for value in &values {
         if value.certificate.height != height {
             error!(
-                "Received from host value for height {}, expected for height {height}",
+                %request_id,
+                "Received from host value for height {}, expected height: {height}; \
+                 sending {valid_count} valid values to peer",
                 value.certificate.height
             );
+            break;
         }
+        valid_count += 1;
         height = height.increment();
     }
 
-    debug!(%request_id, range = %DisplayRange::<Ctx>(&range), "Sending response to peer");
+    values.truncate(valid_count);
+
+    debug!(%request_id, range = %DisplayRange(&range), "Sending {} values to peer", values.len());
     perform!(
         co,
         Effect::SendValueResponse(
@@ -432,231 +577,95 @@ where
     Ok(())
 }
 
-fn on_invalid_value<Ctx>(
+pub async fn on_sync_request_timed_out<Ctx>(
+    co: Co<Ctx>,
     state: &mut State<Ctx>,
-    height: Ctx::Height,
+    metrics: &Metrics,
+    request_id: OutboundRequestId,
     peer_id: PeerId,
+    request: Request<Ctx>,
 ) -> Result<(), Error<Ctx>>
 where
     Ctx: Context,
 {
-    let Some((request_id, stored_peer_id, ranges)) =
-        state.get_pending_consensus_request_id_by(height)
-    else {
-        error!(%peer_id, %height, "Received height of invalid value for unknown request");
-        return Ok(());
+    match request {
+        Request::ValueRequest(value_request) => {
+            info!(%peer_id, range = %DisplayRange(&value_request.range), "Sync request timed out");
+
+            state.peer_scorer.update_score(peer_id, SyncResult::Timeout);
+
+            metrics.value_request_timed_out(value_request.range.start().as_u64());
+
+            re_request_values_from_peer_except(co, state, metrics, request_id, Some(peer_id))
+                .await?;
+        }
     };
 
-    if stored_peer_id != peer_id {
-        error!(%stored_peer_id, %peer_id, %request_id, "Received invalid value from wrong peer");
-        return Ok(());
-    }
+    Ok(())
+}
 
-    warn!(
-                %request_id, peer_id = %peer_id, stored_peer_id = %stored_peer_id, %height,
-                "Received value at height failed consensus verification");
+async fn on_invalid_value<Ctx>(
+    co: Co<Ctx>,
+    state: &mut State<Ctx>,
+    metrics: &Metrics,
+    peer_id: PeerId,
+    height: Ctx::Height,
+) -> Result<(), Error<Ctx>>
+where
+    Ctx: Context,
+{
+    error!(%peer_id, %height, "Received invalid value");
+    penalize_peer_and_retry(co, state, metrics, peer_id, height).await
+}
 
-    // remove the height of the invalid value from the ranges
-    if let Err(msg) = excise_height(ranges, height) {
-        error!(%msg, %request_id, %peer_id, %height, "Failed to break range");
-        return Ok(());
-    }
+async fn on_value_processing_error<Ctx>(
+    co: Co<Ctx>,
+    state: &mut State<Ctx>,
+    metrics: &Metrics,
+    peer_id: PeerId,
+    height: Ctx::Height,
+) -> Result<(), Error<Ctx>>
+where
+    Ctx: Context,
+{
+    error!(%peer_id, %height, "Error while processing value");
+    penalize_peer_and_retry(co, state, metrics, peer_id, height).await
+}
 
-    // in case the ranges are now empty, remove the pending request altogether
-    if ranges.is_empty() {
-        state.pending_consensus_requests.remove(&request_id);
+// Penalize the peer and re-request the batch covering `height` from a different peer.
+async fn penalize_peer_and_retry<Ctx>(
+    co: Co<Ctx>,
+    state: &mut State<Ctx>,
+    metrics: &Metrics,
+    peer_id: PeerId,
+    height: Ctx::Height,
+) -> Result<(), Error<Ctx>>
+where
+    Ctx: Context,
+{
+    state.peer_scorer.update_score(peer_id, SyncResult::Failure);
+
+    if let Some((request_id, stored_peer_id)) = state.get_request_id_by(height) {
+        if stored_peer_id != peer_id {
+            // Defensive check: `on_value_response` already rejects responses from
+            // a different peer than the one recorded in the pending entry.
+            error!(
+                %request_id, peer.actual = %peer_id, peer.expected = %stored_peer_id,
+                "Received response from different peer than expected"
+            );
+        }
+        re_request_values_from_peer_except(co, state, metrics, request_id, Some(peer_id)).await?;
+    } else {
+        error!(%peer_id, %height, "Received height for unknown request");
     }
 
     Ok(())
 }
 
-/// Excise `height` from the first (and only) range in `ranges` that contains it and then append up to two ranges
-/// that exclude `height`. We assume that `ranges` does not contain a height more than once.
-/// Return `Err` if no range contains `height` or if `height - 1` underflows.
-pub fn excise_height<H>(ranges: &mut Vec<RangeInclusive<H>>, height: H) -> Result<(), String>
-where
-    H: Height,
-{
-    let Some(i) = ranges.iter_mut().position(|r| r.contains(&height)) else {
-        return Err(format!("cannot find range with this height {:?}", height));
-    };
-
-    let range = ranges[i].clone();
-    // always remove the range we want to "break" into two ranges and then re-push desired ranges
-    ranges.remove(i);
-
-    if range.start() != range.end() {
-        if *range.start() == height {
-            ranges.push(range.start().increment()..=*range.end());
-        } else if *range.end() == height {
-            let Some(new_end) = range.end().decrement() else {
-                return Err(format!("cannot decrement {:?}", range.end()));
-            };
-            ranges.push(*range.start()..=new_end);
-        } else {
-            let Some(new_end) = height.decrement() else {
-                return Err(format!("cannot decrement {:?}", height));
-            };
-            ranges.push(*range.start()..=new_end);
-            ranges.push(height.increment()..=*range.end());
-        }
-    }
-
-    Ok(())
-}
-
-// Returns the current number of heights we have requested (e.g., inflight requests) or that we
-// are currently processing (e.g.., pending consensus verification).
-fn current_number_of_heights<Ctx>(state: &State<Ctx>) -> u64
-where
-    Ctx: Context,
-{
-    let snapshot = height_allowance_snapshot(state);
-    snapshot.inflight_heights + snapshot.pending_heights
-}
-
-/// Finds the earliest window `[a, b]` such that the window is "free" from overlaps with ranges, meaning:
-/// - `a > exclusive_start_height`
-/// - every x in `[a, b]` is not covered by any range in `ranges`
-/// - `b` does not exceed `inclusive_up_to_height`
-/// - the window length (number of elements) is ≤ `window_size`
-///
-/// "Earliest" means we pick the smallest valid `a`, then extend `b` as far as possible without
-/// crossing the next blocking range, the `inclusive_up_to_height` cap, or the `window_size` limit.
-///
-/// Returns `None` if no such window exists.
-///
-/// Examples:
-/// - If `window_size == 0`, there is no valid window.
-/// - If `window_size == 1`, the window is a single element `[a, a]`.
-fn compute_free_window<H>(
-    exclusive_start_height: H,
-    inclusive_up_to_height: H,
-    window_size: u64,
-    mut ranges: Vec<RangeInclusive<H>>,
-) -> Option<RangeInclusive<H>>
-where
-    H: Height,
-{
-    // we can include at most `window_size` elements: grow from `a` by at most `n - 1` increments.
-    let mut remaining_increments = match window_size {
-        0 => return None,
-        1 => 0,
-        n => n - 1,
-    };
-
-    // order ranges by first `start()` and then `end()`
-    ranges.sort_by(|a, b| match a.start().cmp(b.start()) {
-        Ordering::Equal => a.end().cmp(b.end()),
-        other => other,
-    });
-
-    // The desired free window corresponds to `a..b` where `a` is the start and `b` (declared later on) the end.
-    // We do not yet know what `a` is, but we know that `a >= exclusive_start_height + 1` so we start from there.
-    let mut a = exclusive_start_height.increment_by(1);
-    if a > inclusive_up_to_height {
-        // if `a` already exceeds `inclusive_up_to_height`, then there's no free window
-        return None;
-    }
-
-    // we loop through all the ranges until we find the first `a` that is not covered by any of the `ranges`
-    let mut i = 0;
-    while i < ranges.len() {
-        let r = &ranges[i];
-
-        if a < *r.start() {
-            // `a` lies strictly before this range; no later range can cover `a` and hence we can break
-            break;
-        } else if a <= *r.end() {
-            // `a` is covered by a range; jump to just after this range and keep going **from here**
-            a = r.end().increment();
-            if a > inclusive_up_to_height {
-                // if `a` exceeds `inclusive_up_to_height`, then there's no free window
-                return None;
-            }
-            i += 1;
-            continue;
-        } else {
-            // a > r.end(): this range is behind us; advance.
-            i += 1;
-        }
-    }
-
-    // determine the start of the first range after `a`: any range that `compute_free_window` returns
-    // should not exceed that start
-    let next_range_start = ranges.iter().find(|r| *r.start() >= a).map(|r| *r.start());
-
-    // the end of the free window is `b` and we know it can be `a`, we then increment `b` as far as
-    // possible to get the maximum possible free window
-    let mut b = a;
-
-    // increment `b` from `a` without crossing the next range, the `inclusive_up_to_height`, or the window size
-    while remaining_increments > 0 {
-        let next = b.increment_by(1);
-
-        if next > inclusive_up_to_height {
-            // we're about to exceed `inclusive_up_to_height`, so we cannot go any further
-            break;
-        }
-
-        if let Some(s) = &next_range_start {
-            if next >= *s {
-                // we reached the next range, so we cannot go any further
-                break;
-            }
-        }
-        // if `next_range_start` is `None`, then we can keep incrementing `b` a `remaining_increments` times
-        // and up to `inclusive_up_to_height`
-
-        // the range `[a, next]` does not overlap any other range, so we can increment `b` and keep
-        // trying to increment `b`
-        b = next;
-        remaining_increments -= 1;
-    }
-
-    Some(a..=b)
-}
-
-/// Find the earliest "free" range of height `[a, b]` that the node can request for such that:
-/// - `a > exclusive_start_height`
-/// - every x in `[a, b]` is not covered by any height in `state.pending_consensus_requests` and `state.inflight_requests`
-/// - `b` does not exceed `inclusive_up_to_height`
-/// - the return range length (number of elements) is ≤ `state.config.batch_size`
-///
-/// "Earliest" means we pick the smallest valid `a`, then extend `b` as far as possible without
-/// crossing the next blocking range, the `inclusive_up_to_height` cap, or the `state.config.batch_size` limit.
-///
-/// Returns `None` if no such window exists.
-fn find_range_of_heights_to_request<Ctx>(
-    state: &State<Ctx>,
-    up_to_height: Ctx::Height,
-) -> Option<RangeInclusive<Ctx::Height>>
-where
-    Ctx: Context,
-{
-    let tip = state.tip_height;
-    let batch_size = state.config.batch_size as u64;
-
-    let ranges: Vec<_> = state
-        .inflight_requests
-        .values()
-        .map(|(r, _)| r.clone())
-        .chain(
-            state
-                .pending_consensus_requests
-                .values()
-                .flat_map(|(ranges, _)| ranges.iter().cloned()),
-        )
-        .collect();
-
-    compute_free_window(tip, up_to_height, batch_size, ranges)
-}
-
-/// Request multiple batches of values in parallel that are of height less than `up_to_height`.
+/// Request multiple batches of values in parallel.
 async fn request_values<Ctx>(
     co: Co<Ctx>,
     state: &mut State<Ctx>,
-    up_to_height: Ctx::Height,
     metrics: &Metrics,
 ) -> Result<(), Error<Ctx>>
 where
@@ -664,108 +673,180 @@ where
 {
     let max_parallel_requests = state.max_parallel_requests();
 
-    if state.inflight_requests.len() as u64 >= max_parallel_requests {
+    if state.pending_requests.len() >= max_parallel_requests {
         info!(
-            %max_parallel_requests,
-            inflight_requests = %state.inflight_requests.len(),
-            "Maximum number of parallel inflight requests reached, skipping request for values"
+            max_parallel_requests,
+            pending_requests = state.pending_requests.len(),
+            "Maximum number of parallel requests reached, skipping request for values"
         );
 
         return Ok(());
     };
 
-    // The maximum number of heights/values we can be waiting for at any point in time.
-    // Should be equal to the capacity of the `sync_input_queue` so that we do not overflow this queue.
-    let max_heights = state.config.batch_size as u64 * state.config.parallel_requests;
+    while state.pending_requests.len() < max_parallel_requests {
+        // Find the next uncovered range starting from current sync_height
+        let initial_height = state.sync_height;
+        let range = find_next_uncovered_range_from::<Ctx>(
+            initial_height,
+            state.config.batch_size as u64,
+            &state.pending_requests,
+        );
 
-    loop {
-        let Some(range) = find_range_of_heights_to_request(state, up_to_height) else {
-            info!(
-                    %up_to_height,
-                "Could not find a range to request"
-            );
-            return Ok(());
+        // Get a random peer that can provide the values in the range.
+        let Some((peer, range)) = state.random_peer_with(&range) else {
+            debug!("No peer to request sync from");
+            // No connected peer reached this height yet, we can stop syncing here.
+            break;
         };
 
-        let Some((peer_id, _)) = state.random_peer_with(&range) else {
-            // Normally we expect to always find a peer covering `range` because `request_values` is
-            // only called from `on_tick` and `on_status` and `request_values` is always invoked
-            // with an `up_to_height` argument (that we pass to `find_range_of_heights_to_request`)
-            // that we know at least one peer has seen.
-            // However, we still might fail to find a peer with the desired range if peers have
-            // already garbage-collected older values and increased their `status.history_min_height`.
-            // When this happens, value sync cannot proceed. Recovery may require switching to
-            // state sync or to connecting to additional peers that still have this range.
-            error!(
-                range_start = range.start().to_string(),
-                range_end = range.end().to_string(),
-                peers = ?state.peers
-                    .iter()
-                    .map(|(peer_id, status)| format!("{peer_id}: {status:?}"))
-                    .collect::<Vec<_>>(),
-                "Could not find a peer with the desired range. State sync or more peers maybe be needed."
-            );
-
-            return Ok(());
-        };
-
-        // Check that we can issue a request for the desired range without exceeding the `max_values`
-        // and hence we won't overflow the consensus' `sync_input_queue`.
-        let current_number_of_heights = current_number_of_heights(state);
-        let asking_for_how_many_heights = range.end().as_u64() - range.start().as_u64() + 1;
-        if current_number_of_heights + asking_for_how_many_heights > max_heights {
-            let snapshot = height_allowance_snapshot(state);
-            let lowest_inflight_start =
-                snapshot.lowest_inflight_start.map(|height| height.as_u64());
-            let lowest_pending_start = snapshot.lowest_pending_start.map(|height| height.as_u64());
-
-            info!(
-                height.tip = %snapshot.tip_height,
-                %current_number_of_heights,
-                inflight_heights = %snapshot.inflight_heights,
-                pending_consensus_heights = %snapshot.pending_heights,
-                ?lowest_inflight_start,
-                ?lowest_pending_start,
-                inflight_requests = state.inflight_requests.len(),
-                pending_consensus_requests = state.pending_consensus_requests.len(),
-                %asking_for_how_many_heights,
-                %max_heights,
-                "Maximum number of heights reached, skipping request for values"
-            );
-            return Ok(());
-        }
-
-        request_values_from_peer(&co, state, metrics, range.clone(), peer_id).await?;
+        send_and_track_request_to_peer(&co, state, metrics, peer, range, BTreeSet::new()).await?;
     }
+
+    Ok(())
 }
 
-async fn request_values_from_peer<Ctx>(
+/// Request values for this specific range from a peer.
+/// Should only be used when re-requesting a partial range of values from a peer.
+async fn request_values_range<Ctx>(
+    co: Co<Ctx>,
+    state: &mut State<Ctx>,
+    metrics: &Metrics,
+    range: RangeInclusive<Ctx::Height>,
+) -> Result<(), Error<Ctx>>
+where
+    Ctx: Context,
+{
+    // NOTE: We do not perform a `max_parallel_requests` check and return here in contrast to what is done, for
+    // example, in `request_values`. This is because `request_values_range` is only called for retrieving
+    // partial responses, which means the original request is not on the wire anymore. Nevertheless,
+    // we log here because seeing this log frequently implies that we keep getting partial responses
+    // from peers and hints to potential reconfiguration.
+    let max_parallel_requests = state.max_parallel_requests();
+
+    if state.pending_requests.len() >= max_parallel_requests {
+        info!(
+            %max_parallel_requests,
+            pending_requests = %state.pending_requests.len(),
+            "Maximum number of pending requests reached when re-requesting a partial range of values"
+        );
+    };
+
+    // Capture the range start before `range` is shadowed by the peer-selected sub-range,
+    // so we can roll sync_height back if no peer can serve it.
+    let range_start = *range.start();
+
+    // Get a random peer that can provide the values in the range.
+    let Some((peer, range)) = state.random_peer_with(&range) else {
+        // No connected peer reached this height yet, we can stop syncing here.
+        debug!(range = %DisplayRange(&range), "No peer to request sync from");
+        // Roll sync_height back towards the range start so this range is
+        // picked up again once a peer advances past it. The original request
+        // has already advanced sync_height past the range, so without this
+        // rollback the missing segment would stall until an external event.
+        set_sync_height(state, min(state.sync_height, range_start));
+        return Ok(());
+    };
+
+    send_and_track_request_to_peer(&co, state, metrics, peer, range, BTreeSet::new()).await?;
+
+    Ok(())
+}
+
+async fn send_and_track_request_to_peer<Ctx>(
+    co: &Co<Ctx>,
+    state: &mut State<Ctx>,
+    metrics: &Metrics,
+    peer: PeerId,
+    range: RangeInclusive<<Ctx as Context>::Height>,
+    excluded_peers: BTreeSet<PeerId>,
+) -> Result<(), Error<Ctx>>
+where
+    Ctx: Context,
+{
+    // Capture the range start before `range` is moved into `send_request_to_peer`,
+    // so we can roll sync_height back if the send is skipped.
+    let range_start = *range.start();
+
+    // Send the request
+    let Some((request_id, final_range)) =
+        send_request_to_peer(co, state, metrics, range, peer).await?
+    else {
+        // Request was skipped. `send_request_to_peer` returns `Ok(None)` in
+        // three cases:
+        //   1. The input range was empty (shouldn't happen from any known
+        //      caller — all callers derive `range` from a pending entry or
+        //      `find_next_uncovered_range_from`, both of which produce
+        //      non-empty ranges).
+        //   2. The range was trimmed empty because all heights in it have
+        //      already been validated by consensus (tip advanced past the
+        //      range mid-flight). The rollback is effectively a no-op here:
+        //      `set_sync_height` raises the candidate back above
+        //      `tip_height + 1`.
+        //   3. The `SendValueRequest` effect yielded `None` (transport-level
+        //      failure). This is the failure mode the rollback actually
+        //      targets.
+        //
+        // Roll sync_height back towards the range start so the range can be
+        // picked up again by `find_next_uncovered_range_from` on the next
+        // request cycle. Without this, a retry path that popped the pending
+        // entry before calling us would leave sync_height past an untracked
+        // range and stall sync for that segment until an external event.
+        set_sync_height(state, min(state.sync_height, range_start));
+        return Ok(());
+    };
+
+    // Store the pending request
+    state.pending_requests.insert(
+        request_id,
+        PendingRequestEntry {
+            range: final_range.clone(),
+            peer,
+            excluded_peers,
+        },
+    );
+
+    // Advance sync_height past this range only if it sat inside the range.
+    // If sync_height is already below the range — because a concurrent
+    // exhaustion path rewound it to an earlier untracked range — leave it
+    // alone so the next request cycle picks that range up.
+    if final_range.contains(&state.sync_height) {
+        set_sync_height(state, final_range.end().increment());
+    }
+
+    Ok(())
+}
+
+/// Send a value request to a peer. Returns the request_id and final range if successful.
+/// The calling function is responsible for storing the request and updating state.
+async fn send_request_to_peer<Ctx>(
     co: &Co<Ctx>,
     state: &mut State<Ctx>,
     metrics: &Metrics,
     range: RangeInclusive<Ctx::Height>,
     peer: PeerId,
-) -> Result<(), Error<Ctx>>
+) -> Result<Option<(OutboundRequestId, RangeInclusive<Ctx::Height>)>, Error<Ctx>>
 where
     Ctx: Context,
 {
     if range.is_empty() {
-        debug!(range.sync = %DisplayRange::<Ctx>(&range), %peer, "Range is empty, skipping request");
-        return Ok(());
+        debug!(%peer, "Range is empty, skipping request");
+        return Ok(None);
     }
 
     // Skip over any heights in the range that are not waiting for a response
     // (meaning that they have been validated by consensus or a peer).
     let range = state.trim_validated_heights(&range);
+
     if range.is_empty() {
         warn!(
-            range = %DisplayRange::<Ctx>(&range), %peer,
+            range = %DisplayRange(&range), %peer,
             "All values in range have been validated, skipping request"
         );
-        return Ok(());
+
+        return Ok(None);
     }
 
-    info!(range = %DisplayRange::<Ctx>(&range), %peer, "Requesting sync from peer");
+    info!(range = %DisplayRange(&range), %peer, "Requesting sync from peer");
 
     // Send request to peer
     let Some(request_id) = perform!(
@@ -773,192 +854,1832 @@ where
         Effect::SendValueRequest(peer, ValueRequest::new(range.clone()), Default::default()),
         Resume::ValueRequestId(id) => id,
     ) else {
-        warn!(range = %DisplayRange::<Ctx>(&range), %peer, "Failed to send sync request to peer");
-        return Ok(());
+        warn!(range = %DisplayRange(&range), %peer, "Failed to send sync request to peer");
+        return Ok(None);
     };
 
     metrics.value_request_sent(range.start().as_u64());
+    debug!(%request_id, range = %DisplayRange(&range), %peer, "Sent sync request to peer");
 
-    // Store inflight request
-    debug!(%request_id, range = %DisplayRange::<Ctx>(&range), %peer, "Sent sync request to peer");
-    state.inflight_requests.insert(request_id, (range, peer));
+    Ok(Some((request_id, range)))
+}
+
+/// Remove the pending request and re-request the batch from another peer.
+///
+/// If `except_peer_id` is `Some`, the failed peer is added to the set of
+/// excluded peers accumulated across retries. Once every eligible peer has
+/// been tried and failed, no further retry is attempted and sync_height is
+/// reset so a future event (status update, consensus advance) can restart
+/// the request cycle with a clean slate.
+///
+/// If `except_peer_id` is `None` (internal processing error), no peer is
+/// added to the exclusion set because the failure was not the peer's fault.
+async fn re_request_values_from_peer_except<Ctx>(
+    co: Co<Ctx>,
+    state: &mut State<Ctx>,
+    metrics: &Metrics,
+    request_id: OutboundRequestId,
+    except_peer_id: Option<PeerId>,
+) -> Result<(), Error<Ctx>>
+where
+    Ctx: Context,
+{
+    info!(%request_id, except_peer_id = ?except_peer_id, "Re-requesting values from peer");
+
+    let Some(mut entry) = state.pending_requests.remove(&request_id) else {
+        warn!(%request_id, "Unknown request ID when re-requesting values");
+        return Ok(());
+    };
+
+    match except_peer_id {
+        Some(peer_id) if entry.peer == peer_id => {
+            entry.excluded_peers.insert(peer_id);
+        }
+        Some(peer_id) => {
+            warn!(
+                %request_id,
+                peer.actual = %peer_id,
+                peer.expected = %entry.peer,
+                "Received response from different peer than expected"
+            );
+
+            entry.excluded_peers.insert(entry.peer);
+            entry.excluded_peers.insert(peer_id);
+        }
+        None => {
+            // Internal processing error — not the peer's fault, don't exclude anyone.
+        }
+    };
+
+    let Some((peer, peer_range)) =
+        state.random_peer_with_except(&entry.range, &entry.excluded_peers)
+    else {
+        debug!(
+            excluded_peers = entry.excluded_peers.len(),
+            "No peer to re-request sync from, all eligible peers exhausted"
+        );
+        // Reset sync_height towards the start of the failed range so it can be retried
+        // when conditions change (new status update, consensus advance, peer reconnect).
+        set_sync_height(state, min(state.sync_height, *entry.range.start()));
+        return Ok(());
+    };
+
+    // NOTE: `entry.excluded_peers` is moved into `send_and_track_request_to_peer`
+    // and is dropped if the send fails (`Ok(None)` branch). This is
+    // intentional — the next request cycle starts with a clean exclusion
+    // set, and convergence away from unhealthy peers is left to the peer
+    // scorer, which biases `random_peer_with_except`'s selection (timeouts
+    // and invalid responses from the same peer will score it down).
+    send_and_track_request_to_peer(&co, state, metrics, peer, peer_range, entry.excluded_peers)
+        .await?;
 
     Ok(())
 }
 
-#[derive(thiserror::Error, Debug)]
-pub enum InflightError {
-    #[error("received response from unknown {request_id}")]
-    UnknownRequestId { request_id: Box<OutboundRequestId> },
+/// Set `sync_height` to the given candidate while enforcing both invariants:
+///   - `sync_height > tip_height`
+///   - `sync_height` is not covered by any pending request
+///
+/// If the candidate violates either invariant, it is raised to the next
+/// uncovered height at or above `tip_height + 1`.
+///
+/// Only the pending-range skip is logged: callers are expected to pass a
+/// candidate outside every pending range, so a skip there means an unsafe
+/// value was passed in. The tip-floor bump (candidate ≤ tip_height) is the
+/// routine post-decide/rollback path and is not logged.
+fn set_sync_height<Ctx: Context>(state: &mut State<Ctx>, candidate: Ctx::Height) {
+    let floor = max(state.tip_height.increment(), candidate);
+    let new_sync_height = find_next_uncovered_height::<Ctx>(floor, &state.pending_requests);
 
-    #[error(
-        "received response from wrong peer (expected {expected_peer_id}, got {actual_peer_id})"
-    )]
-    WrongPeer {
-        expected_peer_id: Box<PeerId>,
-        actual_peer_id: Box<PeerId>,
-    },
+    if new_sync_height != floor {
+        warn!(
+            %candidate,
+            tip_height = %state.tip_height,
+            floor = %floor,
+            sync_height = %new_sync_height,
+            "sync_height candidate is inside a pending request range; advancing past it"
+        );
+    }
+
+    state.sync_height = new_sync_height;
 }
 
-// Deletes an inflight request if one exists under the provided `request_id` and stems from `peer_id`.
-// Returns the requested range of this inflight request and the peer that issues the request.
-fn take_inflight_if_peer_matches<Ctx>(
-    state: &mut State<Ctx>,
-    request_id: &OutboundRequestId,
-    peer_id: PeerId,
-) -> Result<RangeInclusive<Ctx::Height>, InflightError>
+/// Find the next uncovered range starting from initial_height.
+///
+/// Builds a contiguous range of the specified max_size from initial_height.
+///
+/// # Assumptions
+/// - All ranges in pending_requests are disjoint (non-overlapping)
+/// - initial_height is not covered by any pending request (maintained by caller via `set_sync_height`)
+///
+/// If initial_height is unexpectedly covered by a pending request, the function recovers
+/// by advancing to the first uncovered height after the conflicting range.
+///
+/// Returns the range that should be requested.
+fn find_next_uncovered_range_from<Ctx>(
+    mut initial_height: Ctx::Height,
+    max_range_size: u64,
+    pending_requests: &BTreeMap<OutboundRequestId, PendingRequestEntry<Ctx::Height>>,
+) -> RangeInclusive<Ctx::Height>
 where
     Ctx: Context,
 {
-    let Some((requested_range, stored_peer_id)) = state.inflight_requests.get(request_id).cloned()
-    else {
-        return Err(InflightError::UnknownRequestId {
-            request_id: Box::new(request_id.clone()),
-        });
-    };
+    let max_batch_size = max(1, max_range_size);
 
-    if stored_peer_id != peer_id {
-        return Err(InflightError::WrongPeer {
-            expected_peer_id: Box::new(stored_peer_id),
-            actual_peer_id: Box::new(peer_id),
-        });
+    // If initial_height is inside a pending request, recover by advancing past it.
+    // This should not happen if all sync_height writes go through set_sync_height.
+    let adjusted = find_next_uncovered_height::<Ctx>(initial_height, pending_requests);
+    if adjusted != initial_height {
+        error!(
+            initial_height = %initial_height.as_u64(),
+            adjusted_height = %adjusted.as_u64(),
+            "initial_height was inside a pending request, advancing past it"
+        );
+        initial_height = adjusted;
     }
 
-    // We received a response to a sync request from the corresponding peer, and hence this request
-    // is not in flight anymore.
-    state.inflight_requests.remove(request_id);
+    // Find the pending request with the smallest range.start where range.end >= initial_height
+    let next_range = pending_requests
+        .values()
+        .map(|entry| &entry.range)
+        .filter(|range| *range.end() >= initial_height)
+        .min_by_key(|range| range.start());
 
-    Ok(requested_range)
+    // Start with the full max_batch_size range
+    let mut end_height = initial_height.increment_by(max_batch_size - 1);
+
+    // If there's a range in pending, constrain to that boundary
+    if let Some(range) = next_range {
+        // Constrain to the blocking boundary
+        let boundary_end = range
+            .start()
+            .decrement()
+            .expect("range.start() should be decrementable since it's > initial_height");
+        end_height = min(end_height, boundary_end);
+    }
+
+    initial_height..=end_height
 }
 
-struct DisplayRange<'a, Ctx: Context>(&'a RangeInclusive<Ctx::Height>);
-
-impl<'a, Ctx: Context> core::fmt::Display for DisplayRange<'a, Ctx> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}..={}", self.0.start(), self.0.end())
+/// Find the next height that's not covered by any pending request starting from starting_height.
+fn find_next_uncovered_height<Ctx>(
+    starting_height: Ctx::Height,
+    pending_requests: &BTreeMap<OutboundRequestId, PendingRequestEntry<Ctx::Height>>,
+) -> Ctx::Height
+where
+    Ctx: Context,
+{
+    let mut next_height = starting_height;
+    while let Some(entry) = pending_requests
+        .values()
+        .find(|entry| entry.range.contains(&next_height))
+    {
+        next_height = entry.range.end().increment();
     }
+    next_height
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::fmt;
-    use rstest::rstest;
+    use arc_malachitebft_test::{Height, TestContext, ValueId};
+    use bytes::Bytes;
+    use malachitebft_core_types::{CommitCertificate, Round};
+    use rand::SeedableRng;
+    use std::collections::{BTreeMap, BTreeSet};
 
-    /// fake height for tests that raps an u64 and provides the `Height` methods
-    #[derive(Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
-    struct H(u64);
+    use crate::effect::Resumable;
+    use crate::Config;
 
-    impl Height for H {
-        const ZERO: Self = H(0);
-        const INITIAL: Self = H(0);
-        fn increment(&self) -> H {
-            H(self.0 + 1)
-        }
-        fn decrement(&self) -> Option<H> {
-            self.0.checked_sub(1).map(H)
-        }
+    type TestPendingRequests = BTreeMap<OutboundRequestId, PendingRequestEntry<Height>>;
 
-        fn increment_by(&self, n: u64) -> H {
-            H(self.0 + n)
-        }
-        fn decrement_by(&self, _n: u64) -> Option<Self> {
-            None
-        }
+    // Test case structures for table-driven tests
 
-        fn as_u64(&self) -> u64 {
-            self.0
-        }
+    struct RangeTestCase {
+        name: &'static str,
+        initial_height: u64,
+        max_size: u64,
+        pending_ranges: &'static [(u64, u64)], // (start, end) pairs
+        expected_start: u64,
+        expected_end: u64,
     }
 
-    impl fmt::Display for H {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "H({})", self.0)
-        }
+    struct HeightTestCase {
+        name: &'static str,
+        initial_height: u64,
+        pending_ranges: &'static [(u64, u64)], // (start, end) pairs
+        expected_height: u64,
     }
 
-    impl fmt::Debug for H {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "H({})", self.0)
-        }
-    }
+    // Tests for find_next_uncovered_range_from function
 
-    // helper to make a range quickly
-    fn range(a: u64, b: u64) -> core::ops::RangeInclusive<H> {
-        H(a)..=H(b)
-    }
+    #[test]
+    fn test_find_next_uncovered_range_from_table() {
+        let test_cases = [
+            RangeTestCase {
+                name: "no pending requests",
+                initial_height: 10,
+                max_size: 5,
+                pending_ranges: &[],
+                expected_start: 10,
+                expected_end: 14,
+            },
+            RangeTestCase {
+                name: "max size one",
+                initial_height: 10,
+                max_size: 1,
+                pending_ranges: &[],
+                expected_start: 10,
+                expected_end: 10,
+            },
+            RangeTestCase {
+                name: "with blocking request",
+                initial_height: 10,
+                max_size: 5,
+                pending_ranges: &[(12, 15)],
+                expected_start: 10,
+                expected_end: 11,
+            },
+            RangeTestCase {
+                name: "zero max size becomes one",
+                initial_height: 10,
+                max_size: 0, // Should be treated as 1
+                pending_ranges: &[],
+                expected_start: 10,
+                expected_end: 10,
+            },
+            RangeTestCase {
+                name: "range starts immediately after",
+                initial_height: 15,
+                max_size: 5,
+                pending_ranges: &[(16, 20)],
+                expected_start: 15,
+                expected_end: 15, // boundary_end = 16 - 1 = 15, min(19, 15) = 15
+            },
+            RangeTestCase {
+                name: "height zero with range starting at one",
+                initial_height: 0,
+                max_size: 3,
+                pending_ranges: &[(1, 5)],
+                expected_start: 0,
+                expected_end: 0, // boundary_end = 1 - 1 = 0, min(2, 0) = 0
+            },
+            RangeTestCase {
+                name: "sync height just at range end",
+                initial_height: 11,
+                max_size: 4,
+                pending_ranges: &[(5, 10)],
+                expected_start: 11,
+                expected_end: 14, // max_end = 11 + 4 - 1 = 14
+            },
+            RangeTestCase {
+                name: "fill gap between ranges",
+                initial_height: 12,
+                max_size: 6,
+                pending_ranges: &[(5, 10), (20, 25)],
+                expected_start: 12,
+                expected_end: 17, // max_end = 12 + 6 - 1 = 17, boundary_end = 20 - 1 = 19, min(17, 19) = 17
+            },
+        ];
 
-    #[rstest]
-    #[case(H(10), H(100), 5,  vec![],                                   Some((11, 15)))] // empty ranges fits an entire window
-    #[case(H(10), H(12),  10, vec![],                                   Some((11, 12)))] // capped by `inclusive_up_to_height`
-    #[case(H(7),  H(100), 1,  vec![],                                   Some((8,  8 )))] // window size of 1 returns a single-element range
-    #[case(H(7),  H(100), 0,  vec![],                                   None           )] // window size of 0 returns `None`
-    #[case(H(10), H(10),  5,  vec![],                                   None           )] // `exclusive_start_height == inclusive_up_to_height` returns `None`
-    #[case(H(10), H(9),   5,  vec![],                                   None           )] // `exclusive_start_height == inclusive_up_to_height` returns `None`
-    #[case(H(9),  H(100), 4,  vec![range(10, 12)],                       Some((13, 16)))] // skips range [10, 12]
-    #[case(H(9),  H(100), 10, vec![range(15, 20)],                       Some((10, 14)))] // stops at 14 before the next blocking range [15, 20]
-    #[case(H(9),  H(100), 3,  vec![range(10,12), range(11,13), range(13,14)], Some((15, 17)))] // jumps over overlapping ranges
-    #[case(H(0),  H(5),   100,vec![],                                   Some((1,  5 )))] // hits the `inclusive_up_to_height`
-    #[case(H(0), H(100), 4,  vec![range(1,3), range(10,99)],           Some((4,  7 )))] // hole between `ranges`
-    #[case(H(0), H(100), 10, vec![range(1,3), range(9,20)],            Some((4,  8 )))] // hole between `ranges` that is smaller than `window_size`
-    fn compute_free_window_param(
-        #[case] exclusive_start_height: H,
-        #[case] inclusive_up_to_height: H,
-        #[case] window_size: u64,
-        #[case] ranges: Vec<RangeInclusive<H>>,
-        #[case] expected: Option<(u64, u64)>,
-    ) {
-        let actual = compute_free_window(
-            exclusive_start_height,
-            inclusive_up_to_height,
-            window_size,
-            ranges,
-        );
-        match (actual, expected) {
-            (None, None) => {}
-            (Some(r), Some((s, e))) => {
-                assert_eq!(*r.start(), H(s));
-                assert_eq!(*r.end(), H(e));
+        for case in test_cases {
+            let mut pending_requests = TestPendingRequests::new();
+
+            // Setup pending requests based on test case
+            for (i, &(start, end)) in case.pending_ranges.iter().enumerate() {
+                let peer = PeerId::random();
+                pending_requests.insert(
+                    OutboundRequestId::new(format!("req{}", i + 1)),
+                    PendingRequestEntry {
+                        range: Height::new(start)..=Height::new(end),
+                        peer,
+                        excluded_peers: BTreeSet::new(),
+                    },
+                );
             }
-            (g, e) => panic!("mismatch\n  got: {:?}\n  exp: {:?}", g, e),
+
+            let result = find_next_uncovered_range_from::<TestContext>(
+                Height::new(case.initial_height),
+                case.max_size,
+                &pending_requests,
+            );
+
+            assert_eq!(
+                result,
+                Height::new(case.expected_start)..=Height::new(case.expected_end),
+                "Test case '{}' failed",
+                case.name
+            );
         }
     }
 
-    // helper to normalize `Vec<RangeInclusive<H>>` for easy equality checks
-    fn as_pairs(v: &[RangeInclusive<H>]) -> Vec<(u64, u64)> {
-        let mut pairs: Vec<_> = v
+    // Recovery tests for find_next_uncovered_range_from: when initial_height
+    // falls inside a pending request, the function skips past it.
+
+    #[test]
+    fn test_find_next_uncovered_range_from_recovery_cases() {
+        let test_cases = [
+            RangeTestCase {
+                name: "initial height inside pending range, recovers past it",
+                initial_height: 12,
+                max_size: 3,
+                pending_ranges: &[(10, 15)],
+                expected_start: 16,
+                expected_end: 18,
+            },
+            RangeTestCase {
+                name: "initial height equals range start, recovers past it",
+                initial_height: 15,
+                max_size: 5,
+                pending_ranges: &[(15, 20)],
+                expected_start: 21,
+                expected_end: 25,
+            },
+            RangeTestCase {
+                name: "initial height equals range end, recovers past it",
+                initial_height: 15,
+                max_size: 3,
+                pending_ranges: &[(10, 15)],
+                expected_start: 16,
+                expected_end: 18,
+            },
+            RangeTestCase {
+                name: "multiple consecutive ranges, recovers past all",
+                initial_height: 16,
+                max_size: 3,
+                pending_ranges: &[(10, 15), (16, 20)],
+                expected_start: 21,
+                expected_end: 23,
+            },
+            RangeTestCase {
+                name: "initial height zero inside range starting at zero",
+                initial_height: 0,
+                max_size: 3,
+                pending_ranges: &[(0, 5)],
+                expected_start: 6,
+                expected_end: 8,
+            },
+        ];
+
+        for case in test_cases {
+            let mut pending_requests = TestPendingRequests::new();
+
+            for (i, &(start, end)) in case.pending_ranges.iter().enumerate() {
+                let peer = PeerId::random();
+                pending_requests.insert(
+                    OutboundRequestId::new(format!("req{}", i + 1)),
+                    PendingRequestEntry {
+                        range: Height::new(start)..=Height::new(end),
+                        peer,
+                        excluded_peers: BTreeSet::new(),
+                    },
+                );
+            }
+
+            let result = find_next_uncovered_range_from::<TestContext>(
+                Height::new(case.initial_height),
+                case.max_size,
+                &pending_requests,
+            );
+
+            assert_eq!(
+                result,
+                Height::new(case.expected_start)..=Height::new(case.expected_end),
+                "Test case '{}' failed",
+                case.name
+            );
+        }
+    }
+
+    // Tests for find_next_uncovered_height function
+
+    #[test]
+    fn test_find_next_uncovered_height_table() {
+        let test_cases = [
+            HeightTestCase {
+                name: "no pending requests",
+                initial_height: 10,
+                pending_ranges: &[],
+                expected_height: 10,
+            },
+            HeightTestCase {
+                name: "starting height covered",
+                initial_height: 12,
+                pending_ranges: &[(10, 15)],
+                expected_height: 16, // Should return the height after the covered range
+            },
+            HeightTestCase {
+                name: "starting height match request start",
+                initial_height: 10,
+                pending_ranges: &[(10, 15)],
+                expected_height: 16, // Should return the height after the covered range
+            },
+            HeightTestCase {
+                name: "starting height match request end",
+                initial_height: 15,
+                pending_ranges: &[(10, 15)],
+                expected_height: 16, // Should return the height after the covered range
+            },
+            HeightTestCase {
+                name: "starting height just before request start",
+                initial_height: 9,
+                pending_ranges: &[(10, 15)],
+                expected_height: 9, // Should return the starting height
+            },
+            HeightTestCase {
+                name: "multiple consecutive ranges",
+                initial_height: 10,
+                pending_ranges: &[(10, 15), (16, 20)],
+                expected_height: 21, // Should skip over all consecutive ranges
+            },
+            HeightTestCase {
+                name: "multiple consecutive ranges with a gap",
+                initial_height: 10,
+                pending_ranges: &[(10, 15), (16, 20), (24, 30)],
+                expected_height: 21, // Should skip over consecutive ranges but stop at gap
+            },
+            HeightTestCase {
+                name: "starting height covered multiple",
+                initial_height: 12,
+                pending_ranges: &[(10, 15), (15, 20)],
+                expected_height: 21, // Should return the height after all covered ranges
+            },
+        ];
+
+        for case in test_cases {
+            let mut pending_requests = TestPendingRequests::new();
+
+            // Setup pending requests based on test case
+            for (i, &(start, end)) in case.pending_ranges.iter().enumerate() {
+                let peer = PeerId::random();
+                pending_requests.insert(
+                    OutboundRequestId::new(format!("req{}", i + 1)),
+                    PendingRequestEntry {
+                        range: Height::new(start)..=Height::new(end),
+                        peer,
+                        excluded_peers: BTreeSet::new(),
+                    },
+                );
+            }
+
+            let result = find_next_uncovered_height::<TestContext>(
+                Height::new(case.initial_height),
+                &pending_requests,
+            );
+
+            assert_eq!(
+                result,
+                Height::new(case.expected_height),
+                "Test case '{}' failed",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_request_range() {
+        let validate = validate_request_range::<TestContext>;
+
+        let tip_height = Height::new(20);
+        let batch_size = 5;
+
+        // Valid range
+        let range = Height::new(15)..=Height::new(19);
+        assert!(validate(&range, tip_height, batch_size));
+
+        // Start greater than end
+        let range = Height::new(18)..=Height::new(17);
+        assert!(!validate(&range, tip_height, batch_size));
+
+        // Start greater than tip height
+        let range = Height::new(21)..=Height::new(25);
+        assert!(!validate(&range, tip_height, batch_size));
+
+        // Exceeds batch size
+        let range = Height::new(10)..=Height::new(16);
+        assert!(!validate(&range, tip_height, batch_size));
+
+        // No overflow
+        let range = Height::new(0)..=Height::new(u64::MAX);
+        assert!(!validate(&range, tip_height, batch_size));
+    }
+
+    #[test]
+    fn test_clamp_request_range() {
+        let clamp = clamp_request_range::<TestContext>;
+
+        let tip_height = Height::new(20);
+
+        // Range within tip height
+        let range = Height::new(15)..=Height::new(18);
+        let clamped = clamp(&range, tip_height);
+        assert_eq!(clamped, range);
+
+        // Range exceeding tip height
+        let range = Height::new(18)..=Height::new(25);
+        let clamped = clamp(&range, tip_height);
+        assert_eq!(clamped, Height::new(18)..=tip_height);
+
+        // Range starting at tip height
+        let range = tip_height..=Height::new(25);
+        let clamped = clamp(&range, tip_height);
+        assert_eq!(clamped, tip_height..=tip_height);
+    }
+
+    // Helper: drive a handle::Input through the coroutine-based handler.
+    // Collects all yielded effects and invokes `resume_strategy` to produce
+    // the `Resume` value fed back for each yielded effect. Tests that do not
+    // need meaningful resume values should prefer the `drive_input` wrapper,
+    // which always resumes with the default.
+    fn drive_input_with<F>(
+        state: &mut State<TestContext>,
+        metrics: &crate::Metrics,
+        input: Input<TestContext>,
+        mut resume_strategy: F,
+    ) -> Result<Vec<crate::Effect<TestContext>>, crate::Error<TestContext>>
+    where
+        F: FnMut(&crate::Effect<TestContext>) -> crate::Resume<TestContext>,
+    {
+        use crate::co::{CoState, Gen};
+        use crate::Resume;
+
+        let mut effects = Vec::new();
+        let mut gen = Gen::new(|co| handle(co, state, metrics, input));
+        let mut result = gen.resume_with(Resume::default());
+
+        loop {
+            match result {
+                CoState::Yielded(effect) => {
+                    let resume = resume_strategy(&effect);
+                    effects.push(effect);
+                    result = gen.resume_with(resume);
+                }
+                CoState::Complete(r) => return r.map(|()| effects),
+            }
+        }
+    }
+
+    // Helper: drive a handle::Input and auto-resume every effect with the
+    // default resume value. Only safe for inputs whose handling does not
+    // require meaningful resume values (no-peer / no-yield paths).
+    fn drive_input(
+        state: &mut State<TestContext>,
+        metrics: &crate::Metrics,
+        input: Input<TestContext>,
+    ) -> Result<Vec<crate::Effect<TestContext>>, crate::Error<TestContext>> {
+        drive_input_with(state, metrics, input, |_| crate::Resume::default())
+    }
+
+    fn make_test_state() -> State<TestContext> {
+        use rand::SeedableRng;
+        State::new(
+            Box::new(rand::rngs::StdRng::seed_from_u64(42)),
+            crate::Config::default(),
+        )
+    }
+
+    // -------------------------------------------------------------------
+    // sync_height invariants:
+    //   1. sync_height > tip_height
+    //   2. sync_height must not fall inside any pending request's range
+    // -------------------------------------------------------------------
+
+    // -- on_decided: sync_height must advance past tip_height --
+
+    #[test]
+    fn test_on_decided_advances_sync_height_when_equal_to_new_tip() {
+        let mut state = make_test_state();
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        state.tip_height = Height::new(9);
+        state.sync_height = Height::new(10);
+
+        drive_input(&mut state, &metrics, Input::Decided(Height::new(10))).unwrap();
+
+        assert_eq!(state.tip_height, Height::new(10));
+        assert_eq!(state.sync_height, Height::new(11));
+    }
+
+    #[test]
+    fn test_on_decided_advances_sync_height_when_below_new_tip() {
+        let mut state = make_test_state();
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        state.tip_height = Height::new(9);
+        state.sync_height = Height::new(8);
+
+        drive_input(&mut state, &metrics, Input::Decided(Height::new(10))).unwrap();
+
+        assert_eq!(state.tip_height, Height::new(10));
+        assert_eq!(state.sync_height, Height::new(11));
+        assert!(state.sync_height > state.tip_height);
+    }
+
+    #[test]
+    fn test_on_decided_preserves_sync_height_when_already_ahead() {
+        let mut state = make_test_state();
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        state.tip_height = Height::new(9);
+        state.sync_height = Height::new(20);
+
+        drive_input(&mut state, &metrics, Input::Decided(Height::new(10))).unwrap();
+
+        assert_eq!(state.tip_height, Height::new(10));
+        assert_eq!(state.sync_height, Height::new(20));
+    }
+
+    #[test]
+    fn test_on_decided_skips_pending_requests() {
+        let mut state = make_test_state();
+        state.started = true;
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        state.tip_height = Height::new(109);
+        state.sync_height = Height::new(110);
+
+        let peer_a = PeerId::random();
+        state.pending_requests.insert(
+            OutboundRequestId::new("req1"),
+            PendingRequestEntry {
+                range: Height::new(110)..=Height::new(120),
+                peer: peer_a,
+                excluded_peers: BTreeSet::new(),
+            },
+        );
+
+        // Deciding heights 110..=112 advances tip to 112.
+        // sync_height must not land inside the remaining pending request [110..=120].
+        drive_input(&mut state, &metrics, Input::Decided(Height::new(110))).unwrap();
+        drive_input(&mut state, &metrics, Input::Decided(Height::new(111))).unwrap();
+        drive_input(&mut state, &metrics, Input::Decided(Height::new(112))).unwrap();
+
+        assert_eq!(state.tip_height, Height::new(112));
+        for entry in state.pending_requests.values() {
+            let range = &entry.range;
+            assert!(
+                !range.contains(&state.sync_height),
+                "sync_height ({}) inside pending request range {}..={}",
+                state.sync_height.as_u64(),
+                range.start().as_u64(),
+                range.end().as_u64(),
+            );
+        }
+    }
+
+    // -- on_started_height: sync_height must skip pending requests --
+
+    #[test]
+    fn test_on_started_height_skips_pending_requests() {
+        let mut state = make_test_state();
+        state.started = true;
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        state.tip_height = Height::new(99);
+        state.sync_height = Height::new(121);
+
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        state.pending_requests.insert(
+            OutboundRequestId::new("req1"),
+            PendingRequestEntry {
+                range: Height::new(100)..=Height::new(110),
+                peer: peer_a,
+                excluded_peers: BTreeSet::new(),
+            },
+        );
+        state.pending_requests.insert(
+            OutboundRequestId::new("req2"),
+            PendingRequestEntry {
+                range: Height::new(111)..=Height::new(120),
+                peer: peer_b,
+                excluded_peers: BTreeSet::new(),
+            },
+        );
+        state.peers.insert(
+            peer_a,
+            crate::Status {
+                peer_id: peer_a,
+                tip_height: Height::new(120),
+                history_min_height: Height::new(1),
+            },
+        );
+
+        // req1 times out, no alternative peer → sync_height resets.
+        drive_input(
+            &mut state,
+            &metrics,
+            Input::SyncRequestTimedOut(
+                OutboundRequestId::new("req1"),
+                peer_a,
+                crate::Request::ValueRequest(crate::ValueRequest::new(
+                    Height::new(100)..=Height::new(110),
+                )),
+            ),
+        )
+        .unwrap();
+
+        // Consensus advances to 115.
+        for h in 100..=114 {
+            drive_input(&mut state, &metrics, Input::Decided(Height::new(h))).unwrap();
+        }
+
+        // on_started_height(115) must not place sync_height inside [111..=120].
+        drive_input(
+            &mut state,
+            &metrics,
+            Input::StartedHeight(Height::new(115), HeightStartType::Start),
+        )
+        .unwrap();
+
+        for entry in state.pending_requests.values() {
+            let range = &entry.range;
+            assert!(
+                !range.contains(&state.sync_height),
+                "sync_height ({}) inside pending request range {}..={}",
+                state.sync_height.as_u64(),
+                range.start().as_u64(),
+                range.end().as_u64(),
+            );
+        }
+    }
+
+    #[test]
+    fn test_on_started_height_restart_clears_pending_and_resets() {
+        let mut state = make_test_state();
+        state.started = true;
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        state.tip_height = Height::new(9);
+        state.sync_height = Height::new(15);
+        state.pending_requests.insert(
+            OutboundRequestId::new("req1"),
+            PendingRequestEntry {
+                range: Height::new(10)..=Height::new(14),
+                peer: PeerId::random(),
+                excluded_peers: BTreeSet::new(),
+            },
+        );
+
+        drive_input(
+            &mut state,
+            &metrics,
+            Input::StartedHeight(Height::new(10), HeightStartType::Restart),
+        )
+        .unwrap();
+
+        assert_eq!(state.sync_height, Height::new(10));
+        assert!(state.pending_requests.is_empty());
+    }
+
+    // -- re_request_values_from_peer_except: sync_height invariants --
+
+    #[test]
+    fn test_re_request_no_peer_preserves_sync_height_above_tip() {
+        let mut state = make_test_state();
+        state.started = true;
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        // Pending request for 11..=15, sync_height = 16.
+        state.tip_height = Height::new(10);
+        state.sync_height = Height::new(16);
+
+        let peer_a = PeerId::random();
+        state.pending_requests.insert(
+            OutboundRequestId::new("req1"),
+            PendingRequestEntry {
+                range: Height::new(11)..=Height::new(15),
+                peer: peer_a,
+                excluded_peers: BTreeSet::new(),
+            },
+        );
+        state.peers.insert(
+            peer_a,
+            crate::Status {
+                peer_id: peer_a,
+                tip_height: Height::new(15),
+                history_min_height: Height::new(1),
+            },
+        );
+
+        // Consensus decides 11 and 12 while the request is in flight.
+        drive_input(&mut state, &metrics, Input::Decided(Height::new(11))).unwrap();
+        drive_input(&mut state, &metrics, Input::Decided(Height::new(12))).unwrap();
+
+        assert_eq!(state.tip_height, Height::new(12));
+
+        // Request times out, no alternative peer.
+        // sync_height must remain above tip_height.
+        drive_input(
+            &mut state,
+            &metrics,
+            Input::SyncRequestTimedOut(
+                OutboundRequestId::new("req1"),
+                peer_a,
+                crate::Request::ValueRequest(crate::ValueRequest::new(
+                    Height::new(11)..=Height::new(15),
+                )),
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            state.sync_height > state.tip_height,
+            "sync_height ({}) <= tip_height ({})",
+            state.sync_height.as_u64(),
+            state.tip_height.as_u64(),
+        );
+        assert_eq!(state.sync_height, Height::new(13));
+    }
+
+    // -- re_request: excluded peers accumulate across retries --
+
+    /// Like [`drive_input`] but provides `ValueRequestId` resumes when
+    /// `SendValueRequest` effects are yielded, allowing retry paths to
+    /// complete without error.
+    fn drive_input_with_retries(
+        state: &mut State<TestContext>,
+        metrics: &crate::Metrics,
+        input: Input<TestContext>,
+    ) -> Result<Vec<crate::Effect<TestContext>>, crate::Error<TestContext>> {
+        use crate::Resume;
+        let mut req_counter = 0u64;
+        drive_input_with(state, metrics, input, |effect| match effect {
+            Effect::SendValueRequest(..) => {
+                req_counter += 1;
+                Resume::ValueRequestId(Some(OutboundRequestId::new(format!(
+                    "retry_req{req_counter}"
+                ))))
+            }
+            _ => Resume::default(),
+        })
+    }
+
+    #[test]
+    fn test_re_request_stops_after_all_peers_exhausted() {
+        let mut state = make_test_state();
+        state.started = true;
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        state.tip_height = Height::new(10);
+        state.sync_height = Height::new(16);
+
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+
+        // Register both peers as having the data.
+        state.peers.insert(
+            peer_a,
+            crate::Status {
+                peer_id: peer_a,
+                tip_height: Height::new(20),
+                history_min_height: Height::new(1),
+            },
+        );
+        state.peers.insert(
+            peer_b,
+            crate::Status {
+                peer_id: peer_b,
+                tip_height: Height::new(20),
+                history_min_height: Height::new(1),
+            },
+        );
+
+        // Pending request assigned to peer_a for heights 11..=15.
+        state.pending_requests.insert(
+            OutboundRequestId::new("req1"),
+            PendingRequestEntry {
+                range: Height::new(11)..=Height::new(15),
+                peer: peer_a,
+                excluded_peers: BTreeSet::new(),
+            },
+        );
+
+        // Peer A times out — retry should go to peer B with A in the excluded set.
+        let effects = drive_input_with_retries(
+            &mut state,
+            &metrics,
+            Input::SyncRequestTimedOut(
+                OutboundRequestId::new("req1"),
+                peer_a,
+                crate::Request::ValueRequest(crate::ValueRequest::new(
+                    Height::new(11)..=Height::new(15),
+                )),
+            ),
+        )
+        .unwrap();
+
+        // A new request should have been sent (to peer B).
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendValueRequest(..))),
+            "Expected a new request after peer A timed out"
+        );
+
+        // Verify the new pending request carries A in the excluded set.
+        assert_eq!(state.pending_requests.len(), 1);
+        let (new_req_id, entry) = state.pending_requests.iter().next().unwrap();
+        assert_ne!(entry.peer, peer_a, "Retry should not go back to peer A");
+        assert!(
+            entry.excluded_peers.contains(&peer_a),
+            "Peer A should be in the excluded set"
+        );
+        let new_req_id = new_req_id.clone();
+
+        // Peer B also times out — all peers exhausted, no further retry.
+        let effects = drive_input_with_retries(
+            &mut state,
+            &metrics,
+            Input::SyncRequestTimedOut(
+                new_req_id,
+                peer_b,
+                crate::Request::ValueRequest(crate::ValueRequest::new(
+                    Height::new(11)..=Height::new(15),
+                )),
+            ),
+        )
+        .unwrap();
+
+        // No new request should be sent.
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendValueRequest(..))),
+            "No request should be sent after all peers are exhausted"
+        );
+
+        // Pending requests should be empty.
+        assert!(
+            state.pending_requests.is_empty(),
+            "No pending requests should remain"
+        );
+
+        // sync_height should have been reset but remain above tip_height.
+        // sync_height should reset to the start of the failed range (11),
+        // which is above tip_height (10).
+        assert_eq!(state.sync_height, Height::new(11));
+    }
+
+    #[test]
+    fn test_re_request_preserves_rewound_sync_height_below_other_pending_range() {
+        let mut state = make_test_state();
+        state.started = true;
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        state.tip_height = Height::new(10);
+        state.sync_height = Height::new(21);
+
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+
+        state.peers.insert(
+            peer_a,
+            crate::Status {
+                peer_id: peer_a,
+                tip_height: Height::new(30),
+                history_min_height: Height::new(1),
+            },
+        );
+        state.peers.insert(
+            peer_b,
+            crate::Status {
+                peer_id: peer_b,
+                tip_height: Height::new(30),
+                history_min_height: Height::new(1),
+            },
+        );
+
+        // Entry A holds heights 11..=15 and has already excluded peer_a, so
+        // when peer_b also times out, every eligible peer is exhausted and
+        // sync_height rewinds to 11.
+        state.pending_requests.insert(
+            OutboundRequestId::new("req_a"),
+            PendingRequestEntry {
+                range: Height::new(11)..=Height::new(15),
+                peer: peer_b,
+                excluded_peers: [peer_a].into_iter().collect(),
+            },
+        );
+
+        // Entry B holds heights 16..=20 with peer_a still available as a
+        // retry target.
+        state.pending_requests.insert(
+            OutboundRequestId::new("req_b"),
+            PendingRequestEntry {
+                range: Height::new(16)..=Height::new(20),
+                peer: peer_b,
+                excluded_peers: BTreeSet::new(),
+            },
+        );
+
+        // Entry A times out on peer_b — all eligible peers exhausted.
+        drive_input_with_retries(
+            &mut state,
+            &metrics,
+            Input::SyncRequestTimedOut(
+                OutboundRequestId::new("req_a"),
+                peer_b,
+                crate::Request::ValueRequest(crate::ValueRequest::new(
+                    Height::new(11)..=Height::new(15),
+                )),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.sync_height,
+            Height::new(11),
+            "exhaustion should rewind sync_height to the start of the failed range"
+        );
+
+        // Entry B times out on peer_b — peer_a is still eligible, so a new
+        // request goes out. sync_height must stay at 11 so the next request
+        // cycle picks up the 11..=15 range that the exhaustion rewound to.
+        let effects = drive_input_with_retries(
+            &mut state,
+            &metrics,
+            Input::SyncRequestTimedOut(
+                OutboundRequestId::new("req_b"),
+                peer_b,
+                crate::Request::ValueRequest(crate::ValueRequest::new(
+                    Height::new(16)..=Height::new(20),
+                )),
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendValueRequest(..))),
+            "Expected a re-request to be sent for entry B"
+        );
+
+        let req_b_entry = state
+            .pending_requests
+            .values()
+            .find(|entry| entry.range == (Height::new(16)..=Height::new(20)))
+            .expect("re-requested entry for 16..=20 should be present");
+        assert_eq!(req_b_entry.peer, peer_a);
+
+        assert_eq!(state.sync_height, Height::new(11));
+    }
+
+    // -- on_value_processing_error: peer fault handling --
+
+    #[test]
+    fn test_value_processing_error_penalizes_peer_and_retries_via_other_peer() {
+        let mut state = make_test_state();
+        state.started = true;
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        state.tip_height = Height::new(10);
+        state.sync_height = Height::new(16);
+
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+
+        state.peers.insert(
+            peer_a,
+            crate::Status {
+                peer_id: peer_a,
+                tip_height: Height::new(20),
+                history_min_height: Height::new(1),
+            },
+        );
+        state.peers.insert(
+            peer_b,
+            crate::Status {
+                peer_id: peer_b,
+                tip_height: Height::new(20),
+                history_min_height: Height::new(1),
+            },
+        );
+
+        state.pending_requests.insert(
+            OutboundRequestId::new("req1"),
+            PendingRequestEntry {
+                range: Height::new(11)..=Height::new(15),
+                peer: peer_a,
+                excluded_peers: BTreeSet::new(),
+            },
+        );
+
+        let initial_score = state.peer_scorer.get_score(&peer_a);
+
+        let effects = drive_input_with_retries(
+            &mut state,
+            &metrics,
+            Input::ValueProcessingError(peer_a, Height::new(11)),
+        )
+        .unwrap();
+
+        assert!(
+            state.peer_scorer.get_score(&peer_a) < initial_score,
+            "Peer A should be penalized for serving an undecodable value"
+        );
+
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendValueRequest(..))),
+            "Expected a re-request after ValueProcessingError"
+        );
+
+        assert_eq!(state.pending_requests.len(), 1);
+        let (_, entry) = state.pending_requests.iter().next().unwrap();
+        assert_ne!(entry.peer, peer_a, "Retry should not go back to peer A");
+        assert_eq!(entry.peer, peer_b);
+        assert!(
+            entry.excluded_peers.contains(&peer_a),
+            "Peer A should be in the excluded set"
+        );
+    }
+
+    // -- on_value_response: certificate height validation --
+
+    /// Helper to create a RawDecidedValue with a given certificate height.
+    fn make_raw_value(height: u64) -> crate::RawDecidedValue<TestContext> {
+        use arc_malachitebft_test::ValueId;
+        use bytes::Bytes;
+        use malachitebft_core_types::{CommitCertificate, Round};
+
+        crate::RawDecidedValue::new(
+            Bytes::from_static(b"test"),
+            CommitCertificate {
+                height: Height::new(height),
+                round: Round::ZERO,
+                value_id: ValueId::new(height),
+                commit_signatures: vec![],
+            },
+        )
+    }
+
+    /// Helper to set up test state with a pending request and a single peer.
+    fn setup_response_test(
+        range_start: u64,
+        range_end: u64,
+    ) -> (State<TestContext>, crate::Metrics, PeerId) {
+        let mut state = make_test_state();
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        let peer = PeerId::random();
+        state.peers.insert(
+            peer,
+            crate::Status {
+                peer_id: peer,
+                tip_height: Height::new(range_end + 10),
+                history_min_height: Height::new(1),
+            },
+        );
+        state.pending_requests.insert(
+            OutboundRequestId::new("req1"),
+            PendingRequestEntry {
+                range: Height::new(range_start)..=Height::new(range_end),
+                peer,
+                excluded_peers: BTreeSet::new(),
+            },
+        );
+
+        (state, metrics, peer)
+    }
+
+    fn has_process_value_response(effects: &[crate::Effect<TestContext>]) -> bool {
+        effects
             .iter()
-            .map(|r| (r.start().as_u64(), r.end().as_u64()))
-            .collect();
-        pairs.sort_unstable();
-        pairs
+            .any(|e| matches!(e, crate::Effect::ProcessValueResponse(..)))
     }
 
-    #[rstest]
-    #[case(vec![range(5,5)],                          H(5),  vec![])] // single singleton range removed
-    #[case(vec![range(1,3), range(5,5), range(9,11)], H(5),  vec![(1,3), (9,11)])] // singleton range removed but other ranges are kept
-    #[case(vec![range(5,10)],                         H(5),  vec![(6,10)])] // height at the left edge trims left
-    #[case(vec![range(5,10)],                         H(10), vec![(5,9)])] // height at the right edge trims right
-    #[case(vec![range(5,10)],                         H(7),  vec![(5,6), (8,10)])] // height inside a range splits the range
-    #[case(vec![range(1,3), range(5,7), range(9,11)], H(6),  vec![(1,3), (5,5), (7,7), (9,11)])] // multiple ranges, only the first matching is changed
-    fn excise_height_ok(
-        #[case] mut ranges: Vec<RangeInclusive<H>>,
-        #[case] height: H,
-        #[case] expected_pairs: Vec<(u64, u64)>,
-    ) {
-        excise_height(&mut ranges, height).unwrap();
-        assert_eq!(as_pairs(&ranges), expected_pairs);
+    #[test]
+    fn test_value_response_rejects_wrong_start_height() {
+        // Requested range 10..=14, but peer sends sequential values starting at 5
+        let (mut state, metrics, peer) = setup_response_test(10, 14);
+
+        let response = crate::ValueResponse::new(
+            Height::new(5),
+            vec![
+                make_raw_value(5),
+                make_raw_value(6),
+                make_raw_value(7),
+                make_raw_value(8),
+                make_raw_value(9),
+            ],
+        );
+
+        let effects = drive_input(
+            &mut state,
+            &metrics,
+            Input::ValueResponse(OutboundRequestId::new("req1"), peer, Some(response)),
+        )
+        .unwrap();
+
+        assert!(
+            !has_process_value_response(&effects),
+            "Response with sequential but wrong-range heights should be rejected"
+        );
     }
 
-    #[rstest]
-    #[case(vec![range(5,7), range(9,12)], H(8), vec![(5,7), (9,12)])] // not found returns an `Error`
-    fn excise_height_err(
-        #[case] mut ranges: Vec<RangeInclusive<H>>,
-        #[case] height: H,
-        #[case] expected_pairs: Vec<(u64, u64)>,
-    ) {
-        let err = excise_height(&mut ranges, height).unwrap_err();
-        assert!(err.contains("cannot find range"), "got: {}", err);
-        assert_eq!(as_pairs(&ranges), expected_pairs);
+    #[test]
+    fn test_value_response_accepts_prefix_of_requested_range() {
+        // Requested 5 values (10..=14) but peer returns a 3-value prefix.
+        // Accepting the prefix triggers a follow-up `SendValueRequest` for the
+        // remaining suffix, so drive through the retry-aware helper.
+        let (mut state, metrics, peer) = setup_response_test(10, 14);
+        // A second peer is needed so the suffix re-request has somewhere to go.
+        let other_peer = PeerId::random();
+        state.peers.insert(
+            other_peer,
+            crate::Status {
+                peer_id: other_peer,
+                tip_height: Height::new(24),
+                history_min_height: Height::new(1),
+            },
+        );
+
+        let response = crate::ValueResponse::new(
+            Height::new(10),
+            vec![make_raw_value(10), make_raw_value(11), make_raw_value(12)],
+        );
+
+        let effects = drive_input_with_retries(
+            &mut state,
+            &metrics,
+            Input::ValueResponse(OutboundRequestId::new("req1"), peer, Some(response)),
+        )
+        .unwrap();
+
+        assert!(
+            has_process_value_response(&effects),
+            "A non-empty prefix of the requested range must be accepted so the \
+             requester can make progress when peers truncate under max_response_size"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, crate::Effect::SendValueRequest(..))),
+            "A prefix response must trigger a re-request for the remaining suffix"
+        );
+    }
+
+    #[test]
+    fn test_value_response_rejects_empty_response() {
+        // Requested 10..=14 but peer returns zero values.
+        let (mut state, metrics, peer) = setup_response_test(10, 14);
+
+        let response = crate::ValueResponse::new(Height::new(10), vec![]);
+
+        let effects = drive_input(
+            &mut state,
+            &metrics,
+            Input::ValueResponse(OutboundRequestId::new("req1"), peer, Some(response)),
+        )
+        .unwrap();
+
+        assert!(
+            !has_process_value_response(&effects),
+            "An empty response is indistinguishable from a denial and must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_value_response_rejects_longer_than_requested() {
+        // Requested 5 values (10..=14) but peer returns 6 sequential values.
+        let (mut state, metrics, peer) = setup_response_test(10, 14);
+
+        let response = crate::ValueResponse::new(
+            Height::new(10),
+            vec![
+                make_raw_value(10),
+                make_raw_value(11),
+                make_raw_value(12),
+                make_raw_value(13),
+                make_raw_value(14),
+                make_raw_value(15),
+            ],
+        );
+
+        let effects = drive_input(
+            &mut state,
+            &metrics,
+            Input::ValueResponse(OutboundRequestId::new("req1"), peer, Some(response)),
+        )
+        .unwrap();
+
+        assert!(
+            !has_process_value_response(&effects),
+            "A response longer than the requested range must be rejected"
+        );
+    }
+
+    // -- on_got_decided_values: reject invalid host responses --
+
+    /// Extract the `ValueResponse` from a `SendValueResponse` effect.
+    fn extract_value_response(
+        effects: &[crate::Effect<TestContext>],
+    ) -> &crate::ValueResponse<TestContext> {
+        effects
+            .iter()
+            .find_map(|e| match e {
+                crate::Effect::SendValueResponse(_, response, _) => Some(response),
+                _ => None,
+            })
+            .expect("expected a SendValueResponse effect")
+    }
+
+    #[test]
+    fn test_on_got_decided_values_sends_valid_response() {
+        let mut state = make_test_state();
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        let values = vec![make_raw_value(5), make_raw_value(6), make_raw_value(7)];
+
+        let effects = drive_input(
+            &mut state,
+            &metrics,
+            Input::GotDecidedValues(
+                InboundRequestId::new("req1"),
+                Height::new(5)..=Height::new(7),
+                values,
+            ),
+        )
+        .unwrap();
+
+        let response = extract_value_response(&effects);
+        assert_eq!(response.start_height, Height::new(5));
+        assert_eq!(response.values.len(), 3);
+    }
+
+    #[test]
+    fn test_on_got_decided_values_forwards_truncated_response() {
+        let mut state = make_test_state();
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        // Range expects 3 values (5..=7) but only 2 provided (e.g. truncated by engine).
+        // A count mismatch alone should not prevent forwarding valid values.
+        let values = vec![make_raw_value(5), make_raw_value(6)];
+
+        let effects = drive_input(
+            &mut state,
+            &metrics,
+            Input::GotDecidedValues(
+                InboundRequestId::new("req1"),
+                Height::new(5)..=Height::new(7),
+                values,
+            ),
+        )
+        .unwrap();
+
+        let response = extract_value_response(&effects);
+        assert_eq!(response.start_height, Height::new(5));
+        assert_eq!(response.values.len(), 2);
+    }
+
+    #[test]
+    fn test_on_got_decided_values_truncates_at_wrong_height() {
+        let mut state = make_test_state();
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        // Range is 5..=7 but second value has height 10 instead of 6.
+        // Only the valid prefix (height 5) should be forwarded.
+        let values = vec![make_raw_value(5), make_raw_value(10), make_raw_value(7)];
+
+        let effects = drive_input(
+            &mut state,
+            &metrics,
+            Input::GotDecidedValues(
+                InboundRequestId::new("req1"),
+                Height::new(5)..=Height::new(7),
+                values,
+            ),
+        )
+        .unwrap();
+
+        let response = extract_value_response(&effects);
+        assert_eq!(response.start_height, Height::new(5));
+        assert_eq!(
+            response.values.len(),
+            1,
+            "expected only the valid prefix, got {} values",
+            response.values.len()
+        );
+    }
+
+    #[test]
+    fn test_on_got_decided_values_first_value_wrong_sends_empty() {
+        let mut state = make_test_state();
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        // First value already has the wrong height — no valid prefix exists.
+        let values = vec![make_raw_value(10), make_raw_value(6), make_raw_value(7)];
+
+        let effects = drive_input(
+            &mut state,
+            &metrics,
+            Input::GotDecidedValues(
+                InboundRequestId::new("req1"),
+                Height::new(5)..=Height::new(7),
+                values,
+            ),
+        )
+        .unwrap();
+
+        let response = extract_value_response(&effects);
+        assert_eq!(response.start_height, Height::new(5));
+        assert!(
+            response.values.is_empty(),
+            "expected empty response when first value is wrong, got {} values",
+            response.values.len()
+        );
+    }
+
+    // -- sync_height rollback on retry send failure / missing peer --
+
+    /// Like [`drive_input_with_retries`] but resumes every `SendValueRequest`
+    /// effect with `None`, simulating the case where the underlying send
+    /// effect fails to produce a request id.
+    fn drive_input_with_send_failures(
+        state: &mut State<TestContext>,
+        metrics: &crate::Metrics,
+        input: Input<TestContext>,
+    ) -> Result<Vec<crate::Effect<TestContext>>, crate::Error<TestContext>> {
+        use crate::Resume;
+        drive_input_with(state, metrics, input, |effect| match effect {
+            Effect::SendValueRequest(..) => Resume::ValueRequestId(None),
+            _ => Resume::default(),
+        })
+    }
+
+    #[test]
+    fn test_re_request_rolls_back_sync_height_on_send_failure() {
+        let mut state = make_test_state();
+        state.started = true;
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        state.tip_height = Height::new(10);
+        state.sync_height = Height::new(16);
+
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+
+        state.peers.insert(
+            peer_a,
+            crate::Status {
+                peer_id: peer_a,
+                tip_height: Height::new(20),
+                history_min_height: Height::new(1),
+            },
+        );
+        state.peers.insert(
+            peer_b,
+            crate::Status {
+                peer_id: peer_b,
+                tip_height: Height::new(20),
+                history_min_height: Height::new(1),
+            },
+        );
+
+        // Pending request assigned to peer A for heights 11..=15.
+        state.pending_requests.insert(
+            OutboundRequestId::new("req1"),
+            PendingRequestEntry {
+                range: Height::new(11)..=Height::new(15),
+                peer: peer_a,
+                excluded_peers: BTreeSet::new(),
+            },
+        );
+
+        // Peer A times out. A replacement peer (B) is available, but the send
+        // effect fails — simulating a network / transport error.
+        let effects = drive_input_with_send_failures(
+            &mut state,
+            &metrics,
+            Input::SyncRequestTimedOut(
+                OutboundRequestId::new("req1"),
+                peer_a,
+                crate::Request::ValueRequest(crate::ValueRequest::new(
+                    Height::new(11)..=Height::new(15),
+                )),
+            ),
+        )
+        .unwrap();
+
+        // A SendValueRequest was attempted (the retry path was taken).
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendValueRequest(..))),
+            "Expected a retry SendValueRequest effect"
+        );
+
+        // The original pending entry was consumed and no new one was inserted
+        // because the send failed.
+        assert!(
+            state.pending_requests.is_empty(),
+            "Pending requests should be empty when retry send fails"
+        );
+
+        // sync_height should be rolled back to the range start (11), which is
+        // still above tip_height (10). Without the rollback, sync_height would
+        // have remained at 16 and the range 11..=15 would never be retried.
+        assert_eq!(state.sync_height, Height::new(11));
+    }
+
+    #[test]
+    fn test_request_values_range_rolls_back_sync_height_when_no_peer_available() {
+        let mut state = make_test_state();
+        state.started = true;
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        state.tip_height = Height::new(10);
+        state.sync_height = Height::new(16);
+
+        let peer = PeerId::random();
+
+        // Peer can only serve up to height 12 — it cannot cover the suffix 13..=15.
+        state.peers.insert(
+            peer,
+            crate::Status {
+                peer_id: peer,
+                tip_height: Height::new(12),
+                history_min_height: Height::new(1),
+            },
+        );
+
+        // Pending request assigned to the peer for heights 11..=15.
+        state.pending_requests.insert(
+            OutboundRequestId::new("req1"),
+            PendingRequestEntry {
+                range: Height::new(11)..=Height::new(15),
+                peer,
+                excluded_peers: BTreeSet::new(),
+            },
+        );
+
+        // Peer returns a partial response covering only heights 11..=12.
+        let response = crate::ValueResponse::new(
+            Height::new(11),
+            vec![make_raw_value(11), make_raw_value(12)],
+        );
+
+        drive_input(
+            &mut state,
+            &metrics,
+            Input::ValueResponse(OutboundRequestId::new("req1"), peer, Some(response)),
+        )
+        .unwrap();
+
+        // The suffix 13..=15 cannot be served by any peer. sync_height must
+        // roll back to the suffix start (13) so it is retried once a peer
+        // advances past it.
+        assert_eq!(state.sync_height, Height::new(13));
+
+        // No pending request exists for the suffix.
+        for entry in state.pending_requests.values() {
+            assert!(
+                !entry.range.contains(&Height::new(13)),
+                "No pending request should cover the un-retried suffix start",
+            );
+        }
+    }
+
+    #[test]
+    fn test_request_values_range_rolls_back_sync_height_on_send_failure() {
+        let mut state = make_test_state();
+        state.started = true;
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+
+        state.tip_height = Height::new(10);
+        state.sync_height = Height::new(16);
+
+        let peer = PeerId::random();
+
+        state.peers.insert(
+            peer,
+            crate::Status {
+                peer_id: peer,
+                tip_height: Height::new(20),
+                history_min_height: Height::new(1),
+            },
+        );
+
+        // Pending request assigned to the peer for heights 11..=15.
+        state.pending_requests.insert(
+            OutboundRequestId::new("req1"),
+            PendingRequestEntry {
+                range: Height::new(11)..=Height::new(15),
+                peer,
+                excluded_peers: BTreeSet::new(),
+            },
+        );
+
+        // Peer returns a partial response covering only heights 11..=12.
+        let response = crate::ValueResponse::new(
+            Height::new(11),
+            vec![make_raw_value(11), make_raw_value(12)],
+        );
+
+        // A peer is available for the suffix but the send effect fails.
+        drive_input_with_send_failures(
+            &mut state,
+            &metrics,
+            Input::ValueResponse(OutboundRequestId::new("req1"), peer, Some(response)),
+        )
+        .unwrap();
+
+        // sync_height must roll back to the suffix start (13) so the suffix
+        // is retried on the next request cycle.
+        assert_eq!(state.sync_height, Height::new(13));
+
+        // No pending request covers the suffix start.
+        for entry in state.pending_requests.values() {
+            assert!(
+                !entry.range.contains(&Height::new(13)),
+                "No pending request should cover the un-retried suffix start",
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_value_response_heights() {
+        let validate = validate_value_response_heights::<TestContext>;
+
+        // Valid: contiguous heights 5, 6, 7
+        let response = ValueResponse::new(
+            Height::new(5),
+            vec![
+                make_raw_decided_value(5),
+                make_raw_decided_value(6),
+                make_raw_decided_value(7),
+            ],
+        );
+        assert!(validate(&response));
+
+        // Valid: single value
+        let response = ValueResponse::new(Height::new(1), vec![make_raw_decided_value(1)]);
+        assert!(validate(&response));
+
+        // Valid: empty response
+        let response = ValueResponse::new(Height::new(1), vec![]);
+        assert!(validate(&response));
+
+        // Invalid: gap in heights (1, 2, 5 instead of 1, 2, 3)
+        let response = ValueResponse::new(
+            Height::new(1),
+            vec![
+                make_raw_decided_value(1),
+                make_raw_decided_value(2),
+                make_raw_decided_value(5),
+            ],
+        );
+        assert!(!validate(&response));
+
+        // Invalid: duplicate heights (1, 1, 2 instead of 1, 2, 3)
+        let response = ValueResponse::new(
+            Height::new(1),
+            vec![
+                make_raw_decided_value(1),
+                make_raw_decided_value(1),
+                make_raw_decided_value(2),
+            ],
+        );
+        assert!(!validate(&response));
+
+        // Invalid: first value doesn't match start_height
+        let response = ValueResponse::new(
+            Height::new(1),
+            vec![
+                make_raw_decided_value(2),
+                make_raw_decided_value(3),
+                make_raw_decided_value(4),
+            ],
+        );
+        assert!(!validate(&response));
+
+        // Invalid: reversed order (3, 2, 1 instead of 1, 2, 3)
+        let response = ValueResponse::new(
+            Height::new(1),
+            vec![
+                make_raw_decided_value(3),
+                make_raw_decided_value(2),
+                make_raw_decided_value(1),
+            ],
+        );
+        assert!(!validate(&response));
+    }
+
+    fn make_raw_decided_value(height: u64) -> RawDecidedValue<TestContext> {
+        RawDecidedValue {
+            value_bytes: Bytes::new(),
+            certificate: CommitCertificate {
+                height: Height::new(height),
+                round: Round::new(0),
+                value_id: ValueId::new(height),
+                commit_signatures: vec![],
+            },
+        }
+    }
+
+    /// Test that a non-contiguous sync response (e.g., request 1..=10, get 1,2,5..12)
+    /// is rejected by the sync state machine and triggers a re-request from another peer.
+    #[test]
+    fn test_non_contiguous_response_rejected_by_sync_handler() {
+        use std::cell::Cell;
+
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let request_id = OutboundRequestId::new("req-1");
+
+        let mut state = State::<TestContext>::new(
+            Box::new(rand::rngs::StdRng::seed_from_u64(42)),
+            Config::default(),
+        );
+
+        // Set up state: consensus is at height 1, pending request for 1..=10 from peer_a
+        state.consensus_height = Height::new(1);
+        state.tip_height = Height::new(0);
+        state.sync_height = Height::new(11);
+        state.started = true;
+        state.pending_requests.insert(
+            request_id.clone(),
+            PendingRequestEntry {
+                range: Height::new(1)..=Height::new(10),
+                peer: peer_a,
+                excluded_peers: BTreeSet::new(),
+            },
+        );
+
+        // Add peer_b so re-request can find another peer
+        state.update_status(Status {
+            peer_id: peer_b,
+            tip_height: Height::new(20),
+            history_min_height: Height::new(1),
+        });
+
+        // Build a malformed response: 10 values starting at height 1
+        // but with a gap (heights 1, 2, 5, 6, 7, 8, 9, 10, 11, 12)
+        let response = ValueResponse::new(
+            Height::new(1),
+            vec![
+                make_raw_decided_value(1),
+                make_raw_decided_value(2),
+                make_raw_decided_value(5),
+                make_raw_decided_value(6),
+                make_raw_decided_value(7),
+                make_raw_decided_value(8),
+                make_raw_decided_value(9),
+                make_raw_decided_value(10),
+                make_raw_decided_value(11),
+                make_raw_decided_value(12),
+            ],
+        );
+
+        let input = Input::ValueResponse(request_id, peer_a, Some(response));
+        let metrics = Metrics::default();
+
+        // The handler should reject the response and re-request from another peer.
+        // It should yield SendValueRequest (to peer_b), NOT ProcessValueResponse.
+        let saw_send_request = Cell::new(false);
+        let saw_process_response = Cell::new(false);
+
+        let result: Result<(), Error<TestContext>> = (|| {
+            crate::process!(
+                input: input,
+                state: &mut state,
+                metrics: &metrics,
+                with: effect => {
+                    match &effect {
+                        Effect::SendValueRequest(peer, _, _) => {
+                            saw_send_request.set(true);
+                            assert_eq!(*peer, peer_b);
+                        }
+                        Effect::ProcessValueResponse(_, _, _, _) => {
+                            saw_process_response.set(true);
+                        }
+                        _ => {}
+                    }
+
+                    Ok::<_, eyre::Report>(match effect {
+                        Effect::SendValueRequest(_, _, r) => {
+                            r.resume_with(Some(OutboundRequestId::new("req-2")))
+                        }
+                        Effect::BroadcastStatus(_, r) => r.resume_with(()),
+                        Effect::SendValueResponse(_, _, r) => r.resume_with(()),
+                        Effect::GetDecidedValues(_, _, r) => r.resume_with(()),
+                        Effect::ProcessValueResponse(_, _, _, r) => r.resume_with(()),
+                    })
+                }
+            )
+        })();
+
+        assert!(result.is_ok(), "Handler returned error: {result:?}");
+        assert!(
+            saw_send_request.get(),
+            "Expected a re-request to another peer after non-contiguous response"
+        );
+        assert!(
+            !saw_process_response.get(),
+            "Non-contiguous response should NOT have been forwarded to consensus"
+        );
     }
 }

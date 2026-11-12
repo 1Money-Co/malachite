@@ -68,6 +68,20 @@ impl ExponentialMovingAverage {
             slow_threshold,
         }
     }
+
+    /// Quality score in `[0.0, 1.0]` derived from response time alone.
+    /// Fast responses (at or below `slow_threshold`) score 1.0; slower ones
+    /// decay exponentially from the threshold.
+    fn response_quality(&self, response_time: Duration) -> f64 {
+        let response_time_secs = response_time.as_secs_f64();
+        let threshold_secs = self.slow_threshold.as_secs_f64();
+
+        if response_time_secs <= threshold_secs {
+            1.0
+        } else {
+            (-(response_time_secs - threshold_secs) / threshold_secs).exp()
+        }
+    }
 }
 
 impl ScoringStrategy for ExponentialMovingAverage {
@@ -78,18 +92,51 @@ impl ScoringStrategy for ExponentialMovingAverage {
     fn update_score(&mut self, previous_score: Score, result: SyncResult) -> Score {
         match result {
             SyncResult::Success(response_time) => {
-                // Calculate quality score between 0-1 based on response time
-                // We use an exponential decay function to penalize slow responses more heavily
-                let quality = if response_time < self.slow_threshold {
-                    // Fast responses get a high quality score
-                    1.0
-                } else {
-                    // Slow responses get a low quality score based on how slow they were
-                    (-response_time.as_secs_f64() / self.slow_threshold.as_secs_f64()).exp()
-                };
+                let quality = self.response_quality(response_time);
 
                 // Update score with EMA using alpha_success
-                self.alpha_success * quality + (1.0 - self.alpha_success) * previous_score
+                let new_score =
+                    self.alpha_success * quality + (1.0 - self.alpha_success) * previous_score;
+
+                #[cfg(test)]
+                {
+                    let response_time_secs = response_time.as_secs_f64();
+                    println!("Response time: {response_time_secs:.3}s, Quality: {quality:.3}");
+                    println!(" => Updating score: prev={previous_score:.3}, new={new_score:.3}");
+                }
+
+                new_score
+            }
+
+            SyncResult::PartialSuccess {
+                received,
+                requested,
+                response_time,
+            } => {
+                // Scale the response-time quality by the fraction of the requested
+                // range that was delivered. A full-ratio partial response scores
+                // identically to `Success`; a ratio of 0 collapses the quality
+                // contribution to zero and pulls the score toward 0.0 at least
+                // as hard as `Failure` does (since `alpha_success >= alpha_failure`
+                // is the common default).
+                let ratio = if requested == 0 {
+                    0.0
+                } else {
+                    (received as f64 / requested as f64).clamp(0.0, 1.0)
+                };
+
+                let quality = self.response_quality(response_time) * ratio;
+                let new_score =
+                    self.alpha_success * quality + (1.0 - self.alpha_success) * previous_score;
+
+                #[cfg(test)]
+                {
+                    let response_time_secs = response_time.as_secs_f64();
+                    println!("Partial response ({received}/{requested}) time: {response_time_secs:.3}s, Quality: {quality:.3}");
+                    println!(" => Updating score: prev={previous_score:.3}, new={new_score:.3}");
+                }
+
+                new_score
             }
 
             SyncResult::Timeout => {

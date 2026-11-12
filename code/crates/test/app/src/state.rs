@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use eyre::eyre;
@@ -16,16 +17,16 @@ use malachitebft_app_channel::app::streaming::{StreamContent, StreamId, StreamMe
 use malachitebft_app_channel::app::types::codec::Codec;
 use malachitebft_app_channel::app::types::core::{CommitCertificate, Round, Validity};
 use malachitebft_app_channel::app::types::{LocallyProposedValue, PeerId};
-use malachitebft_test::codec::json::JsonCodec;
+use malachitebft_test::codec::proto::ProtobufCodec;
+use malachitebft_test::middleware::Middleware;
 use malachitebft_test::{
-    Address, Ed25519Provider, Genesis, Height, ProposalData, ProposalFin, ProposalInit,
-    ProposalPart, TestContext, ValidatorSet, Value, ValueId,
+    Address, Ed25519Signer, Genesis, Height, LinearTimeouts, ProposalData, ProposalFin,
+    ProposalInit, ProposalPart, TestContext, ValidatorSet, Value, ValueId,
 };
 
 use crate::config::Config;
-use crate::store::Store;
+use crate::store::{DecidedValue, Store, StoreMetrics};
 use crate::streaming::{PartStreamsMap, ProposalParts};
-use malachitebft_test::decided_value::DecidedValue;
 
 /// Number of historical values to keep in the store
 const HISTORY_LENGTH: u64 = 500;
@@ -40,11 +41,14 @@ pub struct State {
     pub current_height: Height,
     pub current_round: Round,
     pub current_proposer: Option<Address>,
+    #[allow(dead_code)]
     pub current_role: Role,
+    #[allow(dead_code)]
     pub peers: HashSet<PeerId>,
-    pub store: Store,
+    pub store: Store<Box<dyn StoreMetrics>>,
+    pub middleware: Option<Arc<dyn Middleware>>,
 
-    signing_provider: Ed25519Provider,
+    signer: Ed25519Signer,
     streams_map: PartStreamsMap,
     rng: StdRng,
 }
@@ -88,14 +92,16 @@ impl fmt::Display for ProposalValidationError {
 
 impl State {
     /// Creates a new State instance with the given validator address and starting height
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ctx: TestContext,
         config: Config,
         genesis: Genesis,
         address: Address,
         height: Height,
-        store: Store,
-        signing_provider: Ed25519Provider,
+        store: Store<Box<dyn StoreMetrics>>,
+        signer: Ed25519Signer,
+        middleware: Option<Arc<dyn Middleware>>,
     ) -> Self {
         Self {
             ctx,
@@ -103,7 +109,8 @@ impl State {
             genesis,
             address,
             store,
-            signing_provider,
+            signer,
+            middleware,
             current_height: height,
             current_round: Round::new(0),
             current_proposer: None,
@@ -115,13 +122,68 @@ impl State {
     }
 
     /// Returns the set of validators for the given height.
-    pub fn get_validator_set(&self, height: Height) -> Option<ValidatorSet> {
-        self.ctx.middleware().get_validator_set(
+    ///
+    /// Priority order:
+    /// 1. Middleware (if it returns a validator set)
+    /// 2. Validator rotation (if enabled in config)
+    /// 3. Genesis validator set (fallback)
+    pub fn get_validator_set(&self, height: Height) -> ValidatorSet {
+        // Check middleware first
+        if let Some(vs) = self.ctx.middleware().get_validator_set(
             &self.ctx,
             self.current_height,
             height,
             &self.genesis,
+        ) {
+            return vs;
+        }
+
+        // Check validator rotation config
+        if self.config.validator_rotation.enabled {
+            return self.rotate_validator_set(height);
+        }
+
+        // Fallback to genesis
+        self.genesis.validator_set.clone()
+    }
+
+    /// Rotate the validator set based on height and config
+    fn rotate_validator_set(&self, height: Height) -> ValidatorSet {
+        let rotation = &self.config.validator_rotation;
+        let num_validators = self.genesis.validator_set.len();
+
+        let selection_size =
+            if rotation.selection_size == 0 || rotation.selection_size >= num_validators {
+                num_validators
+            } else {
+                rotation.selection_size
+            };
+
+        if selection_size >= num_validators {
+            return self.genesis.validator_set.clone();
+        }
+
+        let rotation_period = rotation.rotation_period.max(1);
+        let rotation_index = (height.as_u64() / rotation_period) as usize % num_validators;
+
+        ValidatorSet::new(
+            self.genesis
+                .validator_set
+                .iter()
+                .cycle()
+                .skip(rotation_index)
+                .take(selection_size)
+                .cloned()
+                .collect::<Vec<_>>(),
         )
+    }
+
+    /// Returns the timeouts for the given height.
+    pub fn get_timeouts(&self, height: Height) -> LinearTimeouts {
+        self.ctx
+            .middleware()
+            .get_timeouts(&self.ctx, self.current_height, height)
+            .unwrap_or_default()
     }
 
     /// Returns the earliest height available in the state
@@ -141,9 +203,8 @@ impl State {
         let round = parts.round;
 
         // Get the expected proposer for this height and round
-        let validator_set = self
-            .get_validator_set(height)
-            .expect("Validator set should be available");
+        let validator_set = self.get_validator_set(height);
+
         let expected_proposer = self
             .ctx
             .select_proposer(&validator_set, height, round)
@@ -193,18 +254,14 @@ impl State {
         };
 
         // Retrieve the proposer from the validator set for the given height
-        let validator_set = self
-            .get_validator_set(parts.height)
-            .expect("Validator set should be available");
+        let validator_set = self.get_validator_set(parts.height);
+
         let proposer = validator_set
             .get_by_address(&parts.proposer)
             .ok_or(SignatureVerificationError::ProposerNotFound)?;
 
         // Verify the signature
-        if !self
-            .signing_provider
-            .verify(&hash, &fin.signature, &proposer.public_key)
-        {
+        if !Ed25519Signer::verify(&hash, &fin.signature, &proposer.public_key) {
             return Err(SignatureVerificationError::InvalidSignature);
         }
 
@@ -248,10 +305,31 @@ impl State {
         // For current height, validate proposal (proposer + signature)
         match self.validate_proposal_parts(&parts) {
             Ok(()) => {
-                // Validation passed - assemble and store as undecided
-                let value = Self::assemble_value_from_parts(parts)?;
-                info!(%value.height, %value.round, %value.proposer, "Storing validated proposal as undecided");
+                // Validation passed - assemble and store as undecided. Cache the
+                // original `ProposalParts` too so a later `RestreamProposal` can
+                // replay them verbatim (same `Init.round`, proposer, signature)
+                // instead of rebuilding and re-signing as a different proposer.
+                let parts_for_store = parts.clone();
+                let mut value = Self::assemble_value_from_parts(parts)?;
+
+                // Use middleware to determine validity (allows testing custom validation logic)
+                if let Some(middleware) = &self.middleware {
+                    let new_validity =
+                        middleware.get_validity(&self.ctx, value.height, value.round, &value.value);
+                    info!(%value.height, "Middleware returned validity: {:?}", new_validity);
+                    value.validity = new_validity;
+                }
+
+                info!(%value.height, %value.round, %value.proposer, validity = ?value.validity, "Storing validated proposal as undecided");
+                let value_id = value.value.id();
                 self.store.store_undecided_proposal(value.clone()).await?;
+                self.store
+                    .store_undecided_proposal_parts(
+                        parts_for_store.height,
+                        value_id,
+                        parts_for_store,
+                    )
+                    .await?;
                 Ok(Some(value))
             }
             Err(error) => {
@@ -270,19 +348,11 @@ impl State {
 
     /// Retrieves a decided block at the given height
     pub async fn get_decided_value(&self, height: Height) -> Option<DecidedValue> {
-        let value = self.store.get_decided_value(height).await.ok().flatten();
-
-        // if middleware contains a value, return the middleware's value
-        if let Some(dv) = self.ctx.middleware().get_decided_value(height) {
-            return Some(dv);
-        }
-
-        value
+        self.store.get_decided_value(height).await.ok().flatten()
     }
 
-    /// Commits a value with the given certificate, updating internal state
-    /// and moving to the next height
-    pub async fn commit(
+    /// Stores a value with the given certificate without updating internal state or moving to the next height.
+    pub async fn store_decided(
         &mut self,
         certificate: CommitCertificate<TestContext>,
     ) -> eyre::Result<()> {
@@ -297,7 +367,35 @@ impl State {
             .await
         else {
             return Err(eyre!(
-                "Trying to commit a value with value id {value_id} at height {height} and round {round} for which there is no proposal"
+                "Trying to store decided value with value id {value_id} at height {height} and round {round} for which there is no proposal"
+            ));
+        };
+
+        self.store
+            .store_decided_value(&certificate, proposal.value)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Finalizes a value with the given certificate, updating internal state
+    /// and moving to the next height.
+    pub async fn finalize(
+        &mut self,
+        certificate: CommitCertificate<TestContext>,
+    ) -> eyre::Result<()> {
+        let (height, round, value_id) =
+            (certificate.height, certificate.round, certificate.value_id);
+
+        // Get the first proposal with the given value id. There may be multiple identical ones
+        // if peers have restreamed at different rounds.
+        let Ok(Some(proposal)) = self
+            .store
+            .get_undecided_proposal_by_value_id(value_id)
+            .await
+        else {
+            return Err(eyre!(
+                "Trying to finalize a value with value id {value_id} at height {height} and round {round} for which there is no proposal"
             ));
         };
 
@@ -400,6 +498,7 @@ impl State {
         Value::new(value)
     }
 
+    #[allow(dead_code)]
     pub async fn get_proposal(
         &self,
         height: Height,
@@ -440,44 +539,20 @@ impl State {
         StreamId::new(bytes.into())
     }
 
-    /// Creates a stream message containing a proposal part.
-    /// Updates internal sequence number and current proposal.
-    pub fn stream_proposal(
-        &mut self,
-        value: LocallyProposedValue<TestContext>,
-        pol_round: Round,
-    ) -> impl Iterator<Item = StreamMessage<ProposalPart>> {
-        let parts = self.value_to_parts(value, pol_round);
-        let stream_id = self.stream_id();
-
-        let mut msgs = Vec::with_capacity(parts.len() + 1);
-        let mut sequence = 0;
-
-        for part in parts {
-            let msg = StreamMessage::new(stream_id.clone(), sequence, StreamContent::Data(part));
-            sequence += 1;
-            msgs.push(msg);
-        }
-
-        msgs.push(StreamMessage::new(
-            stream_id.clone(),
-            sequence,
-            StreamContent::Fin,
-        ));
-
-        msgs.into_iter()
-    }
-
-    fn value_to_parts(
+    /// Build `ProposalParts` for a locally proposed value, signed by this node.
+    ///
+    /// Separated from streaming so callers can cache the exact parts we emit
+    /// (matching what peers will validate and store) before breaking them into
+    /// stream messages for the network.
+    pub fn build_proposal_parts(
         &self,
-        value: LocallyProposedValue<TestContext>,
+        value: &LocallyProposedValue<TestContext>,
         pol_round: Round,
-    ) -> Vec<ProposalPart> {
+    ) -> ProposalParts {
         let mut hasher = sha3::Keccak256::new();
         let mut parts = Vec::new();
 
         // Init
-        // Include metadata about the proposal
         {
             parts.push(ProposalPart::Init(ProposalInit::new(
                 value.height,
@@ -491,9 +566,8 @@ impl State {
         }
 
         // Data
-        // Include each prime factor of the value as a separate proposal part
         {
-            for factor in factor_value(value.value) {
+            for factor in factor_value(value.value.clone()) {
                 parts.push(ProposalPart::Data(ProposalData::new(factor)));
 
                 hasher.update(factor.to_be_bytes().as_slice());
@@ -501,14 +575,65 @@ impl State {
         }
 
         // Fin
-        // Sign the hash of the proposal parts
         {
             let hash = hasher.finalize().to_vec();
-            let signature = self.signing_provider.sign(&hash);
+            let signature = self.signer.sign(&hash);
             parts.push(ProposalPart::Fin(ProposalFin::new(signature)));
         }
 
-        parts
+        ProposalParts {
+            height: value.height,
+            round: value.round,
+            proposer: self.address,
+            parts,
+        }
+    }
+
+    /// Build `ProposalParts` for a locally proposed value and wrap them into
+    /// stream messages. Returns both the canonical parts (for caching and
+    /// restream replay) and the messages to publish on the network.
+    pub fn stream_proposal(
+        &mut self,
+        value: LocallyProposedValue<TestContext>,
+        pol_round: Round,
+    ) -> (ProposalParts, Vec<StreamMessage<ProposalPart>>) {
+        let proposal_parts = self.build_proposal_parts(&value, pol_round);
+        let msgs = self.stream_messages_for_parts(&proposal_parts);
+        (proposal_parts, msgs)
+    }
+
+    /// Wrap a pre-built `ProposalParts` into a fresh stream of messages.
+    ///
+    /// The inner parts (including `Init` metadata and `Fin` signature) are
+    /// cloned verbatim. Only the stream id and per-message sequence are new.
+    /// Used by `RestreamProposal` to replay the original proposer's parts
+    /// without re-signing as a different proposer.
+    pub fn stream_messages_for_parts(
+        &self,
+        parts: &ProposalParts,
+    ) -> Vec<StreamMessage<ProposalPart>> {
+        let stream_id = self.stream_id();
+
+        let mut msgs = Vec::with_capacity(parts.parts.len() + 1);
+        let mut sequence = 0;
+
+        for part in &parts.parts {
+            let msg = StreamMessage::new(
+                stream_id.clone(),
+                sequence,
+                StreamContent::Data(part.clone()),
+            );
+            sequence += 1;
+            msgs.push(msg);
+        }
+
+        msgs.push(StreamMessage::new(
+            stream_id.clone(),
+            sequence,
+            StreamContent::Fin,
+        ));
+
+        msgs
     }
 
     /// Re-assemble a [`ProposedValue`] from its [`ProposalParts`].
@@ -541,12 +666,14 @@ impl State {
 
 /// Encode a value to its byte representation
 pub fn encode_value(value: &Value) -> Bytes {
-    JsonCodec.encode(value).unwrap()
+    ProtobufCodec
+        .encode(value)
+        .expect("encoding a Value (u64 wrapper) should never fail")
 }
 
 /// Decodes a Value from its byte representation
 pub fn decode_value(bytes: Bytes) -> Option<Value> {
-    JsonCodec.decode(bytes).ok()
+    ProtobufCodec.decode(bytes).ok()
 }
 
 /// Returns the list of prime factors of the given value
@@ -560,7 +687,7 @@ fn factor_value(value: Value) -> Vec<u64> {
 
     let mut i = 2;
     while i * i <= n {
-        if n % i == 0 {
+        if n.is_multiple_of(i) {
             factors.push(i);
             n /= i;
         } else {

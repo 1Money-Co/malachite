@@ -1,5 +1,6 @@
 use malachitebft_core_driver::Input as DriverInput;
 use malachitebft_core_driver::Output as DriverOutput;
+use malachitebft_core_types::{NilOrVal, VoteType};
 
 use crate::handle::decide::decide;
 use crate::handle::on_proposal;
@@ -76,9 +77,6 @@ where
                 Effect::StartRound(*height, *round, proposer.clone(), role, Default::default())
             );
 
-            #[cfg(feature = "metrics")]
-            metrics.rebroadcast_timeouts.inc();
-
             // Schedule rebroadcast timer
             let timeout = Timeout::rebroadcast(*round);
             perform!(co, Effect::ScheduleTimeout(timeout, Default::default()));
@@ -103,7 +101,7 @@ where
             }
         }
 
-        DriverInput::Vote(vote) => {
+        DriverInput::Vote(ref vote) => {
             if vote.height() != state.driver.height() {
                 warn!(
                     "Received vote for wrong height {}, current height: {}",
@@ -112,6 +110,17 @@ where
                 );
 
                 return Ok(());
+            }
+
+            #[cfg(feature = "metrics")]
+            if state.finalization_period && vote.vote_type() == VoteType::Precommit {
+                if let Some((decided_round, decided_value)) = state.driver.decided_value() {
+                    if vote.round() == decided_round
+                        && *vote.value() == NilOrVal::Val(decided_value.id())
+                    {
+                        metrics.additional_precommits.inc();
+                    }
+                }
             }
         }
 
@@ -140,6 +149,18 @@ where
         }
 
         DriverInput::TimeoutElapsed(_) => (),
+
+        DriverInput::SyncDecision(proposal) => {
+            if proposal.height() != state.driver.height() {
+                warn!(
+                    "Received sync decision for wrong height {}, current height: {}",
+                    proposal.height(),
+                    state.driver.height()
+                );
+
+                return Ok(());
+            }
+        }
     }
 
     // Record the step we were in
@@ -263,23 +284,27 @@ where
                     );
                 };
 
-                // Publishing the polka certificate of the re-proposed value
+                // When the proposed value is a re-proposal (i.e., it has a pol_round),
+                // publishing the polka certificate of the re-proposed value
                 // ensures all validators receive it, which is necessary for
                 // them to accept the re-proposed value.
                 if proposal.pol_round().is_defined() {
-                    // Broadcast the polka certificate at pol_round
-                    let Some(polka_certificate) =
-                        state.polka_certificate_at_round(proposal.pol_round())
-                    else {
-                        panic!(
-                            "Missing polka certificate for pol_round {}",
-                            proposal.pol_round()
-                        );
-                    };
+                    let polka_certificate = state
+                        .polka_certificate(proposal.pol_round(), &proposal.value().id())
+                        .ok_or_else(|| {
+                            Error::MissingPolkaCertificate(
+                                state.driver.height(),
+                                proposal.pol_round(),
+                                proposal.value().id().clone(),
+                                "reproposal",
+                            )
+                        })?;
+
+                    // Publish the polka certificate at pol_round for the re-proposed value
                     perform!(
                         co,
                         Effect::PublishLivenessMsg(
-                            LivenessMsg::PolkaCertificate(polka_certificate),
+                            LivenessMsg::PolkaCertificate(polka_certificate.clone()),
                             Default::default()
                         )
                     );
@@ -336,19 +361,21 @@ where
                             );
                         }
 
-                        let Some(polka_certificate) =
-                            state.polka_certificate_at_round(vote.round())
-                        else {
-                            panic!(
-                                "Missing polka certificate for Precommit({:?}) at round {}",
-                                vote.value(),
-                                vote.round()
-                            );
-                        };
+                        let polka_certificate = state
+                            .polka_certificate(vote.round(), value_id)
+                            .ok_or_else(|| {
+                                Error::MissingPolkaCertificate(
+                                    state.driver.height(),
+                                    vote.round(),
+                                    value_id.clone(),
+                                    "precommit",
+                                )
+                            })?;
+
                         perform!(
                             co,
                             Effect::PublishLivenessMsg(
-                                LivenessMsg::PolkaCertificate(polka_certificate),
+                                LivenessMsg::PolkaCertificate(polka_certificate.clone()),
                                 Default::default()
                             )
                         );

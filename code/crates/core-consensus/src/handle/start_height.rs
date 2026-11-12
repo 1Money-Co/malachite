@@ -10,17 +10,17 @@ pub async fn reset_and_start_height<Ctx>(
     height: Ctx::Height,
     validator_set: Ctx::ValidatorSet,
     is_restart: bool,
+    target_time: Option<std::time::Duration>,
 ) -> Result<(), Error<Ctx>>
 where
     Ctx: Context,
 {
     perform!(co, Effect::CancelAllTimeouts(Default::default()));
-    perform!(co, Effect::ResetTimeouts(Default::default()));
 
     #[cfg(feature = "metrics")]
     metrics.step_end(state.driver.step());
 
-    state.reset_and_start_height(height, validator_set);
+    state.reset_and_start_height(height, validator_set, target_time);
 
     debug_assert_eq!(state.height(), height);
     debug_assert_eq!(state.round(), Round::Nil);

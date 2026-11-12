@@ -2,7 +2,7 @@ use derive_where::derive_where;
 
 use malachitebft_core_types::*;
 
-use crate::types::{LivenessMsg, SignedConsensusMsg};
+use crate::types::{LivenessMsg, MisbehaviorEvidence, SignedConsensusMsg};
 use crate::{ConsensusMsg, Error, PeerId, Role, VoteExtensionError, WalEntry};
 
 /// Provides a way to construct the appropriate [`Resume`] value to
@@ -16,13 +16,13 @@ use crate::{ConsensusMsg, Error, PeerId, Role, VoteExtensionError, WalEntry};
 /// ```rust,ignore
 /// fn effect_handler(effect: Effect<Ctx>) -> Result<Resume<Ctx>, Error> {
 ///     match effect {
-///         Effect::ResetTimeouts(r) => {
-///             reset_timeouts();
+///         Effect::ScheduleTimeout(timeout, r) => {
+///             schedule_timeout(timeout);
 ///             Ok(r.resume_with(()))
 ///         }
-///         Effect::GetValidatorSet(height, r) => {
-///             let validator_set = get_validator_set(height);
-///             Ok(r.resume_with(validator_set))
+///         Effect::GetValue(height, round, timeout, r) => {
+///             request_value(height, round);
+///             Ok(r.resume_with(()))
 ///         }
 ///        // ...
 ///     }
@@ -49,11 +49,6 @@ pub enum Effect<Ctx>
 where
     Ctx: Context,
 {
-    /// Reset all timeouts to their initial values
-    ///
-    /// Resume with: [`resume::Continue`]
-    ResetTimeouts(resume::Continue),
-
     /// Cancel all outstanding timeouts
     ///
     /// Resume with: [`resume::Continue`]
@@ -158,12 +153,26 @@ where
     /// the value that was decided on, the height and round at which it was decided,
     /// and the aggregated signatures of the validators that committed to it.
     ///
-    /// It also includes the vote extensions that were received for this height.
+    /// In addition, it includes the vote extensions that were received for this height.
     ///
     /// Resume with: [`resume::Continue`]
     Decide(
         CommitCertificate<Ctx>,
         VoteExtensions<Ctx>,
+        resume::Continue,
+    ),
+
+    /// Notifies the application that a height has been finalized.
+    ///
+    /// This message includes an extended commit certificate containing the ID of the value
+    /// that was decided on, the height and round at which it was decided, and all precommits
+    /// for the decided value received until the target duration for the height.
+    ///
+    /// Resume with: [`resume::Continue`]
+    Finalize(
+        CommitCertificate<Ctx>,
+        VoteExtensions<Ctx>,
+        MisbehaviorEvidence<Ctx>,
         resume::Continue,
     ),
 

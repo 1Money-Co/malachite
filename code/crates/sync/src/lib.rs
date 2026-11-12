@@ -5,7 +5,7 @@ mod metrics;
 pub use metrics::Metrics;
 
 mod state;
-pub use state::{height_allowance_snapshot, HeightAllowanceSnapshot, State};
+pub use state::{PendingRequestEntry, State};
 
 mod types;
 pub use types::*;

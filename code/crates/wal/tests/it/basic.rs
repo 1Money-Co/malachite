@@ -8,7 +8,7 @@ use std::{fs, io, str};
 
 use testdir::{NumberedDir, NumberedDirBuilder};
 
-use informalsystems_malachitebft_wal::{Log, Version};
+use arc_malachitebft_wal::{Log, Version};
 
 static TESTDIR: LazyLock<NumberedDir> =
     LazyLock::new(|| NumberedDirBuilder::new("wal".to_string()).create().unwrap());
@@ -118,7 +118,7 @@ fn restart() -> io::Result<()> {
 
     {
         let mut wal = setup_wal(&path, ENTRIES_1)?;
-        wal.restart(1)?;
+        wal.reset(1)?;
 
         assert_eq!(wal.sequence(), 1);
         assert_eq!(wal.len(), 0);

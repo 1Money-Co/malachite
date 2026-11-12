@@ -1,26 +1,28 @@
 //! Utility functions for spawning the actor system and connecting it to the application.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
-use eyre::Result;
-use malachitebft_codec::HasEncodedLen;
+use eyre::{eyre, Result};
+use tokio::task::JoinHandle;
+use tracing::Span;
+
 use malachitebft_engine::consensus::{Consensus, ConsensusCodec, ConsensusParams, ConsensusRef};
 use malachitebft_engine::host::HostRef;
 use malachitebft_engine::network::{Network, NetworkRef};
 use malachitebft_engine::node::{Node, NodeRef};
-use malachitebft_engine::sync::{Params as SyncParams, Sync, SyncCodec, SyncRef};
+use malachitebft_engine::sync::{Params as SyncParams, Sync, SyncCodec, SyncMsg, SyncRef};
 use malachitebft_engine::util::events::TxEvent;
+use malachitebft_engine::util::output_port::OutputPort;
 use malachitebft_engine::wal::{Wal, WalCodec, WalRef};
 use malachitebft_network::{
-    ChannelNames, Config as NetworkConfig, DiscoveryConfig, GossipSubConfig, Keypair,
+    ChannelNames, Config as NetworkConfig, DiscoveryConfig, GossipSubConfig, NetworkIdentity,
 };
-use malachitebft_signing::SigningProvider;
+use malachitebft_signing::{Signer, Verifier};
 use malachitebft_sync as sync;
-use tokio::task::JoinHandle;
-use tracing::Span;
 
-use crate::config::{ConsensusConfig, PubSubProtocol, ValueSyncConfig};
+use crate::config::{ConsensusConfig, ValueSyncConfig};
 use crate::metrics::{Metrics, SharedRegistry};
 use crate::types::core::Context;
 use crate::types::ValuePayload;
@@ -52,8 +54,9 @@ where
 }
 
 pub async fn spawn_network_actor<Ctx, Codec>(
-    cfg: &ConsensusConfig,
-    keypair: Keypair,
+    consensus_cfg: &ConsensusConfig,
+    value_sync_cfg: &ValueSyncConfig,
+    identity: NetworkIdentity,
     registry: &SharedRegistry,
     codec: Codec,
 ) -> Result<NetworkRef<Ctx>>
@@ -61,28 +64,25 @@ where
     Ctx: Context,
     Codec: ConsensusCodec<Ctx>,
     Codec: SyncCodec<Ctx>,
-    Codec: HasEncodedLen<sync::Response<Ctx>>,
 {
-    let config = make_gossip_config(cfg);
+    let config = make_network_config(consensus_cfg, value_sync_cfg);
 
-    Network::spawn(keypair, config, registry.clone(), codec, Span::current())
+    Network::spawn(identity, config, registry.clone(), codec, Span::current())
         .await
         .map_err(Into::into)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn_consensus_actor<Ctx>(
-    initial_height: Ctx::Height,
-    initial_validator_set: Ctx::ValidatorSet,
-    address: Ctx::Address,
     ctx: Ctx,
-    mut cfg: ConsensusConfig,
-    sync_cfg: &ValueSyncConfig,
-    signing_provider: Box<dyn SigningProvider<Ctx>>,
+    address: Ctx::Address,
+    cfg: ConsensusConfig,
+    verifier: Box<dyn Verifier<Ctx>>,
+    signer: Option<Box<dyn Signer<Ctx>>>,
     network: NetworkRef<Ctx>,
     host: HostRef<Ctx>,
     wal: WalRef<Ctx>,
-    sync: Option<SyncRef<Ctx>>,
+    sync: Arc<OutputPort<SyncMsg<Ctx>>>,
     metrics: Metrics,
     tx_event: TxEvent<Ctx>,
 ) -> Result<ConsensusRef<Ctx>>
@@ -98,22 +98,18 @@ where
     };
 
     let consensus_params = ConsensusParams {
-        initial_height,
-        initial_validator_set,
         address,
         threshold_params: Default::default(),
         value_payload,
         enabled: cfg.enabled,
     };
 
-    // Derive the consensus queue capacity from `sync.parallel_requests` and `sync.batch_size`
-    cfg.queue_capacity = sync_cfg.parallel_requests * sync_cfg.batch_size;
-
     Consensus::spawn(
         ctx,
         consensus_params,
         cfg,
-        signing_provider,
+        verifier,
+        signer,
         network,
         host,
         wal,
@@ -129,35 +125,49 @@ where
 pub async fn spawn_wal_actor<Ctx, Codec>(
     ctx: &Ctx,
     codec: Codec,
-    home_dir: &Path,
+    path: &Path,
     registry: &SharedRegistry,
 ) -> Result<WalRef<Ctx>>
 where
     Ctx: Context,
     Codec: WalCodec<Ctx>,
 {
-    let wal_dir = home_dir.join("wal");
-    std::fs::create_dir_all(&wal_dir).unwrap();
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
 
-    let wal_file = wal_dir.join("consensus.wal");
-
-    Wal::spawn(ctx, codec, wal_file, registry.clone(), Span::current())
-        .await
-        .map_err(Into::into)
+    Wal::spawn(
+        ctx,
+        codec,
+        path.to_owned(),
+        registry.clone(),
+        Span::current(),
+    )
+    .await
+    .map_err(Into::into)
 }
 
-pub async fn spawn_sync_actor<Ctx>(
+pub async fn spawn_sync_actor<Ctx, Codec>(
     ctx: Ctx,
     network: NetworkRef<Ctx>,
     host: HostRef<Ctx>,
+    consensus: ConsensusRef<Ctx>,
+    sync_codec: Codec,
     config: &ValueSyncConfig,
     registry: &SharedRegistry,
 ) -> Result<Option<SyncRef<Ctx>>>
 where
     Ctx: Context,
+    Codec: SyncCodec<Ctx>,
 {
     if !config.enabled {
         return Ok(None);
+    }
+
+    if config.enabled && config.batch_size == 0 {
+        return Err(eyre!("Value sync batch size cannot be zero"));
     }
 
     let params = SyncParams {
@@ -174,20 +184,22 @@ where
         max_request_size: config.max_request_size.as_u64() as usize,
         max_response_size: config.max_response_size.as_u64() as usize,
         request_timeout: config.request_timeout,
-        parallel_requests: config.parallel_requests as u64,
+        parallel_requests: config.parallel_requests,
         scoring_strategy,
         inactive_threshold: (!config.inactive_threshold.is_zero())
             .then_some(config.inactive_threshold),
         batch_size: config.batch_size,
     };
 
-    let metrics = sync::Metrics::register(registry);
+    let metrics = sync::Metrics::register(registry, params.status_update_interval);
 
     let actor_ref = Sync::spawn(
         ctx,
         network,
         host,
+        consensus,
         params,
+        sync_codec,
         sync_config,
         metrics,
         Span::current(),
@@ -197,45 +209,71 @@ where
     Ok(Some(actor_ref))
 }
 
-fn make_gossip_config(cfg: &ConsensusConfig) -> NetworkConfig {
+fn make_network_config(cfg: &ConsensusConfig, value_sync_cfg: &ValueSyncConfig) -> NetworkConfig {
+    use malachitebft_config as config;
+    use malachitebft_network as network;
+
     NetworkConfig {
         listen_addr: cfg.p2p.listen_addr.clone(),
         persistent_peers: cfg.p2p.persistent_peers.clone(),
+        persistent_peers_only: cfg.p2p.persistent_peers_only,
         discovery: DiscoveryConfig {
             enabled: cfg.p2p.discovery.enabled,
-            ..Default::default()
+            persistent_peers_only: cfg.p2p.persistent_peers_only,
+            bootstrap_protocol: match cfg.p2p.discovery.bootstrap_protocol {
+                config::BootstrapProtocol::Kademlia => network::BootstrapProtocol::Kademlia,
+                config::BootstrapProtocol::Full => network::BootstrapProtocol::Full,
+            },
+            selector: match cfg.p2p.discovery.selector {
+                config::Selector::Kademlia => network::Selector::Kademlia,
+                config::Selector::Random => network::Selector::Random,
+            },
+            num_outbound_peers: cfg.p2p.discovery.num_outbound_peers,
+            num_inbound_peers: cfg.p2p.discovery.num_inbound_peers,
+            max_connections_per_ip: cfg.p2p.discovery.max_connections_per_ip,
+            max_connections_per_peer: cfg.p2p.discovery.max_connections_per_peer,
+            ephemeral_connection_timeout: cfg.p2p.discovery.ephemeral_connection_timeout,
+            dial_max_retries: cfg.p2p.discovery.dial_max_retries,
+            request_max_retries: cfg.p2p.discovery.request_max_retries,
+            connect_request_max_retries: cfg.p2p.discovery.connect_request_max_retries,
+            max_peers_per_response: cfg.p2p.discovery.max_peers_per_response,
         },
         idle_connection_timeout: Duration::from_secs(15 * 60),
-        transport: malachitebft_network::TransportProtocol::from_multiaddr(&cfg.p2p.listen_addr)
-            .unwrap_or_else(|| {
+        transport: network::TransportProtocol::from_multiaddr(&cfg.p2p.listen_addr).unwrap_or_else(
+            || {
                 panic!(
                     "No valid transport protocol found in listen address: {}",
                     cfg.p2p.listen_addr
                 )
-            }),
+            },
+        ),
         pubsub_protocol: match cfg.p2p.protocol {
-            PubSubProtocol::GossipSub(_) => malachitebft_network::PubSubProtocol::GossipSub,
-            PubSubProtocol::Broadcast => malachitebft_network::PubSubProtocol::Broadcast,
+            config::PubSubProtocol::GossipSub(_) => network::PubSubProtocol::GossipSub,
+            config::PubSubProtocol::Broadcast => network::PubSubProtocol::Broadcast,
         },
         gossipsub: match cfg.p2p.protocol {
-            PubSubProtocol::GossipSub(config) => GossipSubConfig {
+            config::PubSubProtocol::GossipSub(config) => GossipSubConfig {
                 mesh_n: config.mesh_n(),
                 mesh_n_high: config.mesh_n_high(),
                 mesh_n_low: config.mesh_n_low(),
                 mesh_outbound_min: config.mesh_outbound_min(),
+                enable_peer_scoring: config.enable_peer_scoring(),
+                enable_explicit_peering: config.enable_explicit_peering(),
+                enable_flood_publish: config.enable_flood_publish(),
             },
-            PubSubProtocol::Broadcast => GossipSubConfig::default(),
+            config::PubSubProtocol::Broadcast => GossipSubConfig::default(),
         },
         channel_names: ChannelNames::default(),
         rpc_max_size: cfg.p2p.rpc_max_size.as_u64() as usize,
         pubsub_max_size: cfg.p2p.pubsub_max_size.as_u64() as usize,
         enable_consensus: cfg.enabled,
-        enable_sync: true,
-        protocol_names: malachitebft_network::ProtocolNames {
+        enable_sync: value_sync_cfg.enabled,
+        protocol_names: network::ProtocolNames {
             consensus: cfg.p2p.protocol_names.consensus.clone(),
             discovery_kad: cfg.p2p.protocol_names.discovery_kad.clone(),
             discovery_regres: cfg.p2p.protocol_names.discovery_regres.clone(),
             sync: cfg.p2p.protocol_names.sync.clone(),
+            validator_proof: cfg.p2p.protocol_names.validator_proof.clone(),
         },
     }
 }

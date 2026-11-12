@@ -1,6 +1,8 @@
+use std::time::{Duration, Instant};
 use tracing::info;
 
 use malachitebft_core_driver::Driver;
+use malachitebft_core_types::*;
 
 use crate::full_proposal::{FullProposal, FullProposalKeeper};
 use crate::input::Input;
@@ -26,9 +28,6 @@ where
     /// A queue of inputs that were received before the driver started.
     pub input_queue: BoundedQueue<Ctx::Height, Input<Ctx>>,
 
-    /// A queue specifically for `SyncValueResponse`s inputs that were received at a higher height.
-    pub sync_input_queue: BoundedQueue<Ctx::Height, Input<Ctx>>,
-
     /// The proposals to decide on.
     pub full_proposal_keeper: FullProposalKeeper<Ctx>,
 
@@ -37,17 +36,39 @@ where
 
     /// Last precommit broadcasted by this node
     pub last_signed_precommit: Option<SignedVote<Ctx>>,
+
+    /// Target time for the current height
+    pub target_time: Option<Duration>,
+
+    /// Start time of the current height
+    pub height_start_time: Option<Instant>,
+
+    /// Whether we are in the finalization period.
+    ///
+    /// The finalization period is entered in decide, cleared in finalize_height,
+    /// and only valid during the commit step.
+    ///
+    /// It allows collecting additional precommits for the decided value after
+    /// the decision is made in decide, which can be included in the commit certificate.
+    pub finalization_period: bool,
 }
 
 impl<Ctx> State<Ctx>
 where
     Ctx: Context,
 {
-    pub fn new(ctx: Ctx, params: Params<Ctx>, queue_capacity: usize) -> Self {
+    pub fn new(
+        ctx: Ctx,
+        height: Ctx::Height,
+        validator_set: Ctx::ValidatorSet,
+        params: Params<Ctx>,
+        queue_capacity: usize,
+        queue_per_height_capacity: usize,
+    ) -> Self {
         let driver = Driver::new(
             ctx.clone(),
-            params.initial_height,
-            params.initial_validator_set.clone(),
+            height,
+            validator_set,
             params.address.clone(),
             params.threshold_params,
         );
@@ -56,11 +77,13 @@ where
             ctx,
             driver,
             params,
-            input_queue: BoundedQueue::new(queue_capacity),
-            sync_input_queue: BoundedQueue::new(queue_capacity),
+            input_queue: BoundedQueue::new(queue_capacity, queue_per_height_capacity),
             full_proposal_keeper: Default::default(),
             last_signed_prevote: None,
             last_signed_precommit: None,
+            target_time: None,
+            height_start_time: None,
+            finalization_period: false,
         }
     }
 
@@ -94,36 +117,22 @@ where
     }
 
     pub fn restore_precommits(
-        &mut self,
+        &self,
         height: Ctx::Height,
         round: Round,
         value: &Ctx::Value,
     ) -> Vec<SignedVote<Ctx>> {
         assert_eq!(height, self.driver.height());
-
-        // Get the commits for the height and round.
-        if let Some(per_round) = self.driver.votes().per_round(round) {
-            per_round
-                .received_votes()
-                .iter()
-                .filter(|vote| {
-                    vote.vote_type() == VoteType::Precommit
-                        && vote.value() == &NilOrVal::Val(value.id())
-                })
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        }
+        self.driver.restore_precommits(round, &value.id())
     }
 
-    pub fn polka_certificate_at_round(&self, round: Round) -> Option<PolkaCertificate<Ctx>> {
-        // Get the polka certificate for the specified round if it exists
-        self.driver
-            .polka_certificates()
-            .iter()
-            .find(|c| c.round == round && c.height == self.driver.height())
-            .cloned()
+    /// Get the polka certificate at the current height for the specified round and value, if it exists
+    pub fn polka_certificate(
+        &self,
+        round: Round,
+        value_id: &ValueId<Ctx>,
+    ) -> Option<&PolkaCertificate<Ctx>> {
+        self.driver.polka_certificate(round, value_id)
     }
 
     pub fn full_proposal_at_round_and_value(
@@ -146,6 +155,28 @@ where
             .full_proposal_at_round_and_proposer(height, round, address)
     }
 
+    /// Get a proposed value by its ID at the specified height.
+    /// `round` simply populates the corresponding field on the
+    /// returned `ProposedValue`.
+    pub fn get_proposed_value_by_id(
+        &self,
+        height: Ctx::Height,
+        round: Round,
+        value_id: &ValueId<Ctx>,
+    ) -> Option<ProposedValue<Ctx>> {
+        let (value, validity) = self
+            .full_proposal_keeper
+            .get_value_by_id(&height, value_id)?;
+        Some(ProposedValue {
+            height,
+            round,
+            valid_round: Round::Nil,
+            proposer: self.get_proposer(height, round).clone(),
+            value: value.clone(),
+            validity,
+        })
+    }
+
     pub fn proposals_for_value(
         &self,
         proposed_value: &ProposedValue<Ctx>,
@@ -158,26 +189,49 @@ where
         self.full_proposal_keeper.store_proposal(new_proposal)
     }
 
-    pub fn value_exists(&mut self, new_value: &ProposedValue<Ctx>) -> bool {
-        self.full_proposal_keeper.value_exists(new_value)
-    }
-
-    pub fn store_value(&mut self, new_value: &ProposedValue<Ctx>) {
+    /// Store the proposed value and return its validity,
+    /// which may be now be different from the one provided.
+    pub fn store_value(&mut self, new_value: &ProposedValue<Ctx>) -> Validity {
         // Values for higher height should have been cached for future processing
         assert_eq!(new_value.height, self.driver.height());
 
+        if self
+            .full_proposal_keeper
+            .get_value_by_id(&new_value.height, &new_value.value.id())
+            .is_none()
+            && new_value.validity.is_invalid()
+        {
+            warn!(
+                height = %new_value.height,
+                round = %new_value.round,
+                value.id = ?new_value.value.id(),
+                "Application sent an invalid proposed value"
+            );
+        }
         // Store the value at both round and valid_round
         self.full_proposal_keeper.store_value(new_value);
+
+        // Retrieve the validity after storing, as it may have changed (e.g., from Invalid to Valid)
+        let (_value, validity) = self
+            .full_proposal_keeper
+            .get_value_by_id(&new_value.height, &new_value.value.id())
+            .expect("We just stored the entry, so it should be there");
+
+        validity
     }
 
     pub fn reset_and_start_height(
         &mut self,
         height: Ctx::Height,
         validator_set: Ctx::ValidatorSet,
+        target_time: Option<Duration>,
     ) {
         self.full_proposal_keeper.clear();
         self.last_signed_prevote = None;
         self.last_signed_precommit = None;
+        self.target_time = target_time;
+        self.height_start_time = Some(Instant::now());
+        self.finalization_period = false;
 
         self.driver.move_to_height(height, validator_set);
     }
@@ -198,38 +252,13 @@ where
         }
     }
 
-    /// Queue a sync input for later processing, only keep inputs for the highest height seen so far.
-    pub fn buffer_sync_input(
-        &mut self,
-        height: Ctx::Height,
-        input: Input<Ctx>,
-        _metrics: &Metrics,
-    ) {
-        self.sync_input_queue.push(height, input);
-
-        #[cfg(feature = "metrics")]
-        {
-            _metrics
-                .sync_queue_heights
-                .set(self.sync_input_queue.len() as i64);
-            _metrics
-                .sync_queue_size
-                .set(self.sync_input_queue.size() as i64);
-        }
-    }
-
     /// Take all inputs that are pending for the specified height and remove from the input queue.
     pub fn take_pending_inputs(&mut self, _metrics: &Metrics) -> Vec<Input<Ctx>>
     where
         Ctx: Context,
     {
-        let mut inputs = self
+        let inputs = self
             .input_queue
-            .shift_and_take(&self.height())
-            .collect::<Vec<_>>();
-
-        let mut sync_response_inputs = self
-            .sync_input_queue
             .shift_and_take(&self.height())
             .collect::<Vec<_>>();
 
@@ -237,18 +266,9 @@ where
         {
             _metrics.queue_heights.set(self.input_queue.len() as i64);
             _metrics.queue_size.set(self.input_queue.size() as i64);
-            _metrics
-                .sync_queue_heights
-                .set(self.sync_input_queue.len() as i64);
-            _metrics
-                .sync_queue_size
-                .set(self.sync_input_queue.size() as i64);
         }
 
-        // We first return the sync-related inputs because if we can successfully apply them, we will move
-        // to the next height, and therefore we can skip applying pending inputs for the just-committed height.
-        sync_response_inputs.append(&mut inputs);
-        sync_response_inputs
+        inputs
     }
 
     pub fn print_state(&self) {
