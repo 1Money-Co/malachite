@@ -1,5 +1,78 @@
 # 1Money downstream changes
 
+## v0.7.0 integration checkpoint
+
+Phase 2 starts from the merged rc.3 reconciliation and preserves two distinct Circle ancestry checkpoints:
+
+| Role | Repository and exact commit |
+| --- | --- |
+| 1Money phase-1 fork | `1Money-Co/malachite@6f544d7efca221ee8e7d2da9af37795ed6745f99` |
+| Circle v0.7 implementation | `circlefin/malachite@5cd137fb158fc52b55044eee9b090fd0d34996b0` |
+| Circle v0.7 release | `circlefin/malachite@32abf3cf952bb5fe03de914435e902a782632b59` |
+| Circle crate rename | `circlefin/malachite@8d8c224c53e095f1f10ab575e0711ecc8168bf51` |
+
+The implementation commit is merged and reconciled first. It already contains the `arc-malachitebft-*` crate
+rename. The release commit is merged only after the implementation candidate is stable; its delta promotes
+`0.7.0-pre` packages to `0.7.0` and stamps release metadata. Neither checkpoint by itself retires a downstream
+invariant or qualifies Emerald.
+
+### v0.7 behavior inventory
+
+`Pending Tn` means the named implementation-plan task owns the evidence and no compatibility claim exists yet.
+
+| Behavior | Circle input | Phase-1 behavior | Decision | Evidence | Gate |
+| --- | --- | --- | --- | --- | --- |
+| `builder-lifecycle` | `b24e55c8`, `18915cd8` | `Node` actor order | Adopt builder; retain order/errors | T4 | V7-G1 |
+| `arc-package-identity` | `8d8c224c` | `informalsystems-*` names | Adopt `arc-*`; keep aliases | T3/T7 | V7-G2 |
+| `signer-verifier-split` | `ba1e4217`, `133d78eb` | combined provider | Adopt split; retain bytes | T4 | V7-G3 |
+| `validator-proof-protocol` | `b6f55de4` | no proof protocol | Adopt exact static peer binding | Pending T4 | V7-G4 |
+| `height-parameters` | `155a1fc7`, `d2fc6f47` | engine-owned values | Adopt app callbacks | T4/Emerald | V7-G5 |
+| `sync-queue-scoring` | `1b2a15b2`, `628d8cff`, `5cd137fb` | fork free-window queues | Require parity | T5 | V7-G6 |
+| `proposal-part-forwarding` | `3e41a306` | trait part signing | Preserve app authentication | T4/Emerald | V7-G7 |
+| `wal-polka-certificate` | `8ee5d998` | tags `0x01`, `0x02`, `0x04` | Add `0x08`; read old | T6 | V7-G8 |
+| `wal-immediate-replay` | `3c264593` | immediate replay | Reject delay; remove `WaitingForSync` | Pending T6 | V7-G9 |
+| `wal-feature-matrix` | none | raw fixtures assume raw rewrites | Test raw/forced modes | T2 | V7-G10 |
+
+### Replacement inputs and phase-1 retention
+
+Circle `628d8cff` ports later sync-queue behavior, `8ee5d998` ports downstream WAL and recovery work, and `5cd137fb`
+fixes concurrent sync-height rewind. They are replacement inputs, not evidence that the phase-1 implementation can
+be deleted. The following map keeps each rc.3 row active until its named test passes on the merged candidate.
+
+| Phase-1 behavior | v0.7 replacement | Status before evidence | Required retained evidence |
+| --- | --- | --- | --- |
+| `ecdsa-signing-and-serialization` | upstream ECDSA plus split traits | Partial | known-answer fixture suite |
+| `sync-response-size-bound` | v0.7 response validation | Partial | exact send/receive byte bounds |
+| `sync-inflight-and-pending-accounting` | queued responses and `sync_height` | Partial | saturated combined allowance |
+| `sync-restored-height-startup` | upstream start-height flow | Partial | status/tick startup ordering |
+| `sync-delayed-stale-and-partial-responses` | `628d8cff`, `5cd137fb` | Partial | complete lifecycle matrix |
+| `sync-capacity-diagnostics` | upstream metrics and queue state | Partial | one-snapshot diagnostic fields |
+| `sync-network-subscription-order` | v0.7 builder wiring | Partial | consensus-before-subscribe test |
+| `consensus-sync-input-queue` | v0.7 consensus input queue | Partial | bounded sync-first isolation |
+| `consensus-request-errors` | v0.7 app channel | Partial | `Closed`, `Full`, and `Recv` tests |
+| `wal-entry-height` | `8ee5d998` | Partial | old fixtures and height regression |
+| `wal-same-height-no-replay` | `8ee5d998` | Partial | same-height reply test |
+| `sync-peer-restart-recovery` | `628d8cff`, `5cd137fb` | Partial | peer-restart integration scenario |
+| `decided-reply-async-forwarding` | v0.7 builder/app channel | Partial | async reply plus dropped-reply error |
+| `rc3-logging-context` | v0.7 logging changes | Partial | severity, context, and control-flow audit |
+
+### v0.7 retirement gates
+
+- **V7-G1:** validator/full-node construction, startup failure, actor ordering, and shutdown pass through the builder.
+- **V7-G2:** all workspace crates use `arc-malachitebft-*`; downstream aliases resolve one reviewed revision.
+- **V7-G3:** fixed ECDSA keys, addresses, signatures, JSON, and protobuf bytes remain unchanged.
+- **V7-G4:** proof preimage, validation, unknown-key storage, promotion/demotion, duplicate, and reconnect pass.
+- **V7-G5:** every height start/restart carries the intended validator set, timeouts, and target time.
+- **V7-G6:** every phase-1 sync lifecycle and peer-restart scenario passes on the v0.7 queue without retry.
+- **V7-G7:** Emerald authenticates local, forwarded, mixed-path, hidden-lock, and restreamed proposal content.
+- **V7-G8:** old WALs read; `0x08` round-trips and restarts; an old decoder rejects it without mutation.
+- **V7-G9:** a non-empty validator WAL always replays before sync can change the crash height.
+- **V7-G10:** raw mode preserves fixture bytes and forced compression preserves decoded entries and replay behavior.
+
+Phase-1 Emerald qualification runs in parallel. Phase-2 pull requests may be opened while it runs, but they must not
+merge without a linked record naming exact revisions, environment, scenarios, results, limitations, and explicit
+human approval or a documented override.
+
 ## rc.3 reconciliation baseline
 
 The first phase of the staged Emerald migration develops from the current 1Money fork while qualifying compatibility
