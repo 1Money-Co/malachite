@@ -1,3 +1,7 @@
+// Newer compilers flag unreachable conversion arms emitted by the
+// NetworkBehaviour derive for child behaviours with uninhabited events.
+#![allow(unreachable_code)]
+
 use std::time::Duration;
 
 use libp2p::swarm::NetworkBehaviour;

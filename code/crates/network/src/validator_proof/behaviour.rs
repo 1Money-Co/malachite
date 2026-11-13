@@ -226,12 +226,12 @@ impl NetworkBehaviour for Behaviour {
 
     fn on_connection_handler_event(
         &mut self,
-        peer_id: PeerId,
-        connection_id: ConnectionId,
+        _peer_id: PeerId,
+        _connection_id: ConnectionId,
         event: libp2p::swarm::THandlerOutEvent<Self>,
     ) {
-        self.inner
-            .on_connection_handler_event(peer_id, connection_id, event);
+        // stream::Behaviour's connection handler cannot emit events.
+        match event {}
     }
 
     fn poll(

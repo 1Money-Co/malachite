@@ -1,3 +1,9 @@
+// The NetworkBehaviour derive must generate conversion arms for child
+// behaviours whose event type is `Infallible`. Newer compilers flag those
+// generated arms as unreachable even though the trait implementation is
+// required.
+#![allow(unreachable_code)]
+
 use std::convert::Infallible;
 use std::time::Duration;
 
