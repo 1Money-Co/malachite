@@ -1,12 +1,12 @@
 use crate::{TestBuilder, TestParams};
+use arc_malachitebft_test::codec::json::JsonCodec;
+use arc_malachitebft_test::decided_value::DecidedValue;
+use arc_malachitebft_test::middleware::{Middleware, RotateEpochValidators};
+use arc_malachitebft_test::TestContext;
+use arc_malachitebft_test::{Address, Height, PrivateKey, Value, ValueId, Vote};
 use bytes::Bytes;
 use bytesize::ByteSize;
 use eyre::bail;
-use informalsystems_malachitebft_test::codec::json::JsonCodec;
-use informalsystems_malachitebft_test::decided_value::DecidedValue;
-use informalsystems_malachitebft_test::middleware::{Middleware, RotateEpochValidators};
-use informalsystems_malachitebft_test::TestContext;
-use informalsystems_malachitebft_test::{Address, Height, PrivateKey, Value, ValueId, Vote};
 use malachitebft_codec::{Codec, HasEncodedLen};
 use malachitebft_config::ValuePayload;
 use malachitebft_core_consensus::ProposedValue;

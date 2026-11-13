@@ -1,6 +1,14 @@
+// The NetworkBehaviour derive must generate conversion arms for child
+// behaviours whose event type is `Infallible`. Newer compilers flag those
+// generated arms as unreachable even though the trait implementation is
+// required.
+#![allow(unreachable_code)]
+
+use std::convert::Infallible;
 use std::time::Duration;
 
 use eyre::Result;
+use libp2p::connection_limits;
 pub use libp2p::identity::Keypair;
 use libp2p::kad::{Addresses, KBucketKey, KBucketRef};
 use libp2p::request_response::{OutboundRequestId, ResponseChannel};
@@ -13,8 +21,34 @@ use libp2p_broadcast as broadcast;
 use malachitebft_discovery as discovery;
 use malachitebft_metrics::Registry;
 use malachitebft_sync as sync;
+use tracing::info;
 
-use crate::{Config, GossipSubConfig};
+use crate::validator_proof;
+use crate::{ip_limits, peer_scoring, Config, GossipSubConfig};
+
+/// Multiplier for connection limits.
+/// Connection limits are higher than discovery limits to allow headroom for ephemeral
+/// connections, persistent peers, and connection churn.
+const CONNECTION_LIMITS_MULTIPLIER: u32 = 4;
+
+/// Derive libp2p connection limits from network config.
+/// Uses 4x multiplier to provide headroom above discovery-level limits.
+fn connection_limits(config: &Config) -> connection_limits::ConnectionLimits {
+    let multiplier = CONNECTION_LIMITS_MULTIPLIER;
+    let max_pending_incoming = (config.discovery.num_inbound_peers as u32) * multiplier;
+    let max_pending_outgoing = (config.discovery.num_outbound_peers as u32) * multiplier;
+    let max_established_incoming = (config.discovery.num_inbound_peers as u32) * multiplier;
+    let max_established_outgoing = (config.discovery.num_outbound_peers as u32) * multiplier;
+    let max_established_per_peer = (config.discovery.max_connections_per_peer as u32) * multiplier;
+
+    connection_limits::ConnectionLimits::default()
+        .with_max_pending_incoming(Some(max_pending_incoming))
+        .with_max_pending_outgoing(Some(max_pending_outgoing))
+        .with_max_established_incoming(Some(max_established_incoming))
+        .with_max_established_outgoing(Some(max_established_outgoing))
+        .with_max_established_per_peer(Some(max_established_per_peer))
+}
+
 #[derive(Debug)]
 pub enum NetworkEvent {
     Identify(Box<identify::Event>),
@@ -23,6 +57,7 @@ pub enum NetworkEvent {
     Broadcast(broadcast::Event),
     Sync(sync::Event),
     Discovery(Box<discovery::NetworkEvent>),
+    ValidatorProof(validator_proof::Event),
 }
 
 impl From<identify::Event> for NetworkEvent {
@@ -61,15 +96,32 @@ impl From<discovery::NetworkEvent> for NetworkEvent {
     }
 }
 
+impl From<validator_proof::Event> for NetworkEvent {
+    fn from(event: validator_proof::Event) -> Self {
+        Self::ValidatorProof(event)
+    }
+}
+
+// connection_limits::Behaviour never emits events (uses Infallible),
+// but the NetworkBehaviour derive macro requires this implementation.
+impl From<Infallible> for NetworkEvent {
+    fn from(event: Infallible) -> Self {
+        match event {}
+    }
+}
+
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "NetworkEvent")]
 pub struct Behaviour {
+    pub connection_limits: connection_limits::Behaviour,
+    pub ip_limits: ip_limits::Behaviour,
     pub identify: identify::Behaviour,
     pub ping: ping::Behaviour,
     pub gossipsub: Toggle<gossipsub::Behaviour>,
     pub broadcast: Toggle<broadcast::Behaviour>,
     pub sync: Toggle<sync::Behaviour>,
     pub discovery: Toggle<discovery::Behaviour>,
+    pub validator_proof: Toggle<validator_proof::Behaviour>,
 }
 
 /// Dummy implementation of Debug for Behaviour.
@@ -133,7 +185,8 @@ fn message_id(message: &gossipsub::Message) -> gossipsub::MessageId {
 fn gossipsub_config(config: GossipSubConfig, max_transmit_size: usize) -> gossipsub::Config {
     gossipsub::ConfigBuilder::default()
         .max_transmit_size(max_transmit_size)
-        .opportunistic_graft_ticks(3)
+        .opportunistic_graft_ticks(peer_scoring::OPPORTUNISTIC_GRAFT_TICKS)
+        .opportunistic_graft_peers(peer_scoring::OPPORTUNISTIC_GRAFT_PEERS)
         .heartbeat_interval(Duration::from_secs(1))
         .validation_mode(gossipsub::ValidationMode::Strict)
         .history_gossip(3)
@@ -142,6 +195,7 @@ fn gossipsub_config(config: GossipSubConfig, max_transmit_size: usize) -> gossip
         .mesh_n_low(config.mesh_n_low)
         .mesh_outbound_min(config.mesh_outbound_min)
         .mesh_n(config.mesh_n)
+        .flood_publish(config.enable_flood_publish)
         .message_id_fn(message_id)
         .build()
         .unwrap()
@@ -150,24 +204,50 @@ fn gossipsub_config(config: GossipSubConfig, max_transmit_size: usize) -> gossip
 impl Behaviour {
     pub fn new_with_metrics(
         config: &Config,
-        keypair: &Keypair,
+        identity: &crate::NetworkIdentity,
         registry: &mut Registry,
     ) -> Result<Self> {
-        let identify = identify::Behaviour::new(identify::Config::new(
-            config.protocol_names.consensus.clone(),
-            keypair.public(),
-        ));
+        // Build agent_version for peer identification (moniker only)
+        let agent_version = format!("moniker={}", identity.moniker);
+
+        // Validate consensus protocol name and use it for identify (and compatibility check in event loop)
+        let consensus_protocol =
+            libp2p::StreamProtocol::try_from_owned(config.protocol_names.consensus.clone())?;
+
+        // Use signed peer records to prevent peer ID spoofing.
+        // Peers will sign their addresses with their private key, allowing verification.
+        let identify = identify::Behaviour::new(
+            identify::Config::new_with_signed_peer_record(
+                consensus_protocol.to_string(),
+                &identity.keypair,
+            )
+            .with_agent_version(agent_version),
+        );
 
         let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(5)));
 
         let enable_gossipsub = config.pubsub_protocol.is_gossipsub() && config.enable_consensus;
         let gossipsub = enable_gossipsub.then(|| {
-            gossipsub::Behaviour::new(
-                gossipsub::MessageAuthenticity::Signed(keypair.clone()),
+            let mut behaviour = gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Signed(identity.keypair.clone()),
                 gossipsub_config(config.gossipsub, config.pubsub_max_size),
             )
-            .unwrap()
-            .with_metrics(
+            .unwrap();
+
+            // Enable peer scoring if configured
+            if config.gossipsub.enable_peer_scoring {
+                info!("Enabling peer scoring for GossipSub");
+                behaviour
+                    .with_peer_score(
+                        peer_scoring::peer_score_params(),
+                        peer_scoring::peer_score_thresholds(),
+                    )
+                    .expect("Failed to enable peer scoring");
+            } else {
+                info!("Peer scoring is disabled for GossipSub");
+            }
+
+            behaviour.with_metrics(
                 registry.sub_registry_with_prefix("gossipsub"),
                 Default::default(),
             )
@@ -185,10 +265,9 @@ impl Behaviour {
         });
 
         let sync = if config.enable_sync {
-            Some(sync::Behaviour::new_with_metrics(
+            Some(sync::Behaviour::new(
                 sync::Config::default().with_max_response_size(config.rpc_max_size),
                 config.protocol_names.sync.clone(),
-                registry.sub_registry_with_prefix("sync"),
             )?)
         } else {
             None
@@ -196,7 +275,7 @@ impl Behaviour {
 
         let discovery = if config.discovery.enabled {
             Some(discovery::Behaviour::new(
-                keypair,
+                &identity.keypair,
                 config.discovery,
                 config.protocol_names.discovery_kad.clone(),
                 config.protocol_names.discovery_regres.clone(),
@@ -205,13 +284,32 @@ impl Behaviour {
             None
         };
 
+        // Enable validator proof verification if consensus is enabled
+        let validator_proof = if config.enable_consensus {
+            let protocol = libp2p::StreamProtocol::try_from_owned(
+                config.protocol_names.validator_proof.clone(),
+            )?;
+            Some(validator_proof::Behaviour::new(protocol))
+        } else {
+            None
+        };
+
+        // Limits for transport layer defense against connection attacks
+        let connection_limits = connection_limits::Behaviour::new(connection_limits(config));
+
+        // Per-IP connection limits to prevent DoS from multiple PeerIds on same IP
+        let ip_limits = ip_limits::Behaviour::new(config.discovery.max_connections_per_ip);
+
         Ok(Self {
+            connection_limits,
+            ip_limits,
             identify,
             ping,
             sync: Toggle::from(sync),
             gossipsub: Toggle::from(gossipsub),
             broadcast: Toggle::from(broadcast),
             discovery: Toggle::from(discovery),
+            validator_proof: Toggle::from(validator_proof),
         })
     }
 }

@@ -2,15 +2,112 @@
 
 ## Unreleased
 
+## 0.7.0
+
+*June 22nd, 2026*
+
+> [!IMPORTANT]
+> All crates were renamed from `informalsystems-malachitebft-$crate` to `arc-malachitebft-$crate`.
+
 ### `malachitebft-core-types`
 
-- Move `SigningProvider` and `SigningProviderExt` traits into new `malachitebft-signing` crate ([#1191](https://github.com/informalsystems/malachite/pull/1191))
+- Added new `ValidatorProof<Ctx>` type for the Proof-of-Validator protocol (ADR-006)
+- Added new associated type `Timeouts` to the `Context` trait (use `LinearTimeouts` for default implementation) ([#1227](https://github.com/circlefin/malachite/pull/1227))
+- Remove `initial_validator_set` and `initial_height` fields from `Params` struct ([#1190](https://github.com/circlefin/malachite/pull/1190))
 
 ### `malachitebft-signing`
 
-- New crate exposing the `SigningProvider` trait ([#1191](https://github.com/informalsystems/malachite/pull/1191))
-- Make methods of `SigningProvider` and `SigningProviderExt` traits fallible ([#1191](https://github.com/informalsystems/malachite/pull/1191))
-- Changed methods of `SigningProvider` and `SigningProviderExt` traits to `async` ([#1151](https://github.com/informalsystems/malachite/issues/1151))
+- Split `SigningProvider` into two independent traits:
+  - `Verifier<Ctx>` — signature verification (no key material required)
+  - `Signer<Ctx>` — message signing (requires private key)
+- `SigningProviderExt` has been removed; use `VerifierExt` directly
+- APIs that previously took `Box<dyn SigningProvider<Ctx>>` now take `Box<dyn Verifier<Ctx>>` and/or `Box<dyn Signer<Ctx>>` separately
+- Removed `Signer::sign_bytes` and `Verifier::verify_signed_bytes`; every signing purpose is now a named trait method. Previously these were untyped blob channels that forced downstream signers to inspect bytes or maintain ambient state to pick a domain.
+- Added `sign_validator_proof` as a required method on the `Signer` trait for Proof-of-Validator (ADR-006):
+  - `sign_validator_proof(&self, public_key: Vec<u8>, peer_id: Vec<u8>) -> Result<ValidatorProof<Ctx>, Error>`
+- Added `verify_validator_proof` as a required method on the `Verifier` trait for Proof-of-Validator (ADR-006):
+  - `verify_validator_proof(&self, proof: &ValidatorProof<Ctx>) -> Result<VerificationResult, Error>`
+- Removed the `SignerExt` trait; `sign_validator_proof` now lives on `Signer` directly. Migrate downstream `use … SignerExt` imports to `use … Signer`.
+
+### `malachitebft-core-driver`
+
+- Changed `Driver::new()` signature - removed `timeouts` parameter ([#1227](https://github.com/circlefin/malachite/pull/1227))
+  - Old: `Driver::new(ctx, height, validator_set, timeouts, address, threshold_params)`
+  - New: `Driver::new(ctx, height, validator_set, address, threshold_params)`
+- Removed `Driver::timeouts()` method - timeouts are now accessed through `State` instead ([#1227](https://github.com/circlefin/malachite/pull/1227))
+- Removed `timeouts` field from `Driver` struct - Driver no longer stores or manages timeouts ([#1227](https://github.com/circlefin/malachite/pull/1227))
+- Changed `Driver::move_to_height` signature from `move_to_height(Height, Validator_set, Timeouts)` to `move_to_height(Height, Option<ValidatorSet>)` ([#1227](https://github.com/circlefin/malachite/pull/1227))
+
+### `malachitebft-core-consensus`
+
+- Removed `Effect::ResetTimeouts` variant ([#1227](https://github.com/circlefin/malachite/pull/1227))
+- Changed `Input::StartHeight` from `StartHeight(Height, ValidatorSet, bool)` to `StartHeight(Height, Option<ValidatorSet>, bool)` ([#1227](https://github.com/circlefin/malachite/pull/1227))
+- Changed `State::reset_and_start_height()` signature from `(height, validator_set)` to `(height, validator_set: Option<ValidatorSet>)` ([#1227](https://github.com/circlefin/malachite/pull/1227))
+
+### `malachitebft-engine`
+
+- Added new `NetworkEvent::ValidatorProofReceived` variant for receiving validator proofs (ADR-006)
+- Added new `Msg::ValidatorProofVerified` variant for communicating proof verification results
+- Network codec trait bounds now require `Codec<ValidatorProof<Ctx>>` implementation
+- Changed `Next::Start` variant from `Start(Height, ValidatorSet)` to `Start(Height, HeightParams)` ([#1227](https://github.com/circlefin/malachite/pull/1227))
+- Changed `Next::Restart` variant from `Restart(Height, ValidatorSet)` to `Restart(Height, HeightParams)` ([#1227](https://github.com/circlefin/malachite/pull/1227))
+- Changed `HostMsg::ConsensusReady` reply type from `(Ctx::Height, Ctx::ValidatorSet)` to `(Ctx::Height, HeightParams<Ctx>)` ([#1227](https://github.com/circlefin/malachite/pull/1227))
+- Changed `Msg::StartHeight` from `StartHeight(Height, ValidatorSet)` to `StartHeight(Height, HeightParams)` ([#1227](https://github.com/circlefin/malachite/pull/1227))
+- Changed `Msg::RestartHeight` from `RestartHeight(Height, ValidatorSet)` to `RestartHeight(Height, HeightParams)` ([#1227](https://github.com/circlefin/malachite/pull/1227))
+- Added `timeouts` field to `State` struct - timeouts are now stored in State instead of Driver ([#1227](https://github.com/circlefin/malachite/pull/1227))
+- Added `WalEntry::PolkaCertificate` variant - polka certificates are now stored in the WAL; if recovering with downgraded version fails, restart with the new version
+
+### `malachitebft-config`
+
+- Removed `TimeoutConfig` struct ([#1227](https://github.com/circlefin/malachite/pull/1227))
+- Removed `timeouts` field from `ConsensusConfig` struct (timeouts are now managed via `Context::Timeouts` associated type) ([#1227](https://github.com/circlefin/malachite/pull/1227))
+
+### `malachitebft-app-channel`
+
+- Changed `NetworkContext` struct for Proof-of-Validator support (ADR-006):
+  - Old: `NetworkContext::new(identity: NetworkIdentity, codec: Codec)` (where `NetworkIdentity` had no proof)
+  - New: `NetworkContext::new(identity: NetworkIdentity, codec: Codec)` (where `NetworkIdentity` carries pre-signed proof bytes)
+  - The application is now responsible for signing the validator proof and building `NetworkIdentity::new_validator(moniker, keypair, address, proof_bytes)` before passing it to `NetworkContext`
+- Re-exported `Signer` and `Verifier` from `malachitebft_app_channel`; apps call `sign_validator_proof` / `verify_validator_proof` directly on the primary traits now
+- `ConsensusContext` now has two constructors: `new_validator(address, verifier, signer)` for validators and `new_full_node(address, verifier)` for non-validator nodes
+- Network codec now requires `Codec<ValidatorProof<Ctx>>` implementation
+- Changed `AppMsg::ConsensusReady` reply type from `(Ctx::Height, Ctx::ValidatorSet)` to `(Ctx::Height, HeightParams<Ctx>)` ([#1227](https://github.com/circlefin/malachite/pull/1227))
+- Changed `ConsensusMsg::StartHeight` from `StartHeight(Height, ValidatorSet)` to `StartHeight(Height, HeightParams)` ([#1227](https://github.com/circlefin/malachite/pull/1227))
+- Changed `ConsensusMsg::RestartHeight` from `RestartHeight(Height, ValidatorSet)` to `RestartHeight(Height, HeightParams)` ([#1227](https://github.com/circlefin/malachite/pull/1227))
+
+### `malachitebft-app`
+
+- Removed `Node` trait
+
+### `malachitebft-sync`
+
+- Added new `PartialSuccess { received, requested, response_time }` variant to `SyncResult`. Custom implementations of `ScoringStrategy` that match on `SyncResult` must handle the new variant.
+
+### `malachitebft-engine-byzantine`
+
+- Removed `ByzantineMiddleware`. The `TestContext`-specific middleware has been relocated to `malachitebft_test::byzantine::ByzantineMiddleware`. Downstream contexts that want the same behavior should embed the new `Amnesia<Ctx>` tracker into their own prevote-construction hook.
+- Added `Amnesia<Ctx>` context-generic amnesia state machine, exposed at the crate root.
+- Removed `malachitebft-test` from regular dependencies (now dev-only). Consumers no longer transitively pull in the test crate.
+
+### `malachitebft-test`
+
+- `ByzantineMiddleware` now lives under `malachitebft_test::byzantine` (previously at `malachitebft_engine_byzantine::ByzantineMiddleware`). Its constructor takes 5 args `(ignore_locks, force_precommit_nil, inner, self_address, seed)` and internally delegates to `Amnesia<TestContext>`.
+
+### `malachitebft-app-channel`
+
+- Added optional `byzantine` Cargo feature that enables `EngineBuilder::with_byzantine_network` and the `ByzantineContext` input struct. Off by default; enabling it adds `malachitebft-engine-byzantine` as a transitive dependency.
+
+## 0.6.0
+
+### `malachitebft-core-types`
+
+- Move `SigningProvider` and `SigningProviderExt` traits into new `malachitebft-signing` crate ([#1191](https://github.com/circlefin/malachite/pull/1191))
+
+### `malachitebft-signing`
+
+- New crate exposing the `SigningProvider` trait ([#1191](https://github.com/circlefin/malachite/pull/1191))
+- Make methods of `SigningProvider` and `SigningProviderExt` traits fallible ([#1191](https://github.com/circlefin/malachite/pull/1191))
+- Changed methods of `SigningProvider` and `SigningProviderExt` traits to `async` ([#1151](https://github.com/circlefin/malachite/issues/1151))
 
 ### `malachitebft-core-consensus`
 
@@ -22,13 +119,12 @@
 
 ### `malachitebft-config`
 
-- Added field `channel_names: ChannelNames` to `NetworkConfig` struct ([#849](https://github.com/informalsystems/malachite/pull/849))
+- Added field `channel_names: ChannelNames` to `NetworkConfig` struct ([#849](https://github.com/circlefin/malachite/pull/849))
 
 ### `malachitebft-app-channel`
 
 - Remove `AppMsg::GetValidatorSet` ([#1189](https://github.com/circlefin/malachite/pull/1189))
 - Added field `requests: tokio::sync::mpsc::Sender<ConsensusRequest<Ctx>>` to `Channels` struct ([#1176](https://github.com/circlefin/malachite/pull/1176))
-
 
 ## 0.5.0
 
@@ -36,38 +132,38 @@
 
 ### General
 
-- Updated libp2p to v0.56.x ([#1124](https://github.com/informalsystems/malachite/pull/1124))
+- Updated libp2p to v0.56.x ([#1124](https://github.com/circlefin/malachite/pull/1124))
 
 ### `malachitebft-app-channel`
 
-- Changed type of field `reply` of enum variant `AppMsg::Decided` to `Reply<malachitebft_engine::host::Next<Ctx>>` ([#1109](https://github.com/informalsystems/malachite/pull/1109))
+- Changed type of field `reply` of enum variant `AppMsg::Decided` to `Reply<malachitebft_engine::host::Next<Ctx>>` ([#1109](https://github.com/circlefin/malachite/pull/1109))
 
 ### `malachitebft-engine`
 
-- Changed tuple field of enum variant `HostMsg::ConsensusReady` to a field named `reply_to` of type `RpcReplyPort<(Ctx::Height, Ctx::ValidatorSet)>` ([#1109](https://github.com/informalsystems/malachite/pull/1109))
-- Added field `reply_to` to enum variant `HostMsg::StartedRound` with type `RpcReplyPort<Vec<ProposedValue<Ctx>>>` ([#1109](https://github.com/informalsystems/malachite/pull/1109))
-- Changed type of field `reply_to` of enum variant `HostMsg::Decided` to `RpcReplyPort<malachitebft_engine::host::Next<Ctx>>` ([#1109](https://github.com/informalsystems/malachite/pull/1109))
+- Changed tuple field of enum variant `HostMsg::ConsensusReady` to a field named `reply_to` of type `RpcReplyPort<(Ctx::Height, Ctx::ValidatorSet)>` ([#1109](https://github.com/circlefin/malachite/pull/1109))
+- Added field `reply_to` to enum variant `HostMsg::StartedRound` with type `RpcReplyPort<Vec<ProposedValue<Ctx>>>` ([#1109](https://github.com/circlefin/malachite/pull/1109))
+- Changed type of field `reply_to` of enum variant `HostMsg::Decided` to `RpcReplyPort<malachitebft_engine::host::Next<Ctx>>` ([#1109](https://github.com/circlefin/malachite/pull/1109))
 
 ### `malachitebft-core-consensus`
 
-- Rename `Effect::RebroadcastVote` to `Effect::RepublishVote` and `Effect::RebroadcastRoundCertificate` to `Effect::RepublishRoundCertificate` ([#1011](https://github.com/informalsystems/malachite/issues/1011))
-- Add new `Effect::SyncValue` variant to forward synced values to the application ([#1149](https://github.com/informalsystems/malachite/pull/1149))
+- Rename `Effect::RebroadcastVote` to `Effect::RepublishVote` and `Effect::RebroadcastRoundCertificate` to `Effect::RepublishRoundCertificate` ([#1011](https://github.com/circlefin/malachite/issues/1011))
+- Add new `Effect::SyncValue` variant to forward synced values to the application ([#1149](https://github.com/circlefin/malachite/pull/1149))
 
 ### `malachitebft-sync`
 
 #### Enum Changes
 
-- Renamed `GetDecidedValue` to `GetDecidedValues` in `Effect`. 
+- Renamed `GetDecidedValue` to `GetDecidedValues` in `Effect`.
   - Now it takes a range of heights instead of one, and the reply is a list (possibly empty) of
     decided values instead of one or zero.
-- Renamed `GotDecidedValue` to `GotDecidedValues` in `Msg` and `Input`. 
+- Renamed `GotDecidedValue` to `GotDecidedValues` in `Msg` and `Input`.
   - Now it has as parameter a range of heights instead of one, and a list of decided values instead
     of one or zero.
 - Added new parameter to `SyncRequestTimedOut` in `Input`.
-- Renamed `Effect::RebroadcastVote` to `Effect::RepublishVote` and `Effect::RebroadcastRoundCertificate` to `Effect::RepublishRoundCertificate` ([#1011](https://github.com/informalsystems/malachite/issues/1011))
-- Added new `Effect::SyncValue` variant to forward synced values to the application ([#1149](https://github.com/informalsystems/malachite/pull/1149))
-- Removed `Input::CommitCertificate` variant ([#1149](https://github.com/informalsystems/malachite/pull/1149))
-- Added new `Input::SyncValueResponse` variant to notify consensus of a sync value having been received via the sync protocol ([#1149](https://github.com/informalsystems/malachite/pull/1149))
+- Renamed `Effect::RebroadcastVote` to `Effect::RepublishVote` and `Effect::RebroadcastRoundCertificate` to `Effect::RepublishRoundCertificate` ([#1011](https://github.com/circlefin/malachite/issues/1011))
+- Added new `Effect::SyncValue` variant to forward synced values to the application ([#1149](https://github.com/circlefin/malachite/pull/1149))
+- Removed `Input::CommitCertificate` variant ([#1149](https://github.com/circlefin/malachite/pull/1149))
+- Added new `Input::SyncValueResponse` variant to notify consensus of a sync value having been received via the sync protocol ([#1149](https://github.com/circlefin/malachite/pull/1149))
 
 ## 0.4.0
 
@@ -75,12 +171,11 @@
 
 ### `malachitebft-config`
 - Added new sync parameters to config.
-  See ([#1092](https://github.com/informalsystems/malachite/issues/1092)) for more details.
+  See ([#1092](https://github.com/circlefin/malachite/issues/1092)) for more details.
 
 ### `malachitebft-sync`
 - Added new parallel requests related parameters to sync config.
-  See ([#1092](https://github.com/informalsystems/malachite/issues/1092)) for more details.
-
+  See ([#1092](https://github.com/circlefin/malachite/issues/1092)) for more details.
 
 ## 0.3.1
 
@@ -88,27 +183,26 @@
 
 No breaking changes.
 
-
 ## 0.3.0
 
 *June 17th, 2025*
 
 ### `malachitebft-core-types`
 - Removed the VoteSet synchronization protocol, as it is neither required nor sufficient for liveness.
-  See ([#998](https://github.com/informalsystems/malachite/issues/998)) for more details.
+  See ([#998](https://github.com/circlefin/malachite/issues/998)) for more details.
 
 ### `malachitebft-core-consensus`
 - Removed the VoteSet synchronization protocol, as it is neither required nor sufficient for liveness.
-  See ([#998](https://github.com/informalsystems/malachite/issues/998)) for more details.
+  See ([#998](https://github.com/circlefin/malachite/issues/998)) for more details.
 - Added new variants to `Input` enum: `PolkaCertificate` and `RoundCertificate`
 - Added new variant to `Effect` enum: `PublishLivenessMessage`
 
 ### `malachitebft-metrics`
-- Removed app-specific metrics from the `malachitebft-metrics` crate ([#1054](https://github.com/informalsystems/malachite/issues/1054))
+- Removed app-specific metrics from the `malachitebft-metrics` crate ([#1054](https://github.com/circlefin/malachite/issues/1054))
 
 ### `malachitebft-engine`
 - Removed the VoteSet synchronization protocol, as it is neither required nor sufficient for liveness.
-  See ([#998](https://github.com/informalsystems/malachite/issues/998)) for more details.
+  See ([#998](https://github.com/circlefin/malachite/issues/998)) for more details.
 - Changed the reply channel of `GetValidatorSet` message to take an `Option<Ctx::ValidatorSet>` instead of `Ctx::ValidatorSet`.
 - Added new variant to `Msg` enum: `PublishLivenessMsg`
 - Added new variants to `NetworkEvent` enum: `PolkaCertificate` and `RoundCertificate`
@@ -127,9 +221,9 @@ No breaking changes.
 
 ### `malachitebft-sync`
 - Removed the VoteSet synchronization protocol, as it is neither required nor sufficient for liveness.
-  See ([#998](https://github.com/informalsystems/malachite/issues/998)) for more details.
+  See ([#998](https://github.com/circlefin/malachite/issues/998)) for more details.
 
-### `informalsystems-malachitebft-app-channel`
+### `arc-malachitebft-app-channel`
 - The `start_engine` function now takes two `Codec`s: one for the WAL and one for the network.
 
 ## 0.2.0
@@ -156,7 +250,7 @@ No breaking changes.
 - Added new variants to `TimeoutKind` enum: `PrevoteRebroadcast` and `PrecommitRebroadcast`.
 
 #### Struct Changes
-- Removed the `Extension` struct that was previously available at `informalsystems_malachitebft_core_types::Extension`.
+- Removed the `Extension` struct that was previously available at `arc_malachitebft_core_types::Extension`.
 - Removed the `extension` field from the `CommitSignature` struct.
 - Changed `CommitSignature::new()` method to take 2 parameters instead of 3.
 
@@ -223,8 +317,7 @@ No breaking changes.
   - `State::full_proposals_for_value`
   - `State::remove_full_proposals`
 
-
-### `informalsystems-malachitebft-sync`
+### `arc-malachitebft-sync`
 
 #### Struct Changes
 - Added new field to externally-constructible struct:
@@ -244,7 +337,7 @@ No breaking changes.
 - Changed parameter count:
   - `VoteSetResponse::new` now takes 4 parameters instead of 3
 
-### `informalsystems-malachitebft-engine`
+### `arc-malachitebft-engine`
 
 #### Enum Changes
 - Removed enums:
@@ -275,7 +368,7 @@ No breaking changes.
 - Removed struct:
   - `LocallyProposedValue` has been removed from the `host` module
 
-### `informalsystems-malachitebft-app-channel`
+### `arc-malachitebft-app-channel`
 
 #### Struct Changes
 - Added new fields to externally-constructible structs:
@@ -289,4 +382,3 @@ No breaking changes.
 
 #### Function Renames
   - `run` is now called `start_engine`
-

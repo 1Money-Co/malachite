@@ -1,9 +1,9 @@
-use std::collections::HashMap;
 use std::error::Error;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
 use futures::StreamExt;
+use itertools::Itertools;
 use libp2p::metrics::{Metrics, Recorder};
 use libp2p::request_response::{InboundRequestId, OutboundRequestId};
 use libp2p::swarm::{self, SwarmEvent};
@@ -30,6 +30,26 @@ pub mod pubsub;
 mod channel;
 pub use channel::{Channel, ChannelNames};
 
+mod metrics;
+use metrics::Metrics as NetworkMetrics;
+
+mod peer_type;
+pub use peer_type::PeerType;
+
+pub mod peer_scoring;
+
+mod utils;
+
+mod ip_limits;
+pub mod validator_proof;
+
+// Re-export state types for external use (e.g., RPC)
+pub use state::{LocalNodeInfo, PeerInfo, ValidatorInfo};
+
+mod state;
+pub use state::NetworkStateDump;
+use state::State;
+
 use behaviour::{Behaviour, NetworkEvent};
 use handle::Handle;
 
@@ -42,6 +62,7 @@ pub struct ProtocolNames {
     pub discovery_kad: String,
     pub discovery_regres: String,
     pub sync: String,
+    pub validator_proof: String,
 }
 
 impl Default for ProtocolNames {
@@ -51,6 +72,7 @@ impl Default for ProtocolNames {
             discovery_kad: "/malachitebft-discovery/kad/v1beta1".to_string(),
             discovery_regres: "/malachitebft-discovery/reqres/v1beta1".to_string(),
             sync: "/malachitebft-sync/v1beta1".to_string(),
+            validator_proof: "/malachitebft-validator-proof/v1".to_string(),
         }
     }
 }
@@ -81,6 +103,9 @@ pub struct GossipSubConfig {
     pub mesh_n_high: usize,
     pub mesh_n_low: usize,
     pub mesh_outbound_min: usize,
+    pub enable_peer_scoring: bool,
+    pub enable_explicit_peering: bool,
+    pub enable_flood_publish: bool,
 }
 
 impl Default for GossipSubConfig {
@@ -91,6 +116,9 @@ impl Default for GossipSubConfig {
             mesh_n_high: 12,
             mesh_n_low: 4,
             mesh_outbound_min: 2,
+            enable_peer_scoring: false,
+            enable_explicit_peering: false,
+            enable_flood_publish: true,
         }
     }
 }
@@ -101,10 +129,88 @@ pub type DiscoveryConfig = discovery::Config;
 pub type BootstrapProtocol = discovery::config::BootstrapProtocol;
 pub type Selector = discovery::config::Selector;
 
+/// Node identity bundling all node-specific information.
+///
+/// The consensus address is derived from the keypair in the current implementation
+/// where libp2p and consensus use the same key. In the future, when using separate
+/// keys (e.g., cc-signer for consensus), the address will be provided separately.
+///
+/// If consensus_address is None, the node will not advertise a validator address
+/// and cannot become a validator.
+#[derive(Clone, Debug)]
+pub struct NetworkIdentity {
+    pub moniker: String,
+    pub keypair: Keypair,
+    /// Validator info: consensus address and pre-serialized proof.
+    /// If provided, the proof is sent on connection and when becoming validator.
+    pub validator: Option<ValidatorIdentity>,
+}
+
+/// Validator identity with optional pre-serialized proof.
+#[derive(Clone, Debug)]
+pub struct ValidatorIdentity {
+    /// The consensus address (used for local node metrics and validator set matching)
+    pub address: String,
+    /// Pre-serialized validator proof bytes for broadcasting (optional)
+    pub proof_bytes: Option<Bytes>,
+}
+
+impl NetworkIdentity {
+    /// Create a new NetworkIdentity.
+    ///
+    /// # Arguments
+    /// * `moniker` - Human-readable node identifier
+    /// * `keypair` - libp2p keypair for network authentication
+    /// * `consensus_address` - Optional consensus address (Some = potential validator, None = full node)
+    ///
+    /// In the current implementation where libp2p and consensus share the same key,
+    /// the address is typically derived from the keypair before calling this method.
+    /// In the future with cc-signer, the consensus address will be separate.
+    pub fn new(moniker: String, keypair: Keypair, consensus_address: Option<String>) -> Self {
+        Self {
+            moniker,
+            keypair,
+            validator: consensus_address.map(|address| ValidatorIdentity {
+                address,
+                proof_bytes: None,
+            }),
+        }
+    }
+
+    /// Create a new NodeIdentity for a validator node with a signed proof.
+    ///
+    /// # Arguments
+    /// * `moniker` - Human-readable node identifier
+    /// * `keypair` - libp2p keypair for network authentication
+    /// * `address` - Consensus address
+    /// * `proof_bytes` - Pre-serialized validator proof
+    pub fn new_validator(
+        moniker: String,
+        keypair: Keypair,
+        address: String,
+        proof_bytes: Bytes,
+    ) -> Self {
+        Self {
+            moniker,
+            keypair,
+            validator: Some(ValidatorIdentity {
+                address,
+                proof_bytes: Some(proof_bytes),
+            }),
+        }
+    }
+
+    /// Get the consensus address if this is a validator.
+    pub fn consensus_address(&self) -> Option<&str> {
+        self.validator.as_ref().map(|v| v.address.as_str())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub listen_addr: Multiaddr,
     pub persistent_peers: Vec<Multiaddr>,
+    pub persistent_peers_only: bool,
     pub discovery: DiscoveryConfig,
     pub idle_connection_timeout: Duration,
     pub transport: TransportProtocol,
@@ -152,6 +258,32 @@ impl TransportProtocol {
     }
 }
 
+/// Operation to perform on a persistent peer
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistentPeersOp {
+    /// Add a persistent peer
+    Add(Multiaddr),
+    /// Remove a persistent peer
+    Remove(Multiaddr),
+}
+
+/// Errors that can occur during persistent peer operations
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PersistentPeerError {
+    /// Peer already exists in the persistent peers list (for Add operation)
+    #[error("Persistent peer already exists")]
+    AlreadyExists,
+    /// Peer not found in the persistent peers list (for Remove operation)
+    #[error("Persistent peer not found")]
+    NotFound,
+    /// Network is not started
+    #[error("Network not started")]
+    NetworkStopped,
+    /// Internal error
+    #[error("Internal error: {0}")]
+    InternalError(String),
+}
+
 /// sync event details:
 ///
 /// peer1: sync                  peer2: network                    peer2: sync              peer1: network
@@ -169,6 +301,11 @@ pub enum Event {
     ConsensusMessage(Channel, PeerId, Bytes),
     LivenessMessage(Channel, PeerId, Bytes),
     Sync(sync::RawMessage),
+    /// A validator proof received from a peer (one-way, no response expected).
+    ValidatorProofReceived {
+        peer_id: PeerId,
+        proof_bytes: Bytes,
+    },
 }
 
 #[derive(Debug)]
@@ -177,58 +314,60 @@ pub enum CtrlMsg {
     Broadcast(Channel, Bytes),
     SyncRequest(PeerId, Bytes, oneshot::Sender<OutboundRequestId>),
     SyncReply(InboundRequestId, Bytes),
+    UpdateValidatorSet(Vec<ValidatorInfo>),
+    /// Validator proof verification result. If Valid, public_key should be Some.
+    /// The public_key is stored and used to check validator set membership.
+    ValidatorProofVerified {
+        peer_id: PeerId,
+        result: validator_proof::ProofVerificationResult,
+        public_key: Option<Vec<u8>>,
+    },
+    DumpState(oneshot::Sender<NetworkStateDump>),
+    UpdatePersistentPeers(
+        PersistentPeersOp,
+        oneshot::Sender<Result<(), PersistentPeerError>>,
+    ),
     Shutdown,
 }
 
-#[derive(Debug)]
-pub struct State {
-    pub sync_channels: HashMap<InboundRequestId, sync::ResponseChannel>,
-    pub discovery: discovery::Discovery<Behaviour>,
-}
-
-impl State {
-    fn new(discovery: discovery::Discovery<Behaviour>) -> Self {
-        Self {
-            sync_channels: Default::default(),
-            discovery,
-        }
-    }
-}
-
 pub async fn spawn(
-    keypair: Keypair,
+    identity: NetworkIdentity,
     config: Config,
     registry: SharedRegistry,
 ) -> Result<Handle, eyre::Report> {
-    let swarm = registry.with_prefix(METRICS_PREFIX, |registry| -> Result<_, eyre::Report> {
-        let builder = SwarmBuilder::with_existing_identity(keypair.clone()).with_tokio();
-        match config.transport {
-            TransportProtocol::Tcp => {
-                let behaviour = Behaviour::new_with_metrics(&config, &keypair, registry)?;
-                Ok(builder
-                    .with_tcp(
-                        libp2p::tcp::Config::new().nodelay(true), // Disable Nagle's algorithm
-                        libp2p::noise::Config::new,
-                        libp2p::yamux::Config::default,
-                    )?
-                    .with_dns()?
-                    .with_bandwidth_metrics(registry)
-                    .with_behaviour(|_| behaviour)?
-                    .with_swarm_config(|cfg| config.apply_to_swarm(cfg))
-                    .build())
+    let mut swarm =
+        registry.with_prefix(METRICS_PREFIX, |registry| -> Result<_, eyre::Report> {
+            // Pass the libp2p keypair to the behaviour, it is included in the Identify protocol
+            // Required for ALL nodes
+            let builder =
+                SwarmBuilder::with_existing_identity(identity.keypair.clone()).with_tokio();
+            match config.transport {
+                TransportProtocol::Tcp => {
+                    let behaviour = Behaviour::new_with_metrics(&config, &identity, registry)?;
+                    Ok(builder
+                        .with_tcp(
+                            libp2p::tcp::Config::new().nodelay(true), // Disable Nagle's algorithm
+                            libp2p::noise::Config::new,
+                            libp2p::yamux::Config::default,
+                        )?
+                        .with_dns()?
+                        .with_bandwidth_metrics(registry)
+                        .with_behaviour(|_| behaviour)?
+                        .with_swarm_config(|cfg| config.apply_to_swarm(cfg))
+                        .build())
+                }
+                TransportProtocol::Quic => {
+                    let behaviour = Behaviour::new_with_metrics(&config, &identity, registry)?;
+                    Ok(builder
+                        .with_quic_config(|cfg| config.apply_to_quic(cfg))
+                        .with_dns()?
+                        .with_bandwidth_metrics(registry)
+                        .with_behaviour(|_| behaviour)?
+                        .with_swarm_config(|cfg| config.apply_to_swarm(cfg))
+                        .build())
+                }
             }
-            TransportProtocol::Quic => {
-                let behaviour = Behaviour::new_with_metrics(&config, &keypair, registry)?;
-                Ok(builder
-                    .with_quic_config(|cfg| config.apply_to_quic(cfg))
-                    .with_dns()?
-                    .with_bandwidth_metrics(registry)
-                    .with_behaviour(|_| behaviour)?
-                    .with_swarm_config(|cfg| config.apply_to_swarm(cfg))
-                    .build())
-            }
-        }
-    })?;
+        })?;
 
     let metrics = registry.with_prefix(METRICS_PREFIX, Metrics::new);
 
@@ -239,9 +378,56 @@ pub async fn spawn(
         discovery::Discovery::new(config.discovery, config.persistent_peers.clone(), reg)
     });
 
-    let state = State::new(discovery);
+    let network_metrics = registry.with_prefix(METRICS_PREFIX, NetworkMetrics::new);
 
     let peer_id = PeerId::from_libp2p(swarm.local_peer_id());
+
+    // Create local node info with subscribed consensus topics
+    let mut subscribed_topics = std::collections::HashSet::new();
+    if config.enable_consensus {
+        for channel in Channel::consensus() {
+            subscribed_topics.insert(channel.as_str(config.channel_names).to_string());
+        }
+    }
+
+    let NetworkIdentity {
+        moniker,
+        keypair: _,
+        validator,
+    } = identity;
+
+    let consensus_address = validator.as_ref().map(|v| v.address.clone());
+    let proof_bytes = validator.as_ref().and_then(|v| v.proof_bytes.clone());
+
+    // Set proof on the validator_proof behaviour so it is sent on every new connection
+    if let Some(ref proof_bytes) = proof_bytes {
+        if let Some(vp) = swarm.behaviour_mut().validator_proof.as_mut() {
+            vp.set_proof(proof_bytes.clone());
+        }
+    }
+
+    // Create local node info
+    let local_node_info = LocalNodeInfo {
+        moniker,
+        peer_id: *swarm.local_peer_id(),
+        listen_addr: config.listen_addr.clone(),
+        subscribed_topics,
+        consensus_address,
+        proof_bytes,
+        is_validator: false, // Will be updated when validator set is received
+        persistent_peers_only: config.persistent_peers_only,
+    };
+
+    // Set local node info in metrics
+    network_metrics.set_local_node_info(&local_node_info);
+
+    let state = State::new(
+        discovery,
+        config.persistent_peers.clone(),
+        local_node_info,
+        network_metrics,
+    );
+
     let span = error_span!("network");
 
     info!(parent: span.clone(), %peer_id, "Starting network service");
@@ -260,6 +446,9 @@ async fn run(
     mut rx_ctrl: mpsc::Receiver<CtrlMsg>,
     tx_event: mpsc::Sender<Event>,
 ) {
+    // The validator proof is already set on the behaviour before run() is called
+    // (see set_proof above), so it will be sent on every ConnectionEstablished.
+
     if let Err(e) = swarm.listen_on(config.listen_addr.clone()) {
         error!("Error listening on {}: {e}", config.listen_addr);
         return;
@@ -289,10 +478,11 @@ async fn run(
         };
     }
 
-    // Timer to periodically try reconnecting to persistent peers
+    // Timer to perform periodic network operations (peer reconnection, metrics updates, etc.)
     // TODO: Using 1 second for now, for faster reconnection during testing
     // Maybe adjust via config in the future
-    let mut persistent_peer_timer = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut periodic_timer = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut periodic_tick_count: u32 = 0;
 
     loop {
         let result = tokio::select! {
@@ -324,9 +514,24 @@ async fn run(
                 handle_ctrl_msg(&mut swarm, &mut state, &config, ctrl).await
             }
 
-            _ = persistent_peer_timer.tick() => {
-                // Periodically attempt to dial bootstrap nodes
+            _ = periodic_timer.tick() => {
+                // Attempt to dial bootstrap nodes
                 state.discovery.dial_bootstrap_nodes(&swarm);
+
+                // Update peer info in State and metrics (includes gossipsub scores and mesh membership)
+                if let Some(gossipsub) = swarm.behaviour_mut().gossipsub.as_mut() {
+                    state.update_peer_info(
+                        gossipsub,
+                        Channel::consensus(),
+                        config.channel_names,
+                    );
+                }
+
+                periodic_tick_count = periodic_tick_count.wrapping_add(1);
+                if periodic_tick_count.is_multiple_of(5) {
+                    info!("Network peer state\n{}", state.format_peer_info());
+                }
+
                 ControlFlow::Continue(())
             }
         };
@@ -408,7 +613,7 @@ async fn handle_ctrl_msg(
             };
 
             let Some(channel) = state.sync_channels.remove(&request_id) else {
-                error!(%request_id, "Received Sync reply for unknown request ID");
+                debug!(%request_id, "Received Sync reply for unknown request ID");
                 return ControlFlow::Continue(());
             };
 
@@ -422,7 +627,154 @@ async fn handle_ctrl_msg(
             ControlFlow::Continue(())
         }
 
+        CtrlMsg::UpdateValidatorSet(validators) => {
+            // Process the validator set update and get peers that need score updates
+            let validator_set = validators.into_iter().collect();
+            let changed_peers = state.process_validator_set_update(validator_set);
+
+            // Update GossipSub scores for peers whose type changed
+            for (peer_id, new_score) in &changed_peers {
+                set_peer_score(swarm, *peer_id, *new_score);
+            }
+
+            // Promote newly promoted validators from ephemeral to inbound
+            for (peer_id, _) in &changed_peers {
+                state.try_prioritize_peer(*peer_id);
+            }
+
+            ControlFlow::Continue(())
+        }
+
+        CtrlMsg::ValidatorProofVerified {
+            peer_id,
+            result,
+            public_key,
+        } => {
+            let libp2p_peer_id = peer_id.to_libp2p();
+
+            // Disconnect on verification failure
+            if !result.is_valid() {
+                warn!(%peer_id, "Invalid validator proof, disconnecting peer");
+                let _ = swarm.disconnect_peer_id(libp2p_peer_id);
+                return ControlFlow::Continue(());
+            }
+
+            // If signature is valid, store the proof and check validator set membership
+            if let Some(public_key) = public_key {
+                if let Some(new_score) = state.record_verified_proof(&libp2p_peer_id, public_key) {
+                    set_peer_score(swarm, libp2p_peer_id, new_score);
+                }
+
+                // Promote newly verified validator from ephemeral to inbound
+                state.try_prioritize_peer(libp2p_peer_id);
+            }
+
+            ControlFlow::Continue(())
+        }
+
+        CtrlMsg::DumpState(reply_to) => {
+            // Build a snapshot from current state
+            let snapshot = NetworkStateDump {
+                local_node: state.local_node.clone(),
+                peers: state.peer_info.clone(),
+                validator_set: state
+                    .validator_set
+                    .iter()
+                    .cloned()
+                    .sorted_unstable_by(|a, b| a.address.cmp(&b.address))
+                    .collect(),
+                persistent_peer_ids: state
+                    .persistent_peer_ids
+                    .iter()
+                    .copied()
+                    .sorted_unstable()
+                    .collect(),
+                persistent_peer_addrs: state.persistent_peer_addrs.clone(),
+            };
+
+            if let Err(_s) = reply_to.send(snapshot) {
+                error!("Error replying to DumpState");
+            }
+
+            ControlFlow::Continue(())
+        }
+
+        CtrlMsg::UpdatePersistentPeers(op, reply_to) => {
+            let result = match op {
+                PersistentPeersOp::Add(addr) => state.add_persistent_peer(addr, swarm),
+                PersistentPeersOp::Remove(addr) => state.remove_persistent_peer(addr, swarm),
+            };
+            if reply_to.send(result).is_err() {
+                error!("Error replying to UpdatePersistentPeers");
+            }
+            ControlFlow::Continue(())
+        }
+
         CtrlMsg::Shutdown => ControlFlow::Break(()),
+    }
+}
+
+/// Set a default low score for a peer immediately upon connection
+/// This allows gossipsub to form an initial mesh before Identify completes
+fn set_default_peer_score(swarm: &mut swarm::Swarm<Behaviour>, peer_id: libp2p::PeerId) {
+    if let Some(gossipsub) = swarm.behaviour_mut().gossipsub.as_mut() {
+        let score = peer_scoring::get_default_score();
+        gossipsub.set_application_score(&peer_id, score);
+        trace!("Set default application score {score} for peer {peer_id} before Identify");
+    }
+}
+
+fn set_peer_score(swarm: &mut swarm::Swarm<Behaviour>, peer_id: libp2p::PeerId, score: f64) {
+    // Set application-specific score in gossipsub if enabled
+    if let Some(gossipsub) = swarm.behaviour_mut().gossipsub.as_mut() {
+        if gossipsub.set_application_score(&peer_id, score) {
+            debug!("Upgraded application score to {score} for peer {peer_id}");
+        }
+    }
+}
+
+/// Add a persistent peer as an explicit peer in gossipsub (if explicit peering is enabled).
+/// A node always sends and forwards messages to its explicit peers, regardless of mesh membership.
+fn add_explicit_peer_to_gossipsub(
+    swarm: &mut swarm::Swarm<Behaviour>,
+    state: &mut State,
+    peer_id: libp2p::PeerId,
+) {
+    let Some(peer_info) = state.peer_info.get_mut(&peer_id) else {
+        return;
+    };
+
+    if peer_info.peer_type.is_persistent() {
+        if let Some(gossipsub) = swarm.behaviour_mut().gossipsub.as_mut() {
+            gossipsub.add_explicit_peer(&peer_id);
+            state
+                .metrics
+                .record_explicit_peer(&peer_id, &peer_info.moniker);
+            peer_info.is_explicit = true;
+            info!("Added persistent peer {peer_id} as explicit peer in gossipsub");
+        }
+    }
+}
+
+/// Remove a persistent peer from explicit peers in gossipsub and mark the metric stale.
+fn remove_explicit_peer_from_gossipsub(
+    swarm: &mut swarm::Swarm<Behaviour>,
+    state: &mut State,
+    peer_id: &libp2p::PeerId,
+) {
+    let Some(peer_info) = state.peer_info.get_mut(peer_id) else {
+        return;
+    };
+
+    if peer_info.peer_type.is_persistent() {
+        if let Some(gossipsub) = swarm.behaviour_mut().gossipsub.as_mut() {
+            gossipsub.remove_explicit_peer(peer_id);
+            state
+                .metrics
+                .mark_explicit_peer_stale(peer_id, &peer_info.moniker);
+            peer_info.is_explicit = false;
+            info!("Removed persistent peer {peer_id} from explicit peers in gossipsub");
+        }
     }
 }
 
@@ -454,9 +806,17 @@ async fn handle_swarm_event(
             peer_id,
             connection_id,
             endpoint,
+            num_established,
             ..
         } => {
-            trace!("Connected to {peer_id} with connection id {connection_id}",);
+            trace!("Connected to {peer_id} with connection id {connection_id}");
+
+            // Set a low default score immediately for gossipsub mesh formation
+            // This will be upgraded later when Identify completes
+            if num_established.get() == 1 {
+                // Only set score on first connection to this peer
+                set_default_peer_score(swarm, peer_id);
+            }
 
             state
                 .discovery
@@ -497,6 +857,16 @@ async fn handle_swarm_event(
                 .handle_closed_connection(swarm, peer_id, connection_id);
 
             if num_established == 0 {
+                // Remove explicit peer before removing peer_info (needs peer_info to exist)
+                if config.gossipsub.enable_explicit_peering {
+                    remove_explicit_peer_from_gossipsub(swarm, state, &peer_id);
+                }
+                if let Some(peer_info) = state.peer_info.remove(&peer_id) {
+                    state.metrics.free_slot(&peer_id, &peer_info);
+                }
+                // Also clean up any pending proof (proof verified before Identify completed)
+                state.pending_verified_proofs.remove(&peer_id);
+
                 if let Err(e) = tx_event
                     .send(Event::PeerDisconnected(PeerId::from_libp2p(&peer_id)))
                     .await
@@ -517,9 +887,9 @@ async fn handle_swarm_event(
                 peer_id,
                 info,
             } => {
-                trace!(
-                    "Received identity from {peer_id}: protocol={:?}",
-                    info.protocol_version
+                info!(
+                    "Received identity from {peer_id}: protocol={:?} agent={:?}",
+                    info.protocol_version, info.agent_version
                 );
 
                 if info.protocol_version == config.protocol_names.consensus {
@@ -534,6 +904,18 @@ async fn handle_swarm_event(
                         peer_id,
                         info.clone(),
                     );
+
+                    // Update peer info in State and metrics, set peer score in gossipsub
+                    let score = state.update_peer(peer_id, connection_id, &info);
+                    set_peer_score(swarm, peer_id, score);
+
+                    // Promote high-value peer (validator/persistent) from ephemeral to inbound
+                    state.try_prioritize_peer(peer_id);
+
+                    // If enabled, add persistent peers as explicit peers for guaranteed delivery
+                    if config.gossipsub.enable_explicit_peering {
+                        add_explicit_peer_to_gossipsub(swarm, state, peer_id);
+                    }
 
                     if !is_already_connected {
                         if let Err(e) = tx_event
@@ -580,6 +962,10 @@ async fn handle_swarm_event(
 
         SwarmEvent::Behaviour(NetworkEvent::Sync(event)) => {
             return handle_sync_event(event, metrics, swarm, state, tx_event).await;
+        }
+
+        SwarmEvent::Behaviour(NetworkEvent::ValidatorProof(event)) => {
+            return handle_validator_proof_event(event, tx_event).await;
         }
 
         SwarmEvent::Behaviour(NetworkEvent::Discovery(network_event)) => {
@@ -751,32 +1137,34 @@ async fn handle_sync_event(
                 } => {
                     state.sync_channels.insert(request_id, channel);
 
-                    let _ = tx_event
+                    if let Err(e) = tx_event
                         .send(Event::Sync(sync::RawMessage::Request {
                             request_id,
                             peer: PeerId::from_libp2p(&peer),
                             body: request.0,
                         }))
                         .await
-                        .map_err(|e| {
-                            error!("Error sending Sync request to handle: {e}");
-                        });
+                    {
+                        error!("Error sending Sync request to handle: {e}");
+                        return ControlFlow::Break(());
+                    }
                 }
 
                 libp2p::request_response::Message::Response {
                     request_id,
                     response,
                 } => {
-                    let _ = tx_event
+                    if let Err(e) = tx_event
                         .send(Event::Sync(sync::RawMessage::Response {
                             request_id,
                             peer: PeerId::from_libp2p(&peer),
                             body: response.0,
                         }))
                         .await
-                        .map_err(|e| {
-                            error!("Error sending Sync response to handle: {e}");
-                        });
+                    {
+                        error!("Error sending Sync response to handle: {e}");
+                        return ControlFlow::Break(());
+                    }
                 }
             }
 
@@ -787,7 +1175,55 @@ async fn handle_sync_event(
 
         sync::Event::OutboundFailure { .. } => ControlFlow::Continue(()),
 
-        sync::Event::InboundFailure { .. } => ControlFlow::Continue(()),
+        sync::Event::InboundFailure {
+            request_id,
+            peer,
+            error,
+            ..
+        } => {
+            debug!(%request_id, %peer, ?error, "Inbound sync request failed");
+            state.sync_channels.remove(&request_id);
+            ControlFlow::Continue(())
+        }
+    }
+}
+
+async fn handle_validator_proof_event(
+    event: validator_proof::Event,
+    tx_event: &mpsc::Sender<Event>,
+) -> ControlFlow<()> {
+    match event {
+        validator_proof::Event::ProofReceived { peer, proof_bytes } => {
+            // Forward to engine for verification
+            if let Err(e) = tx_event
+                .send(Event::ValidatorProofReceived {
+                    peer_id: PeerId::from_libp2p(&peer),
+                    proof_bytes,
+                })
+                .await
+            {
+                error!("Error sending ValidatorProofReceived to handle: {e}");
+                return ControlFlow::Break(());
+            }
+
+            ControlFlow::Continue(())
+        }
+
+        validator_proof::Event::ProofSent { peer } => {
+            debug!(%peer, "Validator proof sent successfully");
+            ControlFlow::Continue(())
+        }
+
+        validator_proof::Event::ProofSendFailed { peer, error } => {
+            debug!(%peer, %error, "Failed to send validator proof");
+            ControlFlow::Continue(())
+        }
+
+        validator_proof::Event::ProofReceiveFailed { .. } => {
+            // This is handled directly by behaviour (closes connection via ToSwarm::CloseConnection)
+            // and should never be emitted as an event to the swarm
+            unreachable!("ProofReceiveFailed is handled by behaviour, not emitted")
+        }
     }
 }
 
@@ -803,5 +1239,50 @@ impl PeerIdExt for PeerId {
 
     fn from_libp2p(peer_id: &libp2p::PeerId) -> Self {
         Self::from_bytes(&peer_id.to_bytes()).expect("valid PeerId")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn handle_validator_proof_event_breaks_when_event_receiver_dropped() {
+        let (tx_event, rx_event) = mpsc::channel::<Event>(1);
+        drop(rx_event);
+
+        let event = validator_proof::Event::ProofReceived {
+            peer: libp2p::PeerId::random(),
+            proof_bytes: Bytes::new(),
+        };
+
+        let result = handle_validator_proof_event(event, &tx_event).await;
+        assert!(matches!(result, ControlFlow::Break(())));
+    }
+
+    #[tokio::test]
+    async fn handle_validator_proof_event_forwards_proof_and_continues() {
+        let (tx_event, mut rx_event) = mpsc::channel::<Event>(1);
+
+        let peer = libp2p::PeerId::random();
+        let event = validator_proof::Event::ProofReceived {
+            peer,
+            proof_bytes: Bytes::from_static(b"proof"),
+        };
+
+        let result = handle_validator_proof_event(event, &tx_event).await;
+        assert!(matches!(result, ControlFlow::Continue(())));
+
+        let forwarded = rx_event.recv().await.expect("event forwarded to engine");
+        match forwarded {
+            Event::ValidatorProofReceived {
+                peer_id,
+                proof_bytes,
+            } => {
+                assert_eq!(peer_id, PeerId::from_libp2p(&peer));
+                assert_eq!(proof_bytes.as_ref(), b"proof");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }

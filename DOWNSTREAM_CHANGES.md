@@ -1,5 +1,134 @@
 # 1Money downstream changes
 
+## v0.7.0 integration checkpoint
+
+Phase 2 starts from the merged rc.3 reconciliation and preserves two distinct Circle ancestry checkpoints:
+
+| Role | Repository and exact commit |
+| --- | --- |
+| 1Money phase-1 fork | `1Money-Co/malachite@6f544d7efca221ee8e7d2da9af37795ed6745f99` |
+| Circle v0.7 implementation | `circlefin/malachite@5cd137fb158fc52b55044eee9b090fd0d34996b0` |
+| Circle v0.7 release | `circlefin/malachite@32abf3cf952bb5fe03de914435e902a782632b59` |
+| Circle crate rename | `circlefin/malachite@8d8c224c53e095f1f10ab575e0711ecc8168bf51` |
+
+The implementation commit is merged and reconciled first. It already contains the `arc-malachitebft-*` crate
+rename. The release commit is merged only after the implementation candidate is stable; its delta promotes
+`0.7.0-pre` packages to `0.7.0` and stamps release metadata. Neither checkpoint by itself retires a downstream
+invariant or qualifies Emerald.
+
+The exact Malachite code candidate for Emerald is
+`2001721ef3c67ef7588b776dadb2dc4862c6ffb3`. It includes the final review fix that makes builder startup
+transactional: a failed default-actor spawn stops and awaits every default actor already created, in reverse
+dependency order, without stopping caller-owned custom actors. The evidence-only documentation commit that follows
+this record is not part of the code candidate.
+
+### v0.7 behavior inventory
+
+Evidence IDs below resolve to the exact commands and results in the checkpoint evidence section.
+
+| Behavior | Circle input | Phase-1 behavior | Decision | Evidence | Gate |
+| --- | --- | --- | --- | --- | --- |
+| `builder-lifecycle` | `b24e55c8`, `18915cd8` | `Node` actor order | Retain order/errors | V7-E1 | V7-G1 |
+| `arc-package-identity` | `8d8c224c` | `informalsystems-*` names | Adopt `arc-*`; keep aliases | V7-E2 | V7-G2 |
+| `signer-verifier-split` | `ba1e4217`, `133d78eb` | combined provider | Adopt split; retain bytes | V7-E3 | V7-G3 |
+| `validator-proof-protocol` | `b6f55de4` | no proof protocol | Adopt static peer binding | V7-E4 | V7-G4 |
+| `height-parameters` | `155a1fc7`, `d2fc6f47` | engine-owned values | Adopt app callbacks | Emerald | V7-G5 |
+| `sync-queue-scoring` | `1b2a15b2`, `628d8cff`, `5cd137fb` | fork queues | Require parity | V7-E5 | V7-G6 |
+| `proposal-part-forwarding` | `3e41a306` | trait part signing | Preserve app authentication | Emerald | V7-G7 |
+| `wal-polka-certificate` | `8ee5d998` | tags `0x01`, `0x02`, `0x04` | Add `0x08`; read old | V7-E6 | V7-G8 |
+| `wal-immediate-replay` | `3c264593` | immediate replay | Reject delay; remove wait phase | V7-E6 | V7-G9 |
+| `wal-feature-matrix` | none | raw fixtures assume raw rewrites | Test raw/forced modes | V7-E7 | V7-G10 |
+
+### Replacement inputs and phase-1 retention
+
+Circle `628d8cff` ports later sync-queue behavior, `8ee5d998` ports downstream WAL and recovery work, and `5cd137fb`
+fixes concurrent sync-height rewind. They are replacement inputs, not evidence that the phase-1 implementation can
+be deleted. The following map keeps each rc.3 row active until its named test passes on the merged candidate.
+
+| Phase-1 behavior | v0.7 replacement | Status | Required retained evidence |
+| --- | --- | --- | --- |
+| `ecdsa-signing-and-serialization` | upstream ECDSA plus split traits | Passed | four known-answer tests |
+| `sync-response-size-bound` | v0.7 response validation | Passed T5 | exact send/receive byte bounds |
+| `sync-inflight-and-pending-accounting` | queued ranges and `sync_height` | Passed T5 | combined allowance |
+| `sync-restored-height-startup` | upstream start-height flow | Passed T5 | status/tick startup ordering |
+| `sync-delayed-stale-and-partial-responses` | `628d8cff`, `5cd137fb` | Passed T5 | complete lifecycle matrix |
+| `sync-capacity-diagnostics` | upstream metrics and queue state | Passed T5 | one-snapshot diagnostic fields |
+| `sync-network-subscription-order` | v0.7 builder wiring | Retained | builder order audit |
+| `consensus-sync-input-queue` | v0.7 consensus input queue | Passed T5 | bounded sync-first isolation |
+| `consensus-request-errors` | v0.7 app channel | Passed | `Closed`, `Full`, and `Recv` tests |
+| `wal-entry-height` | `8ee5d998` | Passed T6 | old fixtures and height regression |
+| `wal-same-height-no-replay` | `8ee5d998` | Passed T6 | same-height reply test |
+| `sync-peer-restart-recovery` | `628d8cff`, `5cd137fb` | Passed T5 | peer-restart integration scenario |
+| `decided-reply-async-forwarding` | v0.7 builder/app channel | Retained | async path and dropped-reply log |
+| `rc3-logging-context` | v0.7 logging changes | Partial | severity, context, and control-flow audit |
+
+### v0.7 checkpoint evidence
+
+- **V7-E1 — builder and request lifecycle:** `cargo test -p arc-malachitebft-app-channel` passed all 3 builder
+  tests, all 3 `consensus_request` tests, and its library target. The startup rollback regression forces sync spawn
+  to fail after network, WAL, host, and consensus startup, then proves the default network listener is stopped before
+  `build()` returns. The builder tracks and rolls back only default actors; caller-owned custom actors remain live.
+- **V7-E2 — package identity and release ancestry:** `cargo metadata --no-deps --format-version 1` reported every
+  `arc-malachitebft-*` workspace package at `0.7.0`; `rg '0.7.0-pre' Cargo.toml Cargo.lock` found none.
+  `cargo check --workspace --all-targets --all-features` passed. Merge `12483bfc` has first parent `c78247db` and
+  second parent Circle release `32abf3cf`; both `5cd137fb` and `32abf3cf` are ancestors of the candidate.
+- **V7-E3 — signing:** `cargo test -p arc-malachitebft-signing-ecdsa --all-features --test known_answers` passed
+  all 4 known-answer and mutation-rejection tests.
+- **V7-E4 — validator proofs:** `cargo test -p arc-malachitebft-network` passed all 54 state, classification,
+  anti-spam, and reconnect tests. After registering the retained proof module,
+  `cargo test -p arc-malachitebft-test --test unit validator_proof` passed 7/7 preimage, round-trip, mismatch,
+  tamper, and malformed-key cases; the complete unit target then passed 94/94.
+- **V7-E5 — sync queue and recovery:** `cargo test -p arc-malachitebft-test --test unit sync_lifecycle` passed all
+  10 lifecycle cases;
+  `cargo nextest run -p arc-malachitebft-test --test it value_sync --retries 0 --test-threads 1` passed all 18
+  value-sync scenarios with 65 filtered and no retry; and `cargo test -p arc-malachitebft-sync --lib` passed 45 tests
+  with one scoring test ignored. The candidate validates the original response envelope before trimming an obsolete
+  prefix, keeps wrong-peer and unknown replies from consuming the real request, tracks inflight and exact
+  consensus-pending ranges from one snapshot, and retries a locally rejected height without penalizing its peer or
+  discarding the remaining buffered response.
+- **V7-E6 — WAL codec and recovery:** the `wal_codec` and `wal_compatibility` unit filters each passed 6 tests;
+  the serial WAL suite passed all 7 enabled scenarios with 76 filtered and no retry; and the config crate passed all
+  15 tests. Recovery replays a
+  non-empty validator WAL before notifying sync, while empty WALs and full nodes start without replay. The `0x08`
+  polka-certificate entry fixture has SHA-256
+  `252be25c27c1ee934f606a80b38f6effda7902b0eaaaa7920c9ae96275f9bf50`. A detached worktree at phase-1 commit
+  `6f544d7efca221ee8e7d2da9af37795ed6745f99` proved its old decoder rejects that fixture with `invalid tag` and
+  leaves the WAL bytes and hash unchanged. Legacy `wal_replay_delay` TOML is ignored and has no runtime effect.
+- **V7-E7 — WAL feature matrix:** package-default, explicit `wal-force-compression`, and workspace `--all-features`
+  `wal_compatibility` nextest runs each passed 6/6. The checked-in phase-1 fixture paths and hashes were unchanged.
+- **V7-E8 — complete development gate:** `cargo build --workspace --all-features` passed. Outside the restricted
+  sandbox, the final candidate's `make tests` passed 530/530 main tests with 13 intentional skips, then 13/13
+  discovery tests with one intentional skip. One discovery topology case crossed its 30-second threshold on its
+  first attempt, passed its configured retry in 29.05 seconds, and passed a separate no-retry run in 29.03 seconds.
+  `cargo check --workspace --all-targets --all-features`, `cargo clippy --tests -- -D warnings`, and
+  `cargo +nightly fmt --all --check` passed.
+- **V7-E9 — branch audit:** `git diff --check origin/main...HEAD` passed; no phase-1 fixture path changed; no
+  `informalsystems-malachitebft` package name remains in a manifest or lockfile; and the lockfile resolves reviewed
+  `0.7.0` workspace manifests.
+
+The first sandboxed `make tests` attempt was stopped after 325/330 completed tests passed and five networked
+byzantine cases timed out. The required unrestricted rerun passed those same cases in 1–3 seconds and completed the
+entire main and discovery matrices. This development evidence does not include Phase-1 Emerald qualification,
+Emerald integration, mixed-version rolling validation, deployment, or production readiness. Phase-1 testing remains
+parallel work, and the Phase-2 pull request must not merge before its linked evidence and explicit human approval.
+
+### v0.7 retirement gates
+
+- **V7-G1:** validator/full-node construction, startup failure, actor ordering, and shutdown pass through the builder.
+- **V7-G2:** all workspace crates use `arc-malachitebft-*`; downstream aliases resolve one reviewed revision.
+- **V7-G3:** fixed ECDSA keys, addresses, signatures, JSON, and protobuf bytes remain unchanged.
+- **V7-G4:** proof preimage, validation, unknown-key storage, promotion/demotion, duplicate, and reconnect pass.
+- **V7-G5:** every height start/restart carries the intended validator set, timeouts, and target time.
+- **V7-G6:** every phase-1 sync lifecycle and peer-restart scenario passes on the v0.7 queue without retry.
+- **V7-G7:** Emerald authenticates local, forwarded, mixed-path, hidden-lock, and restreamed proposal content.
+- **V7-G8:** old WALs read; `0x08` round-trips and restarts; an old decoder rejects it without mutation.
+- **V7-G9:** a non-empty validator WAL always replays before sync can change the crash height.
+- **V7-G10:** raw mode preserves fixture bytes and forced compression preserves decoded entries and replay behavior.
+
+Phase-1 Emerald qualification runs in parallel. Phase-2 pull requests may be opened while it runs, but they must not
+merge without a linked record naming exact revisions, environment, scenarios, results, limitations, and explicit
+human approval or a documented override.
+
 ## rc.3 reconciliation baseline
 
 The first phase of the staged Emerald migration develops from the current 1Money fork while qualifying compatibility

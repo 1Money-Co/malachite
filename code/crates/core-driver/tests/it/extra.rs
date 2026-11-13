@@ -1,10 +1,16 @@
+use futures::executor::block_on;
 use malachitebft_core_state_machine::state::State;
-use malachitebft_core_types::{Round, Validity};
+use malachitebft_core_types::{
+    CommitCertificate, Context, NilOrVal, Round, ThresholdParams, Validity,
+};
+use malachitebft_signing::{Signer, VerifierExt};
 
-use malachitebft_test::utils::validators::make_validators;
-use malachitebft_test::{Height, Proposal, TestContext, ValidatorSet, Value};
+use malachitebft_test::utils::validators::{make_validators, make_validators_seeded};
+use malachitebft_test::{Ed25519Signer, Height, Proposal, TestContext, ValidatorSet, Value};
 
-use informalsystems_malachitebft_core_driver::{Driver, Input, Output};
+use arc_malachitebft_core_driver::{Driver, Input, Output};
+
+use malachitebft_core_state_machine::state::Step;
 
 use crate::utils::*;
 
@@ -2119,78 +2125,6 @@ fn driver_step_change_mux_with_proposal_and_polka() {
 }
 
 #[test]
-fn driver_step_change_mux_with_proposal_and_commit_quorum() {
-    let value: Value = Value::new(9999);
-
-    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
-    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
-
-    let height = Height::new(1);
-    let ctx = TestContext::new();
-    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
-
-    let proposal = Proposal::new(
-        Height::new(1),
-        Round::new(1),
-        value.clone(),
-        Round::Nil,
-        v1.address,
-    );
-
-    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
-
-    let steps = vec![
-        TestStep {
-            desc: "Start round 0, we, v3, are not the proposer, start timeout propose",
-            input: new_round_input(Round::new(0), v1.address),
-            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
-            expected_round: Round::new(0),
-            new_state: propose_state(Round::new(0)),
-        },
-        TestStep {
-            desc: "Receive proposal for round 1, store",
-            input: proposal_input(
-                Round::new(1),
-                value.clone(),
-                Round::Nil,
-                Validity::Valid,
-                v1.address,
-            ),
-            expected_outputs: vec![],
-            expected_round: Round::new(0),
-            new_state: propose_state(Round::new(0)),
-        },
-        TestStep {
-            desc: "v1 precommits value for round 1",
-            input: precommit_input_at(Round::new(1), value.clone(), &v1.address),
-            expected_outputs: vec![],
-            expected_round: Round::new(0),
-            new_state: propose_state(Round::new(0)),
-        },
-        TestStep {
-            desc: "v2 precommits value for round 1, we hit f+1 threshold, move to round 1",
-            input: precommit_input_at(Round::new(1), value.clone(), &v2.address),
-            expected_outputs: vec![new_round_output(Round::new(1))],
-            expected_round: Round::new(1),
-            new_state: new_round(Round::new(1)),
-        },
-        TestStep {
-            desc:
-                "Start round 1, change step to propose, start propose timer, mux proposal, decide",
-            input: new_round_input(Round::new(1), v2.address),
-            expected_outputs: vec![
-                start_propose_timer_output(Round::new(1)),
-                decide_output(Round::new(1), proposal),
-            ],
-            expected_round: Round::new(1),
-            new_state: decided_state(Round::new(1), Round::new(1), value),
-        },
-    ];
-
-    run_steps(&mut driver, steps);
-}
-
-#[test]
 fn proposal_mux_with_polka() {
     let value: Value = Value::new(9999);
 
@@ -2336,14 +2270,1989 @@ fn proposal_mux_with_commit_quorum() {
     run_steps(&mut driver, steps);
 }
 
+// Test for bug with incorrect precommit when receiving proposal after polka for different value
+// Scenario: Process receives polka for value v, then receives proposal for different value v'
+// while in prevote step, and would incorrectly precommits v'.
+//
+// Ev:             NewRound(0)           Timeout(propose)          <polka(v)>               Proposal(v')
+// State: NewRound ------------> Propose ----------------> Prevote ------------> Prevote ---------------> Precommit
+// Msg:            propose_timer         Prevote(nil)              None                   Precommit(v')
+#[test]
+fn no_precommit_after_polka_and_proposal_different_values() {
+    let value_v = Value::new(9999);
+    let value_v_prime = Value::new(8888);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Timeout propose expires, prevote nil (v3)",
+            input: timeout_propose_input(Round::new(0)),
+            expected_outputs: vec![prevote_nil_output(Round::new(0), &my_addr)],
+            expected_round: Round::new(0),
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v1 prevotes value v",
+            input: prevote_input(value_v.clone(), &v1.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v2 prevotes value v, we get +2/3 prevotes (polka for v), start prevote timer",
+            input: prevote_input(value_v.clone(), &v2.address),
+            expected_outputs: vec![start_prevote_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Receive proposal for different value v', no output, stay in prevote",
+            input: proposal_input(
+                Round::new(0),
+                value_v_prime.clone(),
+                Round::Nil,
+                Validity::Valid,
+                v1.address,
+            ),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: prevote_state(Round::new(0)),
+            // Former incorrect behavior:
+            // expected_outputs: vec![precommit_output(Round::new(0), value_v_prime.clone(), &my_addr)],
+            // new_state: precommit_state_with_proposal_and_locked_and_valid(
+            //      Round::new(0),
+            //      Proposal::new(
+            //          Height::new(1),
+            //          Round::new(0),
+            //          value_v_prime.clone(),
+            //          Round::Nil,
+            //          v1.address,
+            //      )
+            // )
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// Test for bug with incorrect valid value update when receiving proposal after polka for different value
+// Scenario: Process receives polka for value v, moves to precommit (with nil),
+// then receives proposal for different value v' and would incorrectly updates valid value to v'
+//
+// Ev:             NewRound(0)           Timeout(propose)          <polka(v)>               Timeout(prevote)            Proposal(v')
+// State: NewRound ------------> Propose ----------------> Prevote ------------> Prevote -----------------> Precommit -----------> Precommit
+// Msg:            propose_timer         Prevote(nil)              prevote_timer         Precommit(nil)               None
+#[test]
+fn no_valid_update_after_polka_and_proposal_different_values() {
+    let value_v = Value::new(9999);
+    let value_v_prime = Value::new(8888);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Timeout propose expires, prevote nil (v3)",
+            input: timeout_propose_input(Round::new(0)),
+            expected_outputs: vec![prevote_nil_output(Round::new(0), &my_addr)],
+            expected_round: Round::new(0),
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v1 prevotes value v",
+            input: prevote_input(value_v.clone(), &v1.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v2 prevotes value v, we get +2/3 prevotes (polka for v), start prevote timer",
+            input: prevote_input(value_v.clone(), &v2.address),
+            expected_outputs: vec![start_prevote_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Timeout prevote expires, precommit nil since no proposal was received",
+            input: timeout_prevote_input(Round::new(0)),
+            expected_outputs: vec![precommit_nil_output(Round::new(0), &my_addr)],
+            expected_round: Round::new(0),
+            new_state: precommit_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Receive proposal for different value v', stays in precommit, no valid update",
+            input: proposal_input(
+                Round::new(0),
+                value_v_prime.clone(),
+                Round::Nil,
+                Validity::Valid,
+                v1.address,
+            ),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: precommit_state(Round::new(0)),
+            // Former incorrect behavior:
+            // new_state: precommit_state_with_proposal_and_valid(
+            //     Round::new(0),
+            //     Round::new(0),
+            //     Proposal::new(
+            //         Height::new(1),
+            //         Round::new(0),
+            //         value_v_prime.clone(),
+            //         Round::Nil,
+            //         v1.address,
+            //     )
+            // )
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// Test for incorrect prevote when receiving proposal with POL round after having polka for different value
+// Scenario: Process receives polka for value v in round r, moves to round r' > r,
+// then receives proposal for different value v' with POL round r and incorrectly prevotes v'
+//
+// Ev:             NewRound(0)           <polka(v)>            <f+1 for round 1>            NewRound(1)              Proposal(v', pol=0)
+// State: NewRound ------------> Propose ------------> Propose -----------------> NewRound ------------> Propose -----------------------> Prevote
+// Msg:            propose_timer                                  new_round(1)              propose_timer            Prevote(v')
+#[test]
+fn no_prevote_for_proposal_with_polka_for_different_value() {
+    let value_v = Value::new(9999);
+    let value_v_prime = Value::new(8888);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v1 prevotes value v in round 0",
+            input: prevote_input(value_v.clone(), &v1.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v2 prevotes value v in round 0, we get +2/3 prevotes (polka for v)",
+            input: prevote_input(value_v.clone(), &v2.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v2 sends vote for round 1, we get f+1 votes, move to round 1",
+            input: prevote_input_at(Round::new(1), Value::new(7777), &v2.address),
+            expected_outputs: vec![new_round_output(Round::new(1))],
+            expected_round: Round::new(1),
+            new_state: new_round(Round::new(1)),
+        },
+        TestStep {
+            desc: "Start round 1, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(1), v2.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(1))],
+            expected_round: Round::new(1),
+            new_state: propose_state(Round::new(1)),
+        },
+        TestStep {
+            desc: "Receive proposal for v' with POL round 0, stays in propose, no vote",
+            input: proposal_input(
+                Round::new(1),
+                value_v_prime.clone(),
+                Round::new(0),
+                Validity::Valid,
+                v2.address,
+            ),
+            expected_round: Round::new(1),
+            expected_outputs: vec![],
+            new_state: propose_state(Round::new(1)),
+            // Former incorrect behavior:
+            // expected_outputs: vec![prevote_output(Round::new(1), value_v_prime.clone(), &my_addr)],
+            // new_state: prevote_state(Round::new(1)),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// Alternative test using polka certificate instead of individual votes
+#[test]
+fn no_prevote_for_proposal_with_polka_for_different_value_via_certificate() {
+    let value_v = Value::new(9999);
+    let value_v_prime = Value::new(8888);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Receive polka certificate for value v in round 0",
+            input: polka_certificate_input_at(
+                Round::new(0),
+                value_v.clone(),
+                &[v1.address, v2.address],
+            ),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v2 sends vote for round 1, we get f+1 votes, move to round 1",
+            input: prevote_input_at(Round::new(1), Value::new(7777), &v2.address),
+            expected_outputs: vec![new_round_output(Round::new(1))],
+            expected_round: Round::new(1),
+            new_state: new_round(Round::new(1)),
+        },
+        TestStep {
+            desc: "Start round 1, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(1), v2.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(1))],
+            expected_round: Round::new(1),
+            new_state: propose_state(Round::new(1)),
+        },
+        TestStep {
+            desc: "Receive proposal for v' with POL round 0, stays in propose, no vote",
+            input: proposal_input(
+                Round::new(1),
+                value_v_prime.clone(),
+                Round::new(0),
+                Validity::Valid,
+                v2.address,
+            ),
+            expected_round: Round::new(1),
+            expected_outputs: vec![],
+            new_state: propose_state(Round::new(1)),
+            // Former incorrect behavior:
+            // expected_outputs: vec![prevote_output(Round::new(1), value_v_prime.clone(), &my_addr)],
+            // new_state: prevote_state(Round::new(1)),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// Test for incorrect prevote nil when receiving invalid proposal with POL round after having polka
+// Scenario: Process receives polka for value v in round r, moves to round r' > r,
+// then receives invalid proposal for different value v' with POL round r and incorrectly prevotes nil
+//
+// Ev:             NewRound(0)           <polka(v)>               <f+1 for round 1>            NewRound(1)              Invalid Proposal(v', pol=0)
+// State: NewRound ------------> Propose ------------> Propose -----------------> NewRound ------------> Propose ---------------------------> Prevote
+// Msg:            propose_timer                                  new_round(1)             propose_timer                 Prevote(nil)
+#[test]
+fn no_prevote_for_invalid_proposal_with_polka_for_different_value() {
+    let value_v = Value::new(9999);
+    let value_v_prime = Value::new(8888);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v1 prevotes value v in round 0",
+            input: prevote_input(value_v.clone(), &v1.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v2 prevotes value v in round 0, we get +2/3 prevotes (polka for v)",
+            input: prevote_input(value_v.clone(), &v2.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v2 sends vote for round 1, we get f+1 votes, move to round 1",
+            input: prevote_input_at(Round::new(1), Value::new(7777), &v2.address),
+            expected_outputs: vec![new_round_output(Round::new(1))],
+            expected_round: Round::new(1),
+            new_state: new_round(Round::new(1)),
+        },
+        TestStep {
+            desc: "Start round 1, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(1), v2.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(1))],
+            expected_round: Round::new(1),
+            new_state: propose_state(Round::new(1)),
+        },
+        TestStep {
+            desc: "Receive invalid proposal for v' with POL round 0, stays in propose, no vote",
+            input: proposal_input(
+                Round::new(1),
+                value_v_prime.clone(),
+                Round::new(0),
+                Validity::Invalid, // Invalid proposal
+                v2.address,
+            ),
+            expected_round: Round::new(1),
+            expected_outputs: vec![],
+            new_state: propose_state(Round::new(1)),
+            // Former incorrect behavior:
+            // expected_outputs: vec![prevote_nil_output(Round::new(1), &my_addr)],
+            // new_state: prevote_state(Round::new(1)),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// Alternative test using polka certificate instead of individual votes
+#[test]
+fn no_prevote_for_invalid_proposal_with_polka_for_different_value_via_certificate() {
+    let value_v = Value::new(9999);
+    let value_v_prime = Value::new(8888);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Receive polka certificate for value v in round 0",
+            input: polka_certificate_input_at(
+                Round::new(0),
+                value_v.clone(),
+                &[v1.address, v2.address],
+            ),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v2 sends vote for round 1, we get f+1 votes, move to round 1",
+            input: prevote_input_at(Round::new(1), Value::new(7777), &v2.address),
+            expected_outputs: vec![new_round_output(Round::new(1))],
+            expected_round: Round::new(1),
+            new_state: new_round(Round::new(1)),
+        },
+        TestStep {
+            desc: "Start round 1, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(1), v2.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(1))],
+            expected_round: Round::new(1),
+            new_state: propose_state(Round::new(1)),
+        },
+        TestStep {
+            desc: "Receive invalid proposal for v' with POL round 0, stays in propose, no vote",
+            input: proposal_input(
+                Round::new(1),
+                value_v_prime.clone(),
+                Round::new(0),
+                Validity::Invalid, // Invalid proposal
+                v2.address,
+            ),
+            expected_round: Round::new(1),
+            expected_outputs: vec![],
+            new_state: propose_state(Round::new(1)),
+            // Former incorrect behavior:
+            // expected_outputs: vec![prevote_nil_output(Round::new(1), &my_addr)],
+            // new_state: prevote_state(Round::new(1)),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// It should not matter the order: first the proposal or first the polka certificate.
+// In round 0, we first receive the proposal; in round 1, we first receive the polka certificate.
+#[test]
+fn prevote_and_precommit_upon_proposal_and_polka_cert() {
+    let value_v = Value::new(9999);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let proposal0 = Proposal::new(
+        Height::new(1),
+        Round::new(0),
+        value_v.clone(),
+        Round::Nil,
+        v2.address,
+    );
+
+    let proposal1 = Proposal::new(
+        Height::new(1),
+        Round::new(1),
+        value_v.clone(),
+        Round::Nil,
+        v2.address,
+    );
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Receive proposal for v, prevote(0,v)",
+            input: proposal_input(
+                Round::new(0),
+                value_v.clone(),
+                Round::Nil,
+                Validity::Valid,
+                v2.address,
+            ),
+            expected_round: Round::new(0),
+            expected_outputs: vec![prevote_output(Round::new(0), value_v.clone(), &my_addr)],
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Receive polka certificate for v at round 0, precommit",
+            input: polka_certificate_input_at(
+                Round::new(0),
+                value_v.clone(),
+                &[v1.address, v2.address],
+            ),
+            expected_outputs: vec![precommit_output(Round::new(0), value_v.clone(), &my_addr)],
+            expected_round: Round::new(0),
+            new_state: precommit_state_with_proposal_and_locked_and_valid(
+                Round::new(0),
+                proposal0.clone(),
+            ),
+        },
+        TestStep {
+            desc: "v2 sends vote for round 1, we get f+1 votes, move to round 1",
+            input: prevote_input_at(Round::new(1), value_v.clone(), &v2.address),
+            expected_outputs: vec![new_round_output(Round::new(1))],
+            expected_round: Round::new(1),
+            new_state: new_round_with_proposal_and_locked_and_valid(
+                Round::new(1),
+                proposal0.clone(),
+            ),
+        },
+        TestStep {
+            desc: "Start round 1, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(1), v2.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(1))],
+            expected_round: Round::new(1),
+            new_state: propose_state_with_proposal_and_locked_and_valid(
+                Round::new(1),
+                proposal0.clone(),
+            ),
+        },
+        TestStep {
+            desc: "Receive polka certificate for v at round 1, do nothing right now",
+            input: polka_certificate_input_at(
+                Round::new(1),
+                value_v.clone(),
+                &[v1.address, v2.address],
+            ),
+            expected_outputs: vec![],
+            expected_round: Round::new(1),
+            new_state: propose_state_with_proposal_and_locked_and_valid(
+                Round::new(1),
+                proposal0.clone(),
+            ),
+        },
+        TestStep {
+            desc: "Receive proposal for v at round 1, prevote and precommit",
+            input: proposal_input(
+                Round::new(1),
+                value_v.clone(),
+                Round::Nil,
+                Validity::Valid,
+                v1.address,
+            ),
+            expected_round: Round::new(1),
+            expected_outputs: vec![
+                prevote_output(Round::new(1), value_v.clone(), &my_addr),
+                precommit_output(Round::new(1), value_v.clone(), &my_addr),
+            ],
+            new_state: precommit_state_with_proposal_and_locked_and_valid(Round::new(1), proposal1),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// Upon receiving 2f + 1 prevotes for nil, a process should precommit nil once it reaches the
+// prevote step. This `PolkaNil` condition, however, can be produced during the propose step; once
+// the prevote step is reached, the pending `PolkaNil` must be consumed.
+#[test]
+fn polka_nil_and_prevote_step_precommit_nil() {
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Prevote from v2 while in propose step",
+            input: prevote_nil_input(&v2.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Prevote from v3, we have PolkaNil, not triggered in propose step",
+            input: prevote_nil_input(&v3.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Precommit from v2",
+            input: precommit_nil_input(Round::new(0), &v2.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Precommit from v3, quorum of precommits, timeout to be scheduled",
+            input: precommit_nil_input(Round::new(0), &v3.address),
+            expected_outputs: vec![start_precommit_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Timeout propose, prevote nil; since we have PolkaNil, also precommit nil",
+            input: timeout_propose_input(Round::new(0)),
+            expected_outputs: vec![
+                prevote_nil_output(Round::new(0), &my_addr),
+                precommit_nil_output(Round::new(0), &my_addr),
+            ],
+            expected_round: Round::new(0),
+            new_state: precommit_state(Round::new(0)),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// Upon receiving 2f + 1 prevotes for different values, a process should schedule a prevote timeout
+// once it reaches the prevote step. This `PolkaAny` condition, however, can be produced during the
+// propose step; once the prevote step is reached, the pending `PolkaAny` must be consumed.
+#[test]
+fn polka_any_and_prevote_step_timeout_prevote() {
+    let value = Value::new(9999);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Prevote from v2 while in propose step",
+            input: prevote_nil_input(&v2.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Prevote from v3, we have Polka, not triggered in propose step",
+            input: prevote_input_at(Round::new(0), value.clone(), &v3.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Precommit from v2",
+            input: precommit_nil_input(Round::new(0), &v2.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Precommit from v3, quorum of precommits, timeout to be scheduled",
+            input: precommit_nil_input(Round::new(0), &v3.address),
+            expected_outputs: vec![start_precommit_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Timeout propose, prevote nil; since we have PolkaAny, schedule timeout prevote",
+            input: timeout_propose_input(Round::new(0)),
+            expected_outputs: vec![
+                prevote_nil_output(Round::new(0), &my_addr),
+                start_prevote_timer_output(Round::new(0)),
+            ],
+            expected_round: Round::new(0),
+            new_state: prevote_state(Round::new(0)),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// A pending `PolkaAny` can also be produced upon receiving 2f + 1 prevotes for a value, whose
+// associated proposal is missing. This `PolkaAny` condition, however, can be produced during the
+// propose step; once the prevote step is reached, the pending `PolkaAny` must be consumed.
+#[test]
+fn polka_value_no_proposal_and_prevote_step_timeout_prevote() {
+    let value = Value::new(9999);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Prevote from v2 while in propose step",
+            input: prevote_input_at(Round::new(0), value.clone(), &v2.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Prevote from v3, we have PolkaValue(v) but not Proposal(v)",
+            input: prevote_input_at(Round::new(0), value.clone(), &v3.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Precommit from v2",
+            input: precommit_nil_input(Round::new(0), &v2.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Precommit from v3, quorum of precommits, timeout to be scheduled",
+            input: precommit_nil_input(Round::new(0), &v3.address),
+            expected_outputs: vec![start_precommit_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Timeout propose, prevote nil; since the Polka is incomplete, schedule timeout prevote",
+            input: timeout_propose_input(Round::new(0)),
+            expected_outputs: vec![
+                prevote_nil_output(Round::new(0), &my_addr),
+                start_prevote_timer_output(Round::new(0)),
+            ],
+            expected_round: Round::new(0),
+            new_state: prevote_state(Round::new(0)),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// Before actually starting round 1, a process receives 2f + 1 prevotes and 2f + 1 precomits of
+// round 1. The first event leads to a round skip. Once round 1 is started and timeout propose
+// expires, the pending `PolkaAny` event should lead to the scheduling of a timeout prevote.
+#[test]
+fn polka_any_precommit_any_future_round() {
+    let value = Value::new(9999);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Prevote from v3 in round 1",
+            input: prevote_input_at(Round::new(1), value.clone(), &v3.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Precommit from v3 in round 1",
+            input: precommit_nil_input(Round::new(1), &v3.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Precommit from v2 in round 1, we have PrecommitAny(1)",
+            input: precommit_nil_input(Round::new(1), &v2.address),
+            expected_outputs: vec![new_round_output(Round::new(1))],
+            expected_round: Round::new(1),
+            new_state: new_round(Round::new(1)),
+        },
+        TestStep {
+            desc: "Prevote from v2 in round 1, we have PolkaValue(1, v)",
+            input: prevote_input_at(Round::new(1), value.clone(), &v2.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(1),
+            new_state: new_round(Round::new(1)),
+        },
+        TestStep {
+            desc: "Start round 1 and start timeout propose and commit",
+            input: new_round_input(Round::new(1), v1.address),
+            expected_outputs: vec![
+                start_propose_timer_output(Round::new(1)),
+                start_precommit_timer_output(Round::new(1)),
+            ],
+            expected_round: Round::new(1),
+            new_state: propose_state(Round::new(1)),
+        },
+        TestStep {
+            desc: "Timeout propose, goes to prevote, start timeout prevote",
+            input: timeout_propose_input(Round::new(1)),
+            expected_outputs: vec![
+                prevote_nil_output(Round::new(1), &my_addr),
+                start_prevote_timer_output(Round::new(1)),
+            ],
+            expected_round: Round::new(1),
+            new_state: prevote_state(Round::new(1)),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// Before actually starting round 1, a process receives 2f + 1 prevotes and 2f + 1 precomits of
+// precomits of round 1. The first event leads to a round skip. Once round 1 is started and timeout
+// propose expires, the pending `PolkaNil` event should lead the process to precommit nil.
+#[test]
+fn polka_nil_precommit_any_future_round() {
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Prevote from v3 in round 1",
+            input: prevote_nil_input_at(Round::new(1), &v3.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Precommit from v3 in round 1",
+            input: precommit_nil_input(Round::new(1), &v3.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Precommit from v2 in round 1, we have PrecommitAny(1)",
+            input: precommit_nil_input(Round::new(1), &v2.address),
+            expected_outputs: vec![new_round_output(Round::new(1))],
+            expected_round: Round::new(1),
+            new_state: new_round(Round::new(1)),
+        },
+        TestStep {
+            desc: "Prevote from v2 in round 1, we have PolkaValue(1, v)",
+            input: prevote_nil_input_at(Round::new(1), &v2.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(1),
+            new_state: new_round(Round::new(1)),
+        },
+        TestStep {
+            desc: "Start round 1 and start timeout propose and commit",
+            input: new_round_input(Round::new(1), v1.address),
+            expected_outputs: vec![
+                start_propose_timer_output(Round::new(1)),
+                start_precommit_timer_output(Round::new(1)),
+            ],
+            expected_round: Round::new(1),
+            new_state: propose_state(Round::new(1)),
+        },
+        TestStep {
+            desc: "Timeout propose, goes to prevote, precommit nil",
+            input: timeout_propose_input(Round::new(1)),
+            expected_outputs: vec![
+                prevote_nil_output(Round::new(1), &my_addr),
+                precommit_nil_output(Round::new(1), &my_addr),
+            ],
+            expected_round: Round::new(1),
+            new_state: precommit_state(Round::new(1)),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// A Proposal for an invalid value in round 1 with POL round 0 is received, then a matching polka
+// certificate is received. Despite the global validation, the process should prevote nil. Before
+// that we receive a non matching polka certificate, for round 1, that should be ignored.
+#[test]
+fn proposal_invalid_value_and_matching_pol_certificate() {
+    let value_v = Value::new(9999);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v2 sends vote for round 2, we get f+1 votes, move to round 2",
+            input: prevote_input_at(Round::new(2), Value::new(7777), &v2.address),
+            expected_outputs: vec![new_round_output(Round::new(2))],
+            expected_round: Round::new(2),
+            new_state: new_round(Round::new(2)),
+        },
+        TestStep {
+            desc: "Start round 2, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(2), v2.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(2))],
+            expected_round: Round::new(2),
+            new_state: propose_state(Round::new(2)),
+        },
+        TestStep {
+            desc: "Receive invalid proposal for v with POL round 0, stays in propose, no vote",
+            input: proposal_input(
+                Round::new(2),
+                value_v.clone(),
+                Round::new(0),
+                Validity::Invalid,
+                v2.address,
+            ),
+            expected_round: Round::new(2),
+            expected_outputs: vec![],
+            new_state: propose_state(Round::new(2)),
+        },
+        TestStep {
+            desc: "Receive a Polka for v in round 1, ignore",
+            input: polka_certificate_input_at(
+                Round::new(1),
+                value_v.clone(),
+                &[v1.address, v2.address],
+            ),
+            expected_round: Round::new(2),
+            expected_outputs: vec![],
+            new_state: propose_state(Round::new(2)),
+        },
+        TestStep {
+            desc: "Receive a Polka for v in round 0, prevote nil",
+            input: polka_certificate_input_at(
+                Round::new(0),
+                value_v.clone(),
+                &[v1.address, v2.address],
+            ),
+            expected_round: Round::new(2),
+            expected_outputs: vec![prevote_nil_output(Round::new(2), &my_addr)],
+            new_state: prevote_state(Round::new(2)),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// A node receives a proposal that is reported as Invalid by the application. Then, for instance,
+// after a bug fix, the same proposal is reported as Valid. From this point, it can be decided.
+#[test]
+fn invalid_proposal_becomes_valid_decision_via_proposal() {
+    let value_v = Value::new(9999);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let proposal = Proposal::new(
+        Height::new(1),
+        Round::new(0),
+        value_v.clone(),
+        Round::Nil,
+        v2.address,
+    );
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Timeout propopse, prevote nil",
+            input: timeout_propose_input(Round::new(0)),
+            expected_outputs: vec![prevote_nil_output(Round::new(0), &my_addr)],
+            expected_round: Round::new(0),
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v1 precommits v",
+            input: precommit_input(Round::new(0), value_v.clone(), &v1.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v2 precommits v, we get +2/3 but no proposal",
+            input: precommit_input(Round::new(0), value_v.clone(), &v2.address),
+            expected_round: Round::new(0),
+            expected_outputs: vec![start_precommit_timer_output(Round::new(0))],
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Receive a Proposal for v, which is deemed Invalid",
+            input: proposal_input_from_proposal(proposal.clone(), Validity::Invalid),
+            expected_round: Round::new(0),
+            expected_outputs: vec![],
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Receive again a Proposal for v, still Invalid, duplicated",
+            input: proposal_input_from_proposal(proposal.clone(), Validity::Invalid),
+            expected_round: Round::new(0),
+            expected_outputs: vec![],
+            new_state: prevote_state(Round::new(0)),
+        },
+        // Assume here that the process crashed, and the validation function was updated.
+        TestStep {
+            desc: "Receive a Proposal for v, which is now deemed Valid",
+            input: proposal_input_from_proposal(proposal.clone(), Validity::Valid),
+            expected_round: Round::new(0),
+            expected_outputs: vec![decide_output(Round::new(0), proposal)],
+            new_state: decided_state(Round::new(0), Round::new(0), value_v),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// A node receives a proposal that is reported as Invalid by the application. Then, for instance,
+// after a bug fix, the same proposal is reported as Valid. From this point, it can be decided.
+#[test]
+fn invalid_proposal_becomes_valid_decision_via_votes() {
+    let value_v = Value::new(9999);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let proposal = Proposal::new(
+        Height::new(1),
+        Round::new(0),
+        value_v.clone(),
+        Round::Nil,
+        v2.address,
+    );
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Timeout propopse, prevote nil",
+            input: timeout_propose_input(Round::new(0)),
+            expected_outputs: vec![prevote_nil_output(Round::new(0), &my_addr)],
+            expected_round: Round::new(0),
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Receive a Proposal for v, which is deemed Invalid",
+            input: proposal_input_from_proposal(proposal.clone(), Validity::Invalid),
+            expected_round: Round::new(0),
+            expected_outputs: vec![],
+            new_state: prevote_state(Round::new(0)),
+        },
+        // Assume here that the process crashed, and the validation function was updated.
+        TestStep {
+            desc: "Receive a Proposal for v, which is now deemed Valid",
+            input: proposal_input_from_proposal(proposal.clone(), Validity::Valid),
+            expected_round: Round::new(0),
+            expected_outputs: vec![],
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v1 precommits v",
+            input: precommit_input(Round::new(0), value_v.clone(), &v1.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v2 precommits v, we get +2/3 and decide v",
+            input: precommit_input(Round::new(0), value_v.clone(), &v2.address),
+            expected_outputs: vec![decide_output(Round::new(0), proposal)],
+            expected_round: Round::new(0),
+            new_state: decided_state(Round::new(0), Round::new(0), value_v),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// A node receives a proposal that is reported as Invalid by the application. Then, for instance,
+// after a bug fix, the same proposal is reported as Valid. From this point, it can be decided.
+#[test]
+fn invalid_proposal_becomes_valid_decision_via_certificate() {
+    let value_v = Value::new(9999);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let proposal = Proposal::new(
+        Height::new(1),
+        Round::new(0),
+        value_v.clone(),
+        Round::Nil,
+        v2.address,
+    );
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we, v3, are not the proposer, start timeout propose",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Timeout propopse, prevote nil",
+            input: timeout_propose_input(Round::new(0)),
+            expected_outputs: vec![prevote_nil_output(Round::new(0), &my_addr)],
+            expected_round: Round::new(0),
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Receive a Proposal for v, which is deemed Invalid",
+            input: proposal_input_from_proposal(proposal.clone(), Validity::Invalid),
+            expected_round: Round::new(0),
+            expected_outputs: vec![],
+            new_state: prevote_state(Round::new(0)),
+        },
+        // Assume here that the process crashed, and the validation function was updated.
+        TestStep {
+            desc: "Receive a Proposal for v, which is now deemed Valid",
+            input: proposal_input_from_proposal(proposal.clone(), Validity::Valid),
+            expected_round: Round::new(0),
+            expected_outputs: vec![],
+            new_state: prevote_state(Round::new(0)),
+        },
+        // This should never happen. We should add an error message here.
+        TestStep {
+            desc: "Receive a Proposal for v, back to Invalid, should be ignored",
+            input: proposal_input_from_proposal(proposal.clone(), Validity::Invalid),
+            expected_round: Round::new(0),
+            expected_outputs: vec![],
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "we get a certificate for v and decide v",
+            input: commit_certificate_input_at(
+                Round::new(0),
+                value_v.clone(),
+                &[v1.address, v2.address],
+            ),
+            expected_outputs: vec![decide_output(Round::new(0), proposal)],
+            expected_round: Round::new(0),
+            new_state: decided_state(Round::new(0), Round::new(0), value_v),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// A decision via the synchronization protocol.
+// A Commit certificate for v is received from the sync protocol and processed by the driver.
+// Then the application receives the fully decided value from the sync protocol, validates it
+// and produces ProposedValue event with Origin::Sync, processed by consensus-core.
+// This is becomes a SyncDecision() driver input with a synthetic Proposal.
+#[test]
+fn sync_decision_certificate_then_proposal() {
+    let value_v = Value::new(9999);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let synthetic_proposal = Proposal::new(
+        Height::new(1),
+        Round::new(0),
+        value_v.clone(),
+        Round::Nil,
+        v1.address,
+    );
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we are not the proposer",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        // NOTICE: if we receive the decision v from the Sync protocol or the WAL
+        // **before** the Commit certificate nothing happens.
+        // But once the certificate is received, the Sync protocol decision
+        // input leads to the production of a SyncDecision() input.
+        // We cannot reproduce this scenario here.
+        TestStep {
+            desc: "Certificate for v from Sync protocol",
+            input: commit_certificate_input_at(
+                Round::new(0),
+                value_v.clone(),
+                &[v1.address, v2.address],
+            ),
+            expected_outputs: vec![start_precommit_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Decision value v from Sync protocol",
+            input: Input::SyncDecision(synthetic_proposal.clone()),
+            expected_outputs: vec![decide_output(Round::new(0), synthetic_proposal)],
+            expected_round: Round::new(0),
+            new_state: decided_state(Round::new(0), Round::new(0), value_v),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// Replaces the old driver_step_change_mux_with_proposal_and_commit_quorum.
+// When a node has SkipVote(r) and (r, PrecommitValue(v)) possible events at the same time,
+// the latter must have precedence: we decide as soon as possible, without starting rounds.
+#[test]
+fn round_1_decision_during_round_0() {
+    let value = Value::new(9999);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let proposal = Proposal::new(
+        Height::new(1),
+        Round::new(1),
+        value.clone(),
+        Round::Nil,
+        v1.address,
+    );
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we are not the proposer",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v1 precommits a proposal in round 1",
+            input: precommit_input(Round::new(1), value.clone(), &v1.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Receive proposal from round 1",
+            input: proposal_input_from_proposal(proposal.clone(), Validity::Valid),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v2 precommits the same round 1 proposal, we have a decision",
+            input: precommit_input(Round::new(1), value.clone(), &v2.address),
+            expected_outputs: vec![decide_output(Round::new(0), proposal)],
+            expected_round: Round::new(0),
+            new_state: decided_state(Round::new(0), Round::new(1), value),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+#[test]
+fn round_1_decision_during_round_0_via_certificate() {
+    let value = Value::new(9999);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let proposal = Proposal::new(
+        Height::new(1),
+        Round::new(1),
+        value.clone(),
+        Round::Nil,
+        v1.address,
+    );
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we are not the proposer",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Receive proposal from round 1",
+            input: proposal_input_from_proposal(proposal.clone(), Validity::Valid),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "we get a commit certificate for v at round 1, we have a decision",
+            input: commit_certificate_input_at(
+                Round::new(1),
+                value.clone(),
+                &[v1.address, v2.address],
+            ),
+            expected_outputs: vec![decide_output(Round::new(0), proposal)],
+            expected_round: Round::new(0),
+            new_state: decided_state(Round::new(0), Round::new(1), value),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+#[test]
+fn round_1_invalid_decision_during_round_0() {
+    let value = Value::new(9999);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let proposal = Proposal::new(
+        Height::new(1),
+        Round::new(1),
+        value.clone(),
+        Round::Nil,
+        v1.address,
+    );
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we are not the proposer",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v1 precommits a proposal in round 1",
+            input: precommit_input(Round::new(1), value.clone(), &v1.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Receive proposal from round 1, which is invalid",
+            input: proposal_input_from_proposal(proposal.clone(), Validity::Invalid),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v2 precommits the same round 1 proposal, but we don't decide",
+            input: precommit_input(Round::new(1), value.clone(), &v2.address),
+            expected_outputs: vec![new_round_output(Round::new(1))],
+            expected_round: Round::new(1),
+            new_state: new_round(Round::new(1)),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+#[test]
+fn round_1_invalid_decision_during_round_0_via_certificate() {
+    let value = Value::new(9999);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let proposal = Proposal::new(
+        Height::new(1),
+        Round::new(1),
+        value.clone(),
+        Round::Nil,
+        v1.address,
+    );
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we are not the proposer",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Receive proposal from round 1, which is invalid",
+            input: proposal_input_from_proposal(proposal.clone(), Validity::Invalid),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "we get a commit certificate for v at round 1, but proposal is invalid so we skip round",
+            input: commit_certificate_input_at(
+                Round::new(1),
+                value.clone(),
+                &[v1.address, v2.address],
+            ),
+            expected_outputs: vec![new_round_output(Round::new(1))],
+            expected_round: Round::new(1),
+            new_state: new_round(Round::new(1)),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// Precommit votes arrive for a future round before the proposal. The process skips to that
+// round, and once the proposal arrives, the decision is made.
+// Symmetric with round_1_decision_via_certificate_proposal_arrives_later (certificate path).
+#[test]
+fn round_1_decision_via_votes_proposal_arrives_later() {
+    let value = Value::new(9999);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let proposal = Proposal::new(
+        Height::new(1),
+        Round::new(1),
+        value.clone(),
+        Round::Nil,
+        v1.address,
+    );
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we are not the proposer",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v1 precommits v at round 1",
+            input: precommit_input(Round::new(1), value.clone(), &v1.address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "v2 precommits v at round 1, no proposal yet, skip to round 1",
+            input: precommit_input(Round::new(1), value.clone(), &v2.address),
+            expected_outputs: vec![new_round_output(Round::new(1))],
+            expected_round: Round::new(1),
+            new_state: new_round(Round::new(1)),
+        },
+        TestStep {
+            desc: "Start round 1, precommit threshold replayed",
+            input: new_round_input(Round::new(1), v2.address),
+            expected_outputs: vec![
+                start_propose_timer_output(Round::new(1)),
+                start_precommit_timer_output(Round::new(1)),
+            ],
+            expected_round: Round::new(1),
+            new_state: propose_state(Round::new(1)),
+        },
+        TestStep {
+            desc: "Receive valid proposal for round 1, decide",
+            input: proposal_input_from_proposal(proposal.clone(), Validity::Valid),
+            expected_outputs: vec![decide_output(Round::new(1), proposal)],
+            expected_round: Round::new(1),
+            new_state: decided_state(Round::new(1), Round::new(1), value),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// Commit certificate arrives for a future round before the proposal. The process skips to that
+// round, and once the proposal arrives, the decision is made.
+// Symmetric with round_1_decision_via_votes_proposal_arrives_later (vote path).
+#[test]
+fn round_1_decision_via_certificate_proposal_arrives_later() {
+    let value = Value::new(9999);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let proposal = Proposal::new(
+        Height::new(1),
+        Round::new(1),
+        value.clone(),
+        Round::Nil,
+        v1.address,
+    );
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    let steps = vec![
+        TestStep {
+            desc: "Start round 0, we are not the proposer",
+            input: new_round_input(Round::new(0), v1.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "Commit certificate for round 1, no proposal yet, skip to round 1",
+            input: commit_certificate_input_at(
+                Round::new(1),
+                value.clone(),
+                &[v1.address, v2.address],
+            ),
+            expected_outputs: vec![new_round_output(Round::new(1))],
+            expected_round: Round::new(1),
+            new_state: new_round(Round::new(1)),
+        },
+        // This step is not necessary for the test to succeed, but it is expected to happen.
+        TestStep {
+            desc: "Start round 1",
+            input: new_round_input(Round::new(1), v2.address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(1))],
+            expected_round: Round::new(1),
+            new_state: propose_state(Round::new(1)),
+        },
+        TestStep {
+            desc: "Receive valid proposal for round 1, decide",
+            input: proposal_input_from_proposal(proposal.clone(), Validity::Valid),
+            expected_outputs: vec![decide_output(Round::new(1), proposal)],
+            expected_round: Round::new(1),
+            new_state: decided_state(Round::new(1), Round::new(1), value),
+        },
+    ];
+
+    run_steps(&mut driver, steps);
+}
+
+// When PrecommitValue is emitted by the vote keeper for a future round and the mux falls back
+// to SkipRound (no valid proposal), the round certificate must still be stored so the node can
+// justify entering the new round.
+// Symmetric with round_certificate_stored_on_commit_certificate_fallback_to_skip_round (certificate path).
+#[test]
+fn round_certificate_stored_on_precommit_value_fallback_to_skip_round() {
+    let value = Value::new(9999);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    // Start round 0
+    let outputs = driver
+        .process(new_round_input(Round::new(0), v1.address))
+        .expect("process succeeded");
+    assert_eq!(outputs, vec![start_propose_timer_output(Round::new(0))]);
+    assert!(driver.round_certificate().is_none());
+
+    // v1 precommits v at round 1
+    let outputs = driver
+        .process(precommit_input(Round::new(1), value.clone(), &v1.address))
+        .expect("process succeeded");
+    assert_eq!(outputs, vec![]);
+
+    // v2 precommits v at round 1: triggers both f+1 and 2/3+ PrecommitValue.
+    // No valid proposal, so mux falls back to SkipRound.
+    let outputs = driver
+        .process(precommit_input(Round::new(1), value.clone(), &v2.address))
+        .expect("process succeeded");
+    assert_eq!(outputs, vec![new_round_output(Round::new(1))]);
+
+    // The round certificate must be stored despite PrecommitValue taking priority
+    // over SkipRound in the vote keeper.
+    assert!(
+        driver.round_certificate().is_some(),
+        "round certificate for round 1 should be stored upon PrecommitValue(1) and no decision"
+    );
+}
+
+// Symmetric to the vote-based test above: when a commit certificate for a future round triggers
+// a SkipRound (no valid proposal), the round certificate must be stored. The commit certificate
+// contains 2f+1 precommits, which is more than enough to justify entering the new round.
+#[test]
+fn round_certificate_stored_on_commit_certificate_fallback_to_skip_round() {
+    let value = Value::new(9999);
+
+    let [(v1, _sk1), (v2, _sk2), (v3, sk3)] = make_validators([2, 3, 2]);
+    let (_my_sk, my_addr) = (sk3.clone(), v3.address);
+
+    let height = Height::new(1);
+    let ctx = TestContext::new();
+    let vs = ValidatorSet::new(vec![v1.clone(), v2.clone(), v3.clone()]);
+
+    let mut driver = Driver::new(ctx, height, vs, my_addr, Default::default());
+
+    // Start round 0
+    let outputs = driver
+        .process(new_round_input(Round::new(0), v1.address))
+        .expect("process succeeded");
+    assert_eq!(outputs, vec![start_propose_timer_output(Round::new(0))]);
+    assert!(driver.round_certificate().is_none());
+
+    // Receive a commit certificate for round 1 with no valid proposal.
+    // This should trigger SkipRound(1) and store a round certificate.
+    let outputs = driver
+        .process(commit_certificate_input_at(
+            Round::new(1),
+            value.clone(),
+            &[v1.address, v2.address],
+        ))
+        .expect("process succeeded");
+    assert_eq!(outputs, vec![new_round_output(Round::new(1))]);
+
+    assert!(
+        driver.round_certificate().is_some(),
+        "round certificate for round 1 should be stored upon round-1 commit certificate"
+    );
+}
+
+// Commit certificate from driver after re-applied votes (round-certificate simulation).
+//
+// We are v2 (local node). Sequence:
+// - Start round 0, receive proposal, send our (v2) prevote
+// - Receive prevotes from v1, v3, we have a polka, we precommit
+// - Receive precommit our (v2) precommit and v1's (we don't have +2/3 in round 0 yet) (simulates restart of v3 with proposal and prevote)
+// - Receive v4's nil prevote and precommit (simulates restart of v4 without proposal)
+// - Re-apply precommits v1, v2, v4 (simulate round certificate)
+// - Late precommit from v3, we have a quorum and decide (simulates restart of v3 with proposal and prevote)
+// - Build the commit certificate from the driver's received_votes and verify
+#[test]
+fn commit_certificate_from_driver_verifies_after_reapplied_votes_from_round_certificate() {
+    const SEED: u64 = 0xfeedbeef;
+    let validators_and_keys = make_validators_seeded([10, 10, 10, 10], SEED);
+    let validators: Vec<_> = validators_and_keys.iter().map(|(v, _)| v.clone()).collect();
+    let signers: Vec<Ed25519Signer> = validators_and_keys
+        .iter()
+        .map(|(_, sk)| Ed25519Signer::new(sk.clone()))
+        .collect();
+    let validator_set = ValidatorSet::new(validators.clone());
+    let ctx = TestContext::new();
+    let height = Height::new(1);
+    let round = Round::new(0);
+    let value = Value::new(42);
+    let value_id = value.id();
+    let my_addr = validators[1].address; // we are v2
+
+    // Precommits for value need real signatures for certificate verification at end.
+    let precommit_v1 = block_on(signers[0].sign_vote(ctx.new_precommit(
+        height,
+        round,
+        NilOrVal::Val(value_id),
+        validators[0].address,
+    )))
+    .unwrap();
+    let precommit_v2 = block_on(signers[1].sign_vote(ctx.new_precommit(
+        height,
+        round,
+        NilOrVal::Val(value_id),
+        validators[1].address,
+    )))
+    .unwrap();
+    let precommit_v3 = block_on(signers[2].sign_vote(ctx.new_precommit(
+        height,
+        round,
+        NilOrVal::Val(value_id),
+        validators[2].address,
+    )))
+    .unwrap();
+
+    let proposal = Proposal::new(
+        height,
+        round,
+        value.clone(),
+        Round::Nil,
+        validators[0].address,
+    );
+
+    let mut driver = Driver::new(
+        ctx.clone(),
+        height,
+        validator_set.clone(),
+        my_addr,
+        Default::default(),
+    );
+
+    let steps = vec![
+        // Start and proposal
+        TestStep {
+            desc: "Start round 0, we (v2) are not the proposer",
+            input: new_round_input(Round::new(0), validators[0].address),
+            expected_outputs: vec![start_propose_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: propose_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "We receive the proposal (from v1)",
+            input: proposal_input_from_proposal(proposal.clone(), Validity::Valid),
+            expected_outputs: vec![prevote_output(Round::new(0), value.clone(), &my_addr)],
+            expected_round: Round::new(0),
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "We (v2) get our prevote for value",
+            input: prevote_input_at(round, value.clone(), &validators[1].address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: prevote_state(Round::new(0)),
+        },
+        // +2/3 Prevotes, Polka
+        TestStep {
+            desc: "We receive v1's prevote for value",
+            input: prevote_input_at(round, value.clone(), &validators[0].address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: prevote_state(Round::new(0)),
+        },
+        TestStep {
+            desc: "We receive v3's prevote for value, we have a Polka, we (v2) precommit",
+            input: prevote_input_at(round, value.clone(), &validators[2].address),
+            expected_outputs: vec![precommit_output(Round::new(0), value.clone(), &my_addr)],
+            expected_round: Round::new(0),
+            new_state: precommit_state_with_proposal_and_locked_and_valid(
+                Round::new(0),
+                proposal.clone(),
+            ),
+        },
+        TestStep {
+            desc: "We (v2) get our precommit for value",
+            input: Input::Vote(precommit_v2.clone()),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: precommit_state_with_proposal_and_locked_and_valid(
+                Round::new(0),
+                proposal.clone(),
+            ),
+        },
+        // Receive some Precommits (only v1 and v2 so far, < 2/3)
+        TestStep {
+            desc: "We receive v1's precommit for value",
+            input: Input::Vote(precommit_v1.clone()),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: precommit_state_with_proposal_and_locked_and_valid(
+                Round::new(0),
+                proposal.clone(),
+            ),
+        },
+        TestStep {
+            desc:
+                "We receive v4's precommit for nil (+2/3 precommits total, start precommit timer)",
+            input: precommit_nil_input(round, &validators[3].address),
+            expected_outputs: vec![start_precommit_timer_output(Round::new(0))],
+            expected_round: Round::new(0),
+            new_state: precommit_state_with_proposal_and_locked_and_valid(
+                Round::new(0),
+                proposal.clone(),
+            ),
+        },
+        // Simulate round certificate with previous precommits by re-applying precommits: v1, v2, v4(nil)
+        TestStep {
+            desc: "Re-apply v1 precommit (simulate round certificate)",
+            input: Input::Vote(precommit_v1.clone()),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: precommit_state_with_proposal_and_locked_and_valid(
+                Round::new(0),
+                proposal.clone(),
+            ),
+        },
+        TestStep {
+            desc: "Re-apply v2 precommit (simulate round certificate)",
+            input: Input::Vote(precommit_v2.clone()),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: precommit_state_with_proposal_and_locked_and_valid(
+                Round::new(0),
+                proposal.clone(),
+            ),
+        },
+        TestStep {
+            desc: "Re-apply v4 precommit (simulate round certificate)",
+            input: precommit_nil_input(round, &validators[3].address),
+            expected_outputs: vec![],
+            expected_round: Round::new(0),
+            new_state: precommit_state_with_proposal_and_locked_and_valid(
+                Round::new(0),
+                proposal.clone(),
+            ),
+        },
+        // Late precommit triggers decide
+        TestStep {
+            desc: "We receive v3's late precommit, reached quorum, decide",
+            input: Input::Vote(precommit_v3),
+            expected_outputs: vec![decide_output(Round::new(0), proposal.clone())],
+            expected_round: Round::new(0),
+            new_state: decided_state_with_proposal_and_locked_and_valid(
+                Round::new(0),
+                proposal.clone(),
+            ),
+        },
+    ];
+
+    for step in steps {
+        println!("Step: {}", step.desc);
+        let outputs = driver.process(step.input).expect("execute succeeded");
+        assert_eq!(outputs, step.expected_outputs, "expected outputs");
+        assert_eq!(driver.round(), step.expected_round, "expected round");
+        assert_eq!(driver.round_state(), &step.new_state, "expected state");
+    }
+
+    // Build certificate from restore_precommits and verify.
+    let commits = driver.restore_precommits(round, &value_id);
+
+    let certificate = CommitCertificate::new(height, round, value_id, commits);
+
+    let result = block_on(signers[0].verify_commit_certificate(
+        &ctx,
+        &certificate,
+        &validator_set,
+        ThresholdParams::default(),
+    ));
+
+    assert!(
+        result.is_ok(),
+        "commit certificate built from driver vote keeper must verify: {:?}",
+        result.err()
+    );
+}
+
 fn run_steps(driver: &mut Driver<TestContext>, steps: Vec<TestStep>) {
+    let mut last_step = Step::Unstarted;
     for step in steps {
         println!("Step: {}", step.desc);
 
         let outputs = driver.process(step.input).expect("execute succeeded");
+        last_step = driver.round_state().step;
 
         assert_eq!(outputs, step.expected_outputs, "expected outputs");
         assert_eq!(driver.round(), step.expected_round, "expected round");
         assert_eq!(driver.round_state(), &step.new_state, "expected state");
     }
+
+    // If we have a decision, move to the next height and check driver's state
+    if last_step == Step::Commit {
+        let next_height = driver.height().increment();
+        driver.move_to_height(next_height, driver.validator_set().clone());
+        check_driver_initial_state(driver, next_height);
+    }
+}
+
+fn check_driver_initial_state(driver: &Driver<TestContext>, height: Height) {
+    assert_eq!(driver.height(), height);
+    assert_eq!(driver.round(), Round::Nil);
+    assert_eq!(driver.round_state().step, Step::Unstarted);
+    assert_eq!(driver.round_state().locked, None);
+    assert_eq!(driver.round_state().valid, None);
+    assert_eq!(driver.round_state().decision, None);
+
+    assert_eq!(driver.proposer_address(), None);
+    assert_eq!(driver.proposals().all_rounds().len(), 0);
+    assert_eq!(driver.votes().rounds(), 0);
+    assert_eq!(driver.commit_certificates().len(), 0);
+    assert_eq!(driver.polka_certificates().len(), 0);
+    assert_eq!(driver.pending_inputs().len(), 0);
+    assert_eq!(driver.last_prevote(), None);
+    assert_eq!(driver.last_precommit(), None);
+    assert_eq!(driver.round_certificate(), None);
+    assert_eq!(driver.proposer_address(), None);
+    assert_eq!(driver.proposals().all_rounds().len(), 0);
+    assert_eq!(driver.votes().rounds(), 0);
 }

@@ -1,9 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use informalsystems_malachitebft_signing_ecdsa::{
-    CurveConfig, K256Config, P256Config, P384Config, PrivateKey,
-};
+use arc_malachitebft_signing_ecdsa::{CurveConfig, K256Config, P256Config, P384Config, PrivateKey};
 use serde::Serialize;
 
 const SOURCE_COMMIT: &str = "bcac2b2dbd369a6c29b9151fcd0889b133d7221a";

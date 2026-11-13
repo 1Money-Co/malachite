@@ -1,4 +1,4 @@
-use informalsystems_malachitebft_core_consensus as consensus;
+use arc_malachitebft_core_consensus as consensus;
 use malachitebft_core_types::{
     NilOrVal, Round, SignedMessage, SignedProposal, SignedVote, Timeout, TimeoutKind, Validity,
     ValueOrigin, ValuePayload,
@@ -15,6 +15,7 @@ enum EntryKind {
     Proposal,
     Vote,
     ProposedValue,
+    PolkaCertificate,
     Timeout,
 }
 
@@ -45,6 +46,7 @@ fn process(
                             assert_eq!(height, value.height);
                             EntryKind::ProposedValue
                         }
+                        WalEntry::PolkaCertificate(_) => EntryKind::PolkaCertificate,
                         WalEntry::Timeout(_) => EntryKind::Timeout,
                     };
                     appends.push((height, kind));
@@ -67,8 +69,7 @@ fn process(
                 | Effect::VerifyRoundCertificate(_, _, _, resume) => {
                     Ok(resume.resume_with(Ok(())))
                 }
-                Effect::ResetTimeouts(resume)
-                | Effect::CancelAllTimeouts(resume)
+                Effect::CancelAllTimeouts(resume)
                 | Effect::PublishConsensusMsg(_, resume)
                 | Effect::PublishLivenessMsg(_, resume)
                 | Effect::RepublishVote(_, resume)
@@ -95,14 +96,19 @@ fn wal_appends_use_entry_height_across_start_height_transition() {
     let address = validator.address;
     let validator_set = ValidatorSet::new([validator]);
     let params = Params {
-        initial_height: Height::new(6),
-        initial_validator_set: validator_set.clone(),
         address,
         threshold_params: Default::default(),
         value_payload: ValuePayload::ProposalAndParts,
         enabled: true,
     };
-    let mut state = State::new(TestContext::new(), params, 32);
+    let mut state = State::new(
+        TestContext::new(),
+        Height::new(6),
+        validator_set.clone(),
+        params,
+        32,
+        32,
+    );
     let mut appends = Vec::new();
 
     let height = Height::new(7);
@@ -141,7 +147,7 @@ fn wal_appends_use_entry_height_across_start_height_transition() {
 
     process(
         &mut state,
-        Input::StartHeight(height, validator_set, false),
+        Input::StartHeight(height, validator_set, false, None),
         &mut appends,
     );
     process(

@@ -78,10 +78,10 @@ pub enum Effect<Ctx: Context> {
         resume::Continue,
     ),
 
-    /// Notify consensus to process a sync response.
-    NotifyConsensusToProcessSyncResponse(
-        OutboundRequestId,
+    /// Tell consensus to process the sync response
+    ProcessValueResponse(
         PeerId,
+        OutboundRequestId,
         ValueResponse<Ctx>,
         resume::Continue,
     ),

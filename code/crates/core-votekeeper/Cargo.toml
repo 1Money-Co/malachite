@@ -1,5 +1,5 @@
 [package]
-name = "informalsystems-malachitebft-core-votekeeper"
+name = "arc-malachitebft-core-votekeeper"
 description = "Voting system for the Malachite BFT consensus engine"
 version.workspace = true
 edition.workspace = true
@@ -17,6 +17,7 @@ malachitebft-core-types = { workspace = true }
 
 derive-where = { workspace = true }
 thiserror = { workspace = true, default-features = false }
+tracing = { workspace = true, default-features = false }
 
 [dev-dependencies]
 malachitebft-test = { workspace = true }

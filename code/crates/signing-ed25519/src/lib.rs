@@ -46,6 +46,17 @@ impl SigningScheme for Ed25519 {
     fn decode_signature(bytes: &[u8]) -> Result<Self::Signature, Self::DecodingError> {
         Signature::try_from(bytes)
     }
+
+    fn encode_public_key(public_key: &PublicKey) -> Vec<u8> {
+        public_key.as_bytes().to_vec()
+    }
+
+    fn decode_public_key(bytes: &[u8]) -> Result<Self::PublicKey, Self::DecodingError> {
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| ed25519_consensus::Error::InvalidSliceLength)?;
+        PublicKey::from_bytes(arr)
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -135,6 +146,12 @@ impl PrivateKey {
     pub fn inner(&self) -> &ed25519_consensus::SigningKey {
         &self.0
     }
+
+    #[cfg(feature = "zeroize")]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn inner_mut(&mut self) -> &mut ed25519_consensus::SigningKey {
+        &mut self.0
+    }
 }
 
 impl From<[u8; 32]> for PrivateKey {
@@ -174,8 +191,8 @@ impl PublicKey {
         self.0.as_bytes()
     }
 
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(ed25519_consensus::VerificationKey::try_from(bytes).unwrap())
+    pub fn from_bytes(bytes: [u8; 32]) -> Result<Self, ed25519_consensus::Error> {
+        Ok(Self(ed25519_consensus::VerificationKey::try_from(bytes)?))
     }
 
     pub fn verify(&self, msg: &[u8], signature: &Signature) -> Result<(), signature::Error> {
@@ -192,5 +209,76 @@ impl PublicKey {
 impl Verifier<Signature> for PublicKey {
     fn verify(&self, msg: &[u8], signature: &Signature) -> Result<(), signature::Error> {
         PublicKey::verify(self, msg, signature)
+    }
+}
+
+/// Delegates to [`ed25519_consensus::SigningKey::zeroize`] which clears the seed
+/// and expanded scalar. The cached verification key and prefix are left intact
+/// (upstream limitation).
+#[cfg(feature = "zeroize")]
+impl zeroize::Zeroize for PrivateKey {
+    fn zeroize(&mut self) {
+        self.inner_mut().zeroize();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 32-byte value that is NOT a valid Ed25519 curve point.
+    /// Used across tests for deterministic invalid-key rejection.
+    const INVALID_ED25519_POINT: [u8; 32] = {
+        let mut b = [0x01; 32];
+        b[31] = 0x00;
+        b
+    };
+
+    #[test]
+    fn public_key_from_bytes_valid() {
+        let seed = [1u8; 32];
+        let sk = ed25519_consensus::SigningKey::from(seed);
+        let vk = sk.verification_key();
+        let bytes: [u8; 32] = vk.into();
+
+        let result = PublicKey::from_bytes(bytes);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().as_bytes(), &bytes);
+    }
+
+    #[test]
+    fn public_key_from_bytes_invalid_curve_point() {
+        let result = PublicKey::from_bytes(INVALID_ED25519_POINT);
+        assert!(result.is_err(), "non-curve-point should be rejected");
+    }
+
+    #[test]
+    fn decode_public_key_invalid_curve_point() {
+        let result = Ed25519::decode_public_key(&INVALID_ED25519_POINT);
+        assert!(result.is_err(), "non-curve-point should be rejected");
+    }
+
+    #[test]
+    fn decode_public_key_invalid_length() {
+        let short_bytes = [0u8; 16];
+        let result = Ed25519::decode_public_key(&short_bytes);
+        assert!(result.is_err());
+    }
+}
+
+#[cfg(all(test, feature = "zeroize"))]
+mod zeroize_tests {
+    use super::*;
+    use zeroize::Zeroize;
+
+    #[test]
+    fn private_key_zeroize() {
+        let seed = [0x42; 32];
+        let mut key = PrivateKey::from(seed);
+        // Seed is present before zeroization.
+        assert_eq!(key.inner().as_bytes(), &seed);
+        key.zeroize();
+        // After zeroization the seed bytes must be all zeros.
+        assert_eq!(key.inner().as_bytes(), &[0u8; 32]);
     }
 }

@@ -12,13 +12,22 @@
 
 pub use malachitebft_app as app;
 
+mod builder;
 mod connector;
-mod spawn;
+pub mod spawn;
 
 mod msgs;
 pub use msgs::{
-    AppMsg, Channels, ConsensusMsg, ConsensusRequest, ConsensusRequestError, NetworkMsg, Reply,
+    AppMsg, Channels, ConsensusMsg, ConsensusRequest, ConsensusRequestError, NetworkMsg,
+    NetworkRequest, Reply,
 };
 
 mod run;
-pub use run::start_engine;
+pub use run::*;
+
+pub use builder::{
+    ConsensusContext, EngineBuilder, NetworkContext, RequestContext, SyncContext, WalContext,
+};
+
+#[cfg(feature = "byzantine")]
+pub use builder::ByzantineContext;

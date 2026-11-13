@@ -1,4 +1,7 @@
-use crate::{handle::signature::verify_commit_certificate, prelude::*};
+use crate::handle::signature::verify_commit_certificate;
+use crate::prelude::*;
+
+use super::finalize::log_and_finalize;
 
 #[cfg_attr(not(feature = "metrics"), allow(unused_variables))]
 pub async fn decide<Ctx>(
@@ -20,61 +23,38 @@ where
 
     let decided_id = decided_value.id();
 
-    // Look for an existing certificate
-    let (certificate, extensions) = state
+    // Look for an existing certificate in the driver. This may be present if the decision was reached via Sync protocol.
+    let existing_certificate = state
         .driver
-        .commit_certificate(proposal_round, decided_id.clone())
-        .cloned()
-        .map(|certificate| (certificate, VoteExtensions::default()))
-        .unwrap_or_else(|| {
-            // Restore the commits. Note that they will be removed from `state`
-            let mut commits = state.restore_precommits(height, proposal_round, &decided_value);
+        .commit_certificate(proposal_round, &decided_id)
+        .cloned();
 
-            let extensions = extract_vote_extensions(&mut commits);
+    // Determine if we have an existing certificate or need to restore one.
+    let (certificate, extensions, sync_decision) = if let Some(certificate) = existing_certificate {
+        // NOTE: Existence implies the decision was reached via Sync protocol.
+        // FIXME: No guarantee vote extensions are found in sync.
+        (certificate, VoteExtensions::default(), true)
+    } else {
+        // Restore the precommits (removes them from `state`).
+        let mut commits = state.restore_precommits(height, proposal_round, &decided_value);
+        let extensions = extract_vote_extensions(&mut commits);
+        let certificate = CommitCertificate::new(height, proposal_round, decided_id, commits);
 
-            let certificate =
-                CommitCertificate::new(height, proposal_round, decided_id.clone(), commits);
-
-            (certificate, extensions)
-        });
-
-    let Some((proposal, _)) = state
-        .driver
-        .proposal_and_validity_for_round_and_value(proposal_round, decided_id.clone())
-    else {
-        return Err(Error::DriverProposalNotFound(height, proposal_round));
-    };
-
-    let Some(full_proposal) =
-        state.full_proposal_at_round_and_value(&height, proposal_round, &decided_value)
-    else {
-        return Err(Error::FullProposalNotFound(height, proposal_round));
-    };
-
-    if proposal.value().id() != decided_id {
-        info!(
-            "Decide: driver proposal value id {} does not match the decided value id {}, this may happen if consensus and value sync run in parallel",
-            proposal.value().id(),
-            decided_id
-        );
-    }
-
-    assert_eq!(full_proposal.builder_value.id(), decided_id);
-    assert_eq!(full_proposal.proposal.value().id(), decided_id);
-    assert_eq!(full_proposal.validity, Validity::Valid);
-
-    // The certificate must be valid in Commit step
-    assert!(
-        verify_commit_certificate(
+        // Verify the locally-constructed certificate
+        let result = verify_commit_certificate(
             co,
             certificate.clone(),
             state.driver.validator_set().clone(),
             state.params.threshold_params,
         )
-        .await?
-        .is_ok(),
-        "Commit certificate is not valid"
-    );
+        .await?;
+
+        if let Err(e) = result {
+            panic!("Decide: Commit certificate is not valid: {e:?}");
+        }
+
+        (certificate, extensions, false)
+    };
 
     // Update metrics
     #[cfg(feature = "metrics")]
@@ -85,27 +65,50 @@ where
         }
 
         metrics.block_end();
-
         metrics
             .consensus_round
             .observe(consensus_round.as_i64() as f64);
-
         metrics
             .proposal_round
             .observe(proposal_round.as_i64() as f64);
     }
 
-    #[cfg(feature = "debug")]
-    {
-        for trace in state.driver.get_traces() {
-            debug!(%trace, "Consensus trace");
-        }
-    }
-
     perform!(
         co,
-        Effect::Decide(certificate, extensions, Default::default())
+        Effect::Decide(certificate.clone(), extensions.clone(), Default::default())
     );
+
+    let Some(target_time) = state.target_time else {
+        debug!(%height, "No target time set, finalizing immediately");
+        return log_and_finalize(co, state, certificate, extensions).await;
+    };
+
+    // FIXME: based on the assumption that a decision reached via Sync protocol implies
+    // that the configured target_time should not be observed by Malachite.
+    if sync_decision {
+        debug!(%height, "Decision via sync, finalizing immediately");
+        return log_and_finalize(co, state, certificate, extensions).await;
+    }
+
+    let elapsed = state
+        .height_start_time
+        .expect("height_start_time must be set when target_time is set")
+        .elapsed();
+
+    if elapsed >= target_time {
+        debug!(%height, ?elapsed, ?target_time, "Target time exceeded, finalizing immediately");
+        return log_and_finalize(co, state, certificate, extensions).await;
+    }
+
+    // Time remaining until target time is reached
+    let remaining = target_time - elapsed;
+
+    // Enter finalization period
+    debug!(%height, ?remaining, "Entering finalization period");
+    state.finalization_period = true;
+
+    let timeout = Timeout::finalize_height(consensus_round, remaining);
+    perform!(co, Effect::ScheduleTimeout(timeout, Default::default()));
 
     Ok(())
 }

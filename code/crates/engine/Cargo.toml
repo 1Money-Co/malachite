@@ -1,5 +1,5 @@
 [package]
-name = "informalsystems-malachitebft-engine"
+name = "arc-malachitebft-engine"
 description = "Implementation of the Malachite BFT consensus engine"
 version.workspace = true
 edition.workspace = true
@@ -24,8 +24,8 @@ malachitebft-config.workspace = true
 malachitebft-core-consensus.workspace = true
 malachitebft-core-driver.workspace = true
 malachitebft-core-state-machine.workspace = true
-malachitebft-core-votekeeper.workspace = true
 malachitebft-core-types.workspace = true
+malachitebft-core-votekeeper.workspace = true
 malachitebft-network.workspace = true
 malachitebft-metrics.workspace = true
 malachitebft-signing.workspace = true
@@ -36,9 +36,12 @@ async-trait = { workspace = true }
 async-recursion = { workspace = true }
 borsh = { workspace = true, optional = true }
 bytes = { workspace = true, features = ["serde"] }
+bytesize = { workspace = true }
 byteorder = { workspace = true }
 derive-where = { workspace = true }
 eyre = { workspace = true }
+hex = { workspace = true }
+itertools = { workspace = true }
 libp2p = { workspace = true }
 ractor = { workspace = true }
 rand = { workspace = true }

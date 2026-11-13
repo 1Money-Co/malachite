@@ -3,12 +3,14 @@ use std::time::Duration;
 use eyre::bail;
 use tracing::info;
 
-use informalsystems_malachitebft_test::{self as malachitebft_test};
+use arc_malachitebft_test::{self as malachitebft_test};
 
+use malachitebft_codec::Codec;
 use malachitebft_config::ValuePayload;
-use malachitebft_core_consensus::LocallyProposedValue;
+use malachitebft_core_consensus::{LocallyProposedValue, WalEntry};
 use malachitebft_core_types::SignedVote;
 use malachitebft_engine::util::events::Event;
+use malachitebft_test::codec::proto::ProtobufCodec;
 use malachitebft_test::TestContext;
 
 use crate::middlewares::{ByzantineProposer, PrevoteNil};
@@ -444,4 +446,184 @@ async fn multi_rounds_1() {
 #[tokio::test]
 async fn multi_rounds_2() {
     test_multi_rounds(3, Duration::from_secs(10)).await
+}
+
+#[tokio::test]
+async fn non_empty_wal_replays_before_sync_recovery() {
+    #[derive(Clone, Debug, Default)]
+    struct State {
+        recorded_signed_bytes: Option<Vec<u8>>,
+    }
+
+    const CRASH_HEIGHT: u64 = 3;
+    const FINAL_HEIGHT: u64 = CRASH_HEIGHT + 2;
+
+    let mut test = TestBuilder::<State>::new();
+
+    test.add_node()
+        .start()
+        .wait_until(CRASH_HEIGHT)
+        // Capture the exact signed bytes that must survive the crash.
+        .on_event(|event, state| match event {
+            Event::Published(msg) if msg.height().as_u64() == CRASH_HEIGHT => {
+                state.recorded_signed_bytes = Some(ProtobufCodec.encode(&msg)?.to_vec());
+                Ok(HandlerResult::ContinueTest)
+            }
+            _ => Ok(HandlerResult::WaitForNextEvent),
+        })
+        .crash()
+        // While the validator is down, the other three keep making progress.
+        .restart_after(Duration::from_secs(10))
+        // Replay must begin before a sync certificate can decide the crash height.
+        .on_event(move |event, _| match event {
+            Event::WalReplayBegin(height, count) if height.as_u64() == CRASH_HEIGHT => {
+                if count == 0 {
+                    bail!("WAL replay at crash height contained no entries");
+                }
+                Ok(HandlerResult::ContinueTest)
+            }
+            Event::WalReplayBegin(height, _) => {
+                bail!("Unexpected WAL replay at height {height}, expected {CRASH_HEIGHT}");
+            }
+            Event::Decided { commit_certificate }
+                if commit_certificate.height.as_u64() == CRASH_HEIGHT =>
+            {
+                bail!("Sync decided the crash height before WAL replay began");
+            }
+            _ => Ok(HandlerResult::WaitForNextEvent),
+        })
+        // The replayed signed message must be byte-identical to the one recorded before the crash.
+        .on_event(|event, state| match event {
+            Event::WalReplayEntry(WalEntry::ConsensusMsg(msg)) => {
+                let replayed = ProtobufCodec.encode(&msg)?.to_vec();
+                let recorded = state
+                    .recorded_signed_bytes
+                    .as_ref()
+                    .ok_or_else(|| eyre::eyre!("missing pre-crash signed bytes"))?;
+                if replayed == *recorded {
+                    Ok(HandlerResult::ContinueTest)
+                } else {
+                    Ok(HandlerResult::WaitForNextEvent)
+                }
+            }
+            Event::WalReplayDone(height) => {
+                bail!("WAL replay at height {height} contained no signed consensus entry");
+            }
+            _ => Ok(HandlerResult::WaitForNextEvent),
+        })
+        .wait_until(FINAL_HEIGHT)
+        .success();
+
+    test.add_node().start().wait_until(FINAL_HEIGHT).success();
+    test.add_node().start().wait_until(FINAL_HEIGHT).success();
+    test.add_node().start().wait_until(FINAL_HEIGHT).success();
+
+    test.build()
+        .run_with_params(
+            Duration::from_secs(90),
+            TestParams {
+                enable_value_sync: true,
+                ..TestParams::default()
+            },
+        )
+        .await
+}
+
+#[tokio::test]
+async fn sync_certificate_cannot_skip_recorded_wal() {
+    const CRASH_HEIGHT: u64 = 3;
+    const FINAL_HEIGHT: u64 = CRASH_HEIGHT + 2;
+
+    let mut test = TestBuilder::<()>::new();
+
+    test.add_node()
+        .start()
+        .wait_until(CRASH_HEIGHT)
+        // Wait for an `Event::Published` so the WAL is not empty when crashing.
+        .on_event(|event, _| match event {
+            Event::Published(_) => Ok(HandlerResult::ContinueTest),
+            _ => Ok(HandlerResult::WaitForNextEvent),
+        })
+        .crash()
+        // While the validator is down, the other three keep making progress.
+        .restart_after(Duration::from_secs(10))
+        .on_event(move |event, _| match event {
+            Event::WalReplayBegin(height, _) if height.as_u64() == CRASH_HEIGHT => {
+                Ok(HandlerResult::ContinueTest)
+            }
+            Event::WalReplayBegin(height, _count) => {
+                bail!("Unexpected WAL replay at height {height}, expected {CRASH_HEIGHT}");
+            }
+            Event::Decided { commit_certificate }
+                if commit_certificate.height.as_u64() == CRASH_HEIGHT =>
+            {
+                bail!("Sync certificate skipped the recorded WAL at the crash height");
+            }
+            _ => Ok(HandlerResult::WaitForNextEvent),
+        })
+        .wait_until(FINAL_HEIGHT)
+        .success();
+
+    test.add_node().start().wait_until(FINAL_HEIGHT).success();
+    test.add_node().start().wait_until(FINAL_HEIGHT).success();
+    test.add_node().start().wait_until(FINAL_HEIGHT).success();
+
+    test.build()
+        .run_with_params(
+            Duration::from_secs(90),
+            TestParams {
+                enable_value_sync: true,
+                ..TestParams::default()
+            },
+        )
+        .await
+}
+
+#[tokio::test]
+async fn empty_wal_and_full_node_start_without_replay() {
+    const FINAL_HEIGHT: u64 = 2;
+
+    let mut test = TestBuilder::<()>::new();
+
+    test.add_node()
+        .start()
+        .on_event(|event, _| match event {
+            Event::WalReplayBegin(height, count) => {
+                bail!("empty validator WAL replayed {count} entries at height {height}");
+            }
+            Event::StartedRound(height, _, _, _) if height.as_u64() == 1 => {
+                Ok(HandlerResult::ContinueTest)
+            }
+            _ => Ok(HandlerResult::WaitForNextEvent),
+        })
+        .wait_until(FINAL_HEIGHT)
+        .success();
+
+    test.add_node().start().wait_until(FINAL_HEIGHT).success();
+    test.add_node().start().wait_until(FINAL_HEIGHT).success();
+
+    test.add_node()
+        .full_node()
+        .start()
+        .on_event(|event, _| match event {
+            Event::WalReplayBegin(height, count) => {
+                bail!("full node WAL replayed {count} entries at height {height}");
+            }
+            Event::StartedRound(height, _, _, _) if height.as_u64() == 1 => {
+                Ok(HandlerResult::ContinueTest)
+            }
+            _ => Ok(HandlerResult::WaitForNextEvent),
+        })
+        .wait_until(FINAL_HEIGHT)
+        .success();
+
+    test.build()
+        .run_with_params(
+            Duration::from_secs(60),
+            TestParams {
+                enable_value_sync: true,
+                ..TestParams::default()
+            },
+        )
+        .await
 }

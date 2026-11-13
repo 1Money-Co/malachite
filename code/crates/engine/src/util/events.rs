@@ -1,12 +1,13 @@
 use core::fmt;
+use std::io;
 use std::sync::Arc;
 
 use derive_where::derive_where;
-use ractor::ActorProcessingErr;
 use tokio::sync::broadcast;
 
 use malachitebft_core_consensus::{
-    LocallyProposedValue, ProposedValue, Role, SignedConsensusMsg, WalEntry,
+    Error as ConsensusError, LocallyProposedValue, MisbehaviorEvidence, ProposedValue, Role,
+    SignedConsensusMsg, WalEntry,
 };
 use malachitebft_core_types::{
     CommitCertificate, Context, PolkaCertificate, Round, RoundCertificate, SignedVote, ValueOrigin,
@@ -50,7 +51,13 @@ pub enum Event<Ctx: Context> {
     Received(SignedConsensusMsg<Ctx>),
     ProposedValue(LocallyProposedValue<Ctx>),
     ReceivedProposedValue(ProposedValue<Ctx>, ValueOrigin),
-    Decided(CommitCertificate<Ctx>),
+    Decided {
+        commit_certificate: CommitCertificate<Ctx>,
+    },
+    Finalized {
+        commit_certificate: CommitCertificate<Ctx>,
+        evidence: MisbehaviorEvidence<Ctx>,
+    },
     RepublishVote(SignedVote<Ctx>),
     RebroadcastRoundCertificate(RoundCertificate<Ctx>),
     SkipRoundCertificate(RoundCertificate<Ctx>),
@@ -58,7 +65,9 @@ pub enum Event<Ctx: Context> {
     WalReplayBegin(Ctx::Height, usize),
     WalReplayEntry(WalEntry<Ctx>),
     WalReplayDone(Ctx::Height),
-    WalReplayError(Arc<ActorProcessingErr>),
+    WalReplayError(Arc<ConsensusError<Ctx>>),
+    WalResetError(Arc<eyre::Report>),
+    WalCorrupted(Arc<io::Error>),
 }
 
 impl<Ctx: Context> fmt::Display for Event<Ctx> {
@@ -79,7 +88,35 @@ impl<Ctx: Context> fmt::Display for Event<Ctx> {
                     "ReceivedProposedValue(value: {value:?}, origin: {origin:?})"
                 )
             }
-            Event::Decided(cert) => write!(f, "Decided(value: {})", cert.value_id),
+            Event::Decided { commit_certificate } => {
+                write!(
+                    f,
+                    "Decided(value: {}, signatures: {})",
+                    commit_certificate.value_id,
+                    commit_certificate.commit_signatures.len()
+                )
+            }
+            Event::Finalized {
+                commit_certificate,
+                evidence,
+            } => {
+                if evidence.is_empty() {
+                    write!(
+                        f,
+                        "Finalized(value: {}, signatures: {})",
+                        commit_certificate.value_id,
+                        commit_certificate.commit_signatures.len()
+                    )
+                } else {
+                    write!(
+                        f,
+                        "Finalized(value: {}, signatures: {}, evidence: {:?})",
+                        commit_certificate.value_id,
+                        commit_certificate.commit_signatures.len(),
+                        evidence
+                    )
+                }
+            }
             Event::RepublishVote(vote) => write!(f, "RepublishVote(vote: {vote:?})"),
             Event::RebroadcastRoundCertificate(certificate) => write!(
                 f,
@@ -91,6 +128,9 @@ impl<Ctx: Context> fmt::Display for Event<Ctx> {
             Event::WalReplayEntry(entry) => write!(f, "WalReplayEntry(entry: {entry:?})"),
             Event::WalReplayDone(height) => write!(f, "WalReplayDone(height: {height})"),
             Event::WalReplayError(error) => write!(f, "WalReplayError({error})"),
+            Event::WalResetError(error) => write!(f, "WalResetError({error})"),
+            Event::WalCorrupted(error) => write!(f, "WalCorrupted(error: {error:?})"),
+
             Event::PolkaCertificate(certificate) => {
                 write!(f, "PolkaCertificate: {certificate:?})")
             }

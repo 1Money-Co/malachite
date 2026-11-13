@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::iter;
 use std::time::Duration;
 
@@ -16,15 +15,28 @@ use serde::{Deserialize, Serialize};
 use crate::config::BootstrapProtocol;
 use crate::Config;
 
+/// Maximum number of concurrent inbound + outbound streams per connection
+/// for the discovery request/response protocol.
+///
+/// Budget: up to 2 outbound (Peers + Connect) + 2 inbound = 4 honest peak,
+/// plus margin for overlap.
+const MAX_CONCURRENT_STREAMS: usize = 8;
+
+/// Protobuf-encoded signed peer record bytes.
+/// Use `SignedEnvelope::from_protobuf_encoding()` to decode.
+pub type SignedPeerRecordBytes = Vec<u8>;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
-    Peers(HashSet<(Option<PeerId>, Vec<Multiaddr>)>),
+    /// Peer exchange with signed peer records, cryptographically verified
+    Peers(Vec<SignedPeerRecordBytes>),
     Connect(),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Response {
-    Peers(HashSet<(Option<PeerId>, Vec<Multiaddr>)>),
+    /// Peer exchange with signed peer records, cryptographically verified
+    Peers(Vec<SignedPeerRecordBytes>),
     Connect(bool),
 }
 
@@ -85,7 +97,9 @@ fn request_response_protocol(
 }
 
 fn request_response_config() -> request_response::Config {
-    request_response::Config::default().with_request_timeout(Duration::from_secs(5))
+    request_response::Config::default()
+        .with_request_timeout(Duration::from_secs(5))
+        .with_max_concurrent_streams(MAX_CONCURRENT_STREAMS)
 }
 
 impl Behaviour {

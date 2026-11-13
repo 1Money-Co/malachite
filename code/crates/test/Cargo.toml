@@ -1,5 +1,5 @@
 [package]
-name = "informalsystems-malachitebft-test"
+name = "arc-malachitebft-test"
 description = "Testing framework for the Malachite consensus engine"
 publish = false
 
@@ -9,8 +9,13 @@ repository.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+wal-force-compression = ["malachitebft-wal/force-compression"]
+
 [dependencies]
 malachitebft-engine = { workspace = true }
+malachitebft-engine-byzantine = { workspace = true }
 malachitebft-app = { workspace = true }
 malachitebft-codec = { workspace = true }
 malachitebft-core-types = { workspace = true, features = ["serde"] }
@@ -21,6 +26,7 @@ malachitebft-peer = { workspace = true, features = ["rand", "serde"] }
 malachitebft-signing = { workspace = true }
 malachitebft-signing-ed25519 = { workspace = true, features = ["rand", "serde"] }
 malachitebft-sync = { workspace = true }
+malachitebft-wal = { workspace = true }
 
 async-trait = { workspace = true }
 base64 = { workspace = true }
@@ -31,6 +37,7 @@ futures = {workspace = true}
 hex = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
+libp2p-identity = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true, features = ["derive", "rc"] }
@@ -38,17 +45,16 @@ serde_json = { workspace = true }
 sha3 = { workspace = true }
 signature = { workspace = true }
 tokio = { workspace = true }
-thiserror = "2.0.16"
 
 [dev-dependencies]
 malachitebft-test-app.workspace = true
 malachitebft-test-framework.workspace = true
 
 bytesize.workspace = true
+rstest.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 
 [build-dependencies]
 prost-build = { workspace = true }
