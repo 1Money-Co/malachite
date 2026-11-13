@@ -483,12 +483,12 @@ async fn non_empty_wal_replays_before_sync_recovery() {
                 Ok(HandlerResult::ContinueTest)
             }
             Event::WalReplayBegin(height, _) => {
-                bail!("Unexpected WAL replay at height {height}, expected {CRASH_HEIGHT}")
+                bail!("Unexpected WAL replay at height {height}, expected {CRASH_HEIGHT}");
             }
             Event::Decided { commit_certificate }
                 if commit_certificate.height.as_u64() == CRASH_HEIGHT =>
             {
-                bail!("Sync decided the crash height before WAL replay began")
+                bail!("Sync decided the crash height before WAL replay began");
             }
             _ => Ok(HandlerResult::WaitForNextEvent),
         })
@@ -507,7 +507,7 @@ async fn non_empty_wal_replays_before_sync_recovery() {
                 }
             }
             Event::WalReplayDone(height) => {
-                bail!("WAL replay at height {height} contained no signed consensus entry")
+                bail!("WAL replay at height {height} contained no signed consensus entry");
             }
             _ => Ok(HandlerResult::WaitForNextEvent),
         })
@@ -557,7 +557,7 @@ async fn sync_certificate_cannot_skip_recorded_wal() {
             Event::Decided { commit_certificate }
                 if commit_certificate.height.as_u64() == CRASH_HEIGHT =>
             {
-                bail!("Sync certificate skipped the recorded WAL at the crash height")
+                bail!("Sync certificate skipped the recorded WAL at the crash height");
             }
             _ => Ok(HandlerResult::WaitForNextEvent),
         })
@@ -589,7 +589,7 @@ async fn empty_wal_and_full_node_start_without_replay() {
         .start()
         .on_event(|event, _| match event {
             Event::WalReplayBegin(height, count) => {
-                bail!("empty validator WAL replayed {count} entries at height {height}")
+                bail!("empty validator WAL replayed {count} entries at height {height}");
             }
             Event::StartedRound(height, _, _, _) if height.as_u64() == 1 => {
                 Ok(HandlerResult::ContinueTest)
@@ -607,7 +607,7 @@ async fn empty_wal_and_full_node_start_without_replay() {
         .start()
         .on_event(|event, _| match event {
             Event::WalReplayBegin(height, count) => {
-                bail!("full node WAL replayed {count} entries at height {height}")
+                bail!("full node WAL replayed {count} entries at height {height}");
             }
             Event::StartedRound(height, _, _, _) if height.as_u64() == 1 => {
                 Ok(HandlerResult::ContinueTest)
