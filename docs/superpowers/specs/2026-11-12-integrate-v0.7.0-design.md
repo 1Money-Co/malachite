@@ -1,7 +1,7 @@
 # Integrate Circle Malachite v0.7.0 into the 1Money fork
 
 **Date:** 2026-11-12
-**Status:** Approved
+**Status:** Approved; safety-review amendment approved 2026-11-24
 **Tracking issue:** [1Money-Co/om-emerald#48](https://github.com/1Money-Co/om-emerald/issues/48)
 
 ## Intent
@@ -43,6 +43,12 @@ release delta. Record full SHAs again at implementation start and before opening
 - Preserve authenticated Emerald proposal forwarding despite removal of proposal-part signing trait methods.
 - Add polka-certificate WAL tag `0x08`, old-state reads, new-state restart coverage, and a downgrade boundary.
 - Remove delayed WAL replay entirely and retain immediate, deterministic replay with focused safety regressions.
+- Preserve corrupt WAL bytes for diagnosis instead of truncating a valid suffix after a CRC, decompression, or read
+  failure.
+- Keep the validator process alive in an operator-visible safety hang after WAL durability loss so service managers
+  cannot restart it automatically.
+- Restore end-to-end value-sync decode-failure, commit-ordering, status-update, and eager-mode coverage removed during
+  reconciliation.
 - Repair WAL compatibility tests so raw canonical bytes and forced-compression semantics are both tested correctly.
 - Produce linked Malachite and Emerald pull requests with exact evidence, limitations, and phase-3 handoff.
 
@@ -51,10 +57,11 @@ release delta. Record full SHAs again at implementation start and before opening
 - Production deployment, rolling rehearsal, instance reconfiguration, release publication, or fleet observation.
 - Declaring the v0.7.0-based fork production-qualified merely because development tests pass.
 - Retiring the 1Money fork or switching Emerald to an unmodified Circle dependency.
-- Adopting v0.8.0 proposal-mode, certificate, failure-supervision, or sync-outcome changes except for an explicitly
-  scoped safety backport required by this phase.
+- Adopting v0.8.0 proposal-mode, certificate, storage, or sync-outcome changes. The only approved later-line behavior
+  is the runtime-only safety-hang disposition described below.
 - Enabling vote extensions, changing consensus key material, changing address derivation, or changing signed bytes.
 - Introducing a bulk WAL or database rewrite when compatible reads and bounded adapters are sufficient.
+- Importing a v0.8.x WAL representation, replay index, extended-certificate format, or data migration.
 - Activating another Emerald storage schema or combining unrelated dependency, CI, or repository cleanup.
 - Resolving unrelated interoperability issues or changing Reth execution history, genesis, or chain identity.
 
@@ -108,6 +115,26 @@ actual work.
 Start from Circle v0.7.0 and port only the patches believed to remain necessary. This yields a superficially cleaner
 tree but makes omission the main risk, weakens the phase-1 patch inventory, and conflicts with the requirement to
 retire downstream behavior only after replacement evidence exists.
+
+### Safety-failure disposition
+
+#### A. Runtime-only safety hang — selected
+
+On WAL append or flush failure, notify the node supervisor, stop its child actors, and keep the supervisor process
+alive until an operator explicitly intervenes. This prevents `Restart=on-failure` from converting uncertain
+durability into an automatic validator restart while preserving normal service-manager recovery for unrelated
+liveness failures. Port only the in-memory supervision pattern; do not import v0.8.x persisted types or codecs.
+
+#### B. Exit with a dedicated service-manager policy — rejected
+
+Returning an error would require a distinct process exit status plus synchronized Emerald and systemd changes on
+every deployment surface. A missed or stale unit file would silently restore the unsafe restart behavior.
+
+#### C. Disable automatic Emerald restarts globally — rejected
+
+Changing the service to `Restart=no` would prevent the unsafe WAL restart, but it would also turn ordinary network,
+actor, or application liveness failures into permanent outages. The safety distinction belongs in the consensus
+supervisor rather than in a deployment-wide restart switch.
 
 ## Design
 
@@ -212,6 +239,8 @@ replacement tests demonstrate all retained properties:
 - delayed, stale, partial, unsolicited, wrong-peer, and wrong-range responses preserve validation and retry state;
 - response byte limits apply before send and acceptance;
 - local application or execution failure is not misclassified as peer-invalid input;
+- application decode failure is exercised end to end and re-requests without penalizing the serving peer;
+- eager and interval status-update modes both preserve commit ordering and catch-up;
 - persistent peers reconnect with discovery enabled and disabled;
 - validator and full-node role changes preserve admission and catch-up;
 - sync input ordering cannot lose an early response before consensus wiring exists; and
@@ -247,13 +276,32 @@ Focused tests prove:
 - a sync certificate cannot cause the recorded WAL to be skipped;
 - replay cannot regress the height or round;
 - recorded signed messages are preserved rather than regenerated with changed bytes;
-- corrupt or inapplicable entries fail closed; and
+- corrupt or inapplicable entries fail closed without mutating the WAL, including after a second actor start; and
 - empty-WAL and non-validator startup retain their intended behavior.
 
 This removes the known delayed-path risk but does not import v0.8.1's broader replay-index or divergence machinery.
 Any newly discovered need for that machinery is a scope increase requiring a design update.
 
-### 9. Extend WAL codecs and repair feature-matrix coverage
+### 9. Enter an operator-visible safety hang after WAL durability loss
+
+Treat append, flush, and unknown-outcome WAL transport failures as safety failures. The consensus actor reports the
+failure to the node supervisor and remains pending. The supervisor idempotently enters a safety-hang state, stops its
+children, and remains alive. Child termination while entering that state is expected and must not stop the node.
+Ordinary child failures outside safety hang retain the existing liveness-failure disposition.
+
+Do not emit a fatal event that makes Emerald return a process error for this path. Emerald continues to fail on
+startup and replay corruption, but a runtime WAL durability failure must leave the process alive so
+`Restart=on-failure` cannot restart it. Operator documentation must require WAL and storage diagnosis followed by an
+explicit restart; deleting, truncating, replacing, or restoring a stale WAL is not recovery.
+
+Actor-level tests use `WalBuilder::Custom` with a WAL actor that fails a selected append or flush. They prove that no
+later publish or decide effect occurs, the child actors stop, the supervisor and engine handle stay alive, and an
+explicit test cleanup can terminate the hung runtime. Helper-only tests are insufficient for this contract.
+
+This is a runtime supervision change only. It does not change WAL tags, framing, sequence values, Emerald redb,
+validator identities, signed bytes, genesis, or persisted configuration, and requires no data migration.
+
+### 10. Extend WAL codecs and repair feature-matrix coverage
 
 Retain decoding for old tags `0x01`, `0x02`, and `0x04`, and add the v0.7.0 polka-certificate tag `0x08`. Test actual
 entry contents and replay effects, not only outer framing. New records written with `0x08` are unsupported by the old
@@ -272,7 +320,7 @@ Repair the phase-1 compatibility test exposed by workspace-wide `--all-features`
 The assertion must distinguish framing mode from codec compatibility. It must not accept an arbitrary raw checksum
 mismatch merely because the entries can still be decoded.
 
-### 10. Integrate the candidate into Emerald
+### 11. Integrate the candidate into Emerald
 
 After the Malachite candidate commit is stable, create a separate Emerald branch and update dependency package names,
 aliases, exact fork revision, and lockfile. Adapt `app/`, `types/`, `cli/`, and configuration surfaces to the builder,
@@ -293,7 +341,7 @@ Keep the Malachite and Emerald pull requests linked. If Emerald integration requ
 make it in Malachite first, pin the new candidate commit, and rerun affected evidence. Do not hide patches in Cargo
 configuration.
 
-### 11. Validation and merge gates
+### 12. Validation and merge gates
 
 Use focused tests during reconciliation, then expand to repository-required suites. Networked Malachite tests must
 run outside restricted sandboxes that block loopback listeners; report the environment rather than treating those
@@ -329,10 +377,12 @@ downstream behavior.
 ## Data, downgrade, and rollout position
 
 No bulk database or WAL rewrite is planned. Existing raw records remain readable, and new records use the v0.7.0
-codec. Once a node writes a polka-certificate record with tag `0x08`, the old engine cannot read that WAL. The old
-decoder failure and documented recovery procedure are the phase-2 downgrade signal; no new marker or CLI is planned.
-Operators must restore the new binary or a separately proven forward-compatible successor. Deleting the WAL or
-blindly downgrading is not a recovery procedure.
+codec. Once a node writes a polka-certificate record with tag `0x08`, Phase 1 drops that record while decoding, emits
+a replay error, then continues with an empty replay result. A validator must therefore not downgrade while its local
+WAL contains `0x08`. Downgrade is permitted only after that validator has successfully entered a later height and its
+local WAL sequence has advanced. No new marker or CLI is planned. Operators must restore the new binary or a
+separately proven forward-compatible successor. Deleting, truncating, or replacing the WAL and restoring stale
+validator state are not recovery procedures.
 
 Development completion does not establish rolling readiness. Production qualification must exercise the actual old
 and new Emerald/Malachite pair with realistic voting power, persistent peers, restart state, proposal sizes, storage,

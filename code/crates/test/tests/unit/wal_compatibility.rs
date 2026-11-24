@@ -44,6 +44,26 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+fn corrupt_second_entry_crc(bytes: &mut [u8]) {
+    const WAL_HEADER_SIZE: usize = 12;
+    const ENTRY_FLAG_SIZE: usize = 1;
+    const ENTRY_LENGTH_SIZE: usize = 8;
+    const ENTRY_CRC_SIZE: usize = 4;
+
+    let first_length_start = WAL_HEADER_SIZE + ENTRY_FLAG_SIZE;
+    let first_length_end = first_length_start + ENTRY_LENGTH_SIZE;
+    let first_length = u64::from_be_bytes(
+        bytes[first_length_start..first_length_end]
+            .try_into()
+            .expect("first entry length field"),
+    ) as usize;
+    let second_entry_start =
+        WAL_HEADER_SIZE + ENTRY_FLAG_SIZE + ENTRY_LENGTH_SIZE + ENTRY_CRC_SIZE + first_length;
+    let second_crc_start = second_entry_start + ENTRY_FLAG_SIZE + ENTRY_LENGTH_SIZE;
+
+    bytes[second_crc_start] ^= 1;
+}
+
 fn materialize_fixture(directory: &Path, bytes: &[u8], name: &str) -> Result<PathBuf> {
     let path = directory.join(name);
     fs::write(&path, bytes)?;
@@ -348,7 +368,7 @@ async fn repeated_started_height_returns_no_replay_entries() -> Result<()> {
 }
 
 #[test]
-fn truncated_production_wal_fails_without_returning_a_prefix() -> Result<()> {
+fn truncated_fixture_helper_rejects_open_time_mutation() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let mut truncated = PRODUCTION_WAL.to_vec();
     truncated.pop().expect("production fixture is not empty");
@@ -358,7 +378,7 @@ fn truncated_production_wal_fails_without_returning_a_prefix() -> Result<()> {
 }
 
 #[test]
-fn corrupt_replay_fails_closed() -> Result<()> {
+fn corrupt_fixture_helper_reports_crc_without_mutation() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let mut corrupt = PRODUCTION_WAL.to_vec();
     let last = corrupt.len() - 1;
@@ -367,5 +387,59 @@ fn corrupt_replay_fails_closed() -> Result<()> {
     let hash_before = sha256(&std::fs::read(&path)?);
     assert!(read_fixture(&path).is_err());
     assert_eq!(sha256(&std::fs::read(&path)?), hash_before);
+    Ok(())
+}
+
+async fn replay_corrupt_wal_once(path: PathBuf) -> Result<()> {
+    let wal = Wal::spawn(
+        &TestContext::new(),
+        ProtobufCodec,
+        path,
+        SharedRegistry::global().clone(),
+        tracing::Span::none(),
+    )
+    .await?;
+
+    let replay = wal
+        .call(
+            |reply| Msg::StartedHeight(Height::new(7), reply),
+            Some(Duration::from_secs(1)),
+        )
+        .await?
+        .success_or(eyre!("corrupt WAL StartedHeight call failed"))??;
+
+    assert_eq!(
+        replay.len(),
+        2,
+        "replay must stop at the corrupt middle entry"
+    );
+    assert!(replay[0].is_ok(), "the valid prefix must remain visible");
+    let error = replay[1]
+        .as_ref()
+        .expect_err("the corrupt middle entry must fail replay");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    wal.stop_and_wait(None, None).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn corrupt_actor_replay_preserves_wal_across_restart() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let mut corrupt = PRODUCTION_WAL.to_vec();
+    corrupt_second_entry_crc(&mut corrupt);
+    let path = materialize_fixture(directory.path(), &corrupt, "corrupt-middle.log")?;
+    let expected_bytes = fs::read(&path)?;
+
+    replay_corrupt_wal_once(path.clone()).await?;
+    assert_eq!(
+        fs::read(&path)?,
+        expected_bytes,
+        "first replay mutated the WAL"
+    );
+
+    replay_corrupt_wal_once(path.clone()).await?;
+    assert_eq!(fs::read(&path)?, expected_bytes, "restart mutated the WAL");
+
     Ok(())
 }

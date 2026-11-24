@@ -24,6 +24,26 @@ supervisor so the embedding application can observe and fail on a dead consensus
 failures publish a fatal event, stop the current effect loop before any later signing or publication, and fail the
 consensus actor. The evidence-only documentation commit that follows this record is not part of the code candidate.
 
+### Safety-review remediation
+
+The review of PR #3 identified safety gaps that supersede the fatal-exit candidate above. The approved remediation
+is tracked by `docs/superpowers/plans/2026-11-24-malachite-v0.7-safety-review-remediation.md`. The final candidate
+must satisfy these rows before Emerald updates its pin:
+
+| Behavior | Risk | Disposition | Task | Status |
+| --- | --- | --- | --- | --- |
+| Corrupt replay | Read error truncates suffix | Preserve bytes across restart | 2 | Passed V7-E10 |
+| Runtime WAL failure | Fatal exit permits restart | Stop children; keep node alive | 3, 4 | Pending |
+| Custom ownership | Early linking stops custom actors | Link only after build success | 3 | Pending |
+| WAL fault wiring | Helpers miss live bypasses | Inject custom append/flush faults | 4 | Pending |
+| Sync fault modes | Removed scenarios leave gaps | Restore decode, status, and eager tests | 5 | Pending |
+| Downgrade boundary | Phase 1 accepts loss of `0x08` | Require local WAL advancement | 6 | Pending |
+| Emerald restart | WAL event becomes process failure | Pin candidate; keep event non-fatal | 7 | Pending |
+
+The safety-hang change is runtime-only. It must not change persisted WAL or database formats, signed bytes,
+validator identity, genesis, or configuration, and it requires no data migration. Operator recovery must never
+delete, truncate, replace, or restore a stale WAL.
+
 ### v0.7 behavior inventory
 
 Evidence IDs below resolve to the exact commands and results in the checkpoint evidence section.
@@ -115,6 +135,10 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
 - **V7-E9 — branch audit:** `git diff --check origin/main...HEAD` passed; no phase-1 fixture path changed; no
   `informalsystems-malachitebft` package name remains in a manifest or lockfile; and the lockfile resolves reviewed
   `0.7.0` workspace manifests.
+- **V7-E10 — non-mutating corrupt replay:** the actor-level regression corrupts the middle of a three-frame WAL,
+  replays through `Wal::spawn`, restarts the actor, and proves exact file bytes remain unchanged after both failures.
+  The raw and forced-compression matrices each passed 7/7 WAL compatibility tests, and the complete unit target
+  passed 95/95 without retry.
 
 The first sandboxed `make tests` attempt was stopped after 325/330 completed tests passed and five networked
 byzantine cases timed out. The required unrestricted rerun passed those same cases in 1–3 seconds and completed the

@@ -199,11 +199,6 @@ where
             Err(e) => {
                 error!("Failed to read WAL entry {idx}: {e}");
                 entries.push(Err(e));
-
-                log.truncate(idx as u64).map_err(|e| {
-                    eyre!("Failed to truncate WAL after read error at entry {idx}: {e}")
-                })?;
-
                 break;
             }
         }
