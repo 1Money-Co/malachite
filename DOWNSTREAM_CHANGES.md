@@ -17,10 +17,11 @@ rename. The release commit is merged only after the implementation candidate is 
 invariant or qualifies Emerald.
 
 The exact Malachite code candidate for Emerald is
-`2001721ef3c67ef7588b776dadb2dc4862c6ffb3`. It includes the final review fix that makes builder startup
+`b500f5af5e016847aa8d69fbe6e8fa92f59bf0f2`. It includes the final review fixes that make builder startup
 transactional: a failed default-actor spawn stops and awaits every default actor already created, in reverse
-dependency order, without stopping caller-owned custom actors. The evidence-only documentation commit that follows
-this record is not part of the code candidate.
+dependency order, without stopping caller-owned custom actors. A linked child-actor failure also terminates the node
+supervisor so the embedding application can observe and fail on a dead consensus runtime. The evidence-only
+documentation commit that follows this record is not part of the code candidate.
 
 ### v0.7 behavior inventory
 
@@ -68,6 +69,8 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
   tests, all 3 `consensus_request` tests, and its library target. The startup rollback regression forces sync spawn
   to fail after network, WAL, host, and consensus startup, then proves the default network listener is stopped before
   `build()` returns. The builder tracks and rolls back only default actors; caller-owned custom actors remain live.
+  `child_actor_failure_terminates_the_node_supervisor` also proves a linked child failure is returned by the node
+  supervisor instead of being logged and swallowed.
 - **V7-E2 — package identity and release ancestry:** `cargo metadata --no-deps --format-version 1` reported every
   `arc-malachitebft-*` workspace package at `0.7.0`; `rg '0.7.0-pre' Cargo.toml Cargo.lock` found none.
   `cargo check --workspace --all-targets --all-features` passed. Merge `12483bfc` has first parent `c78247db` and
@@ -97,11 +100,12 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
 - **V7-E7 — WAL feature matrix:** package-default, explicit `wal-force-compression`, and workspace `--all-features`
   `wal_compatibility` nextest runs each passed 6/6. The checked-in phase-1 fixture paths and hashes were unchanged.
 - **V7-E8 — complete development gate:** `cargo build --workspace --all-features` passed. Outside the restricted
-  sandbox, the final candidate's `make tests` passed 530/530 main tests with 13 intentional skips, then 13/13
-  discovery tests with one intentional skip. One discovery topology case crossed its 30-second threshold on its
-  first attempt, passed its configured retry in 29.05 seconds, and passed a separate no-retry run in 29.03 seconds.
-  `cargo check --workspace --all-targets --all-features`, `cargo clippy --tests -- -D warnings`, and
-  `cargo +nightly fmt --all --check` passed.
+  sandbox, the final candidate's `cargo all-tests` passed 536/536 tests with 14 intentional skips. Three WAL tests
+  hit transient missing-file races on their first attempt and passed on their configured retry. The earlier
+  candidate's `make tests` passed 530/530 main tests with 13 intentional skips, then 13/13 discovery tests with one
+  intentional skip. One discovery topology case crossed its 30-second threshold on its first attempt, passed its
+  configured retry in 29.05 seconds, and passed a separate no-retry run in 29.03 seconds. `cargo check --workspace
+  --all-targets --all-features`, `cargo clippy --tests -- -D warnings`, and `cargo +nightly fmt --all --check` passed.
 - **V7-E9 — branch audit:** `git diff --check origin/main...HEAD` passed; no phase-1 fixture path changed; no
   `informalsystems-malachitebft` package name remains in a manifest or lockfile; and the lockfile resolves reviewed
   `0.7.0` workspace manifests.
