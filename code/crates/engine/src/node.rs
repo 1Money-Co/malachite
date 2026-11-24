@@ -1,7 +1,10 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
-use ractor::{Actor, ActorId, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
+use ractor::{
+    Actor, ActorCell, ActorId, ActorProcessingErr, ActorRef, ActorStatus, RpcReplyPort,
+    SupervisionEvent,
+};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -9,11 +12,55 @@ use malachitebft_metrics::Metrics;
 
 #[derive(Debug)]
 pub enum NodeMsg {
-    RegisterSafetyCriticalChild(ActorId, RpcReplyPort<()>),
+    CommitChildren(Vec<ChildRegistration>, RpcReplyPort<Result<(), String>>),
     SafetyFailure(String),
 }
 
+#[derive(Debug)]
+pub struct ChildRegistration {
+    name: &'static str,
+    actor: ActorCell,
+    safety_critical: bool,
+    survives_safety_hang: bool,
+}
+
+impl ChildRegistration {
+    pub fn ordinary(name: &'static str, actor: ActorCell) -> Self {
+        Self {
+            name,
+            actor,
+            safety_critical: false,
+            survives_safety_hang: false,
+        }
+    }
+
+    pub fn safety_critical(name: &'static str, actor: ActorCell) -> Self {
+        Self {
+            name,
+            actor,
+            safety_critical: true,
+            survives_safety_hang: false,
+        }
+    }
+
+    pub fn safety_hang_survivor(name: &'static str, actor: ActorCell) -> Self {
+        Self {
+            name,
+            actor,
+            safety_critical: false,
+            survives_safety_hang: true,
+        }
+    }
+}
+
 pub type NodeRef = ActorRef<NodeMsg>;
+
+fn actor_is_active(actor: &ActorCell) -> bool {
+    matches!(
+        actor.get_status(),
+        ActorStatus::Starting | ActorStatus::Running | ActorStatus::Upgrading
+    )
+}
 
 pub struct Node {
     metrics: Metrics,
@@ -22,6 +69,7 @@ pub struct Node {
 
 pub struct NodeState {
     safety_critical_children: HashSet<ActorId>,
+    safety_hang_survivors: HashSet<ActorId>,
     safety_hang: bool,
     shutting_down: bool,
 }
@@ -44,7 +92,11 @@ impl Node {
         error!(%reason, "Safety-critical failure; entering safety hang");
         state.safety_hang = true;
         self.metrics.set_safety_failure();
-        myself.get_cell().stop_children(Some(reason));
+        for child in myself.get_cell().get_children() {
+            if !state.safety_hang_survivors.contains(&child.get_id()) {
+                child.stop(Some(reason.clone()));
+            }
+        }
     }
 }
 
@@ -61,6 +113,7 @@ impl Actor for Node {
     ) -> Result<Self::State, ActorProcessingErr> {
         Ok(NodeState {
             safety_critical_children: HashSet::new(),
+            safety_hang_survivors: HashSet::new(),
             safety_hang: false,
             shutting_down: false,
         })
@@ -74,9 +127,39 @@ impl Actor for Node {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match msg {
-            NodeMsg::RegisterSafetyCriticalChild(actor, reply_to) => {
-                state.safety_critical_children.insert(actor);
-                let _ = reply_to.send(());
+            NodeMsg::CommitChildren(children, reply_to) => {
+                if state.safety_hang || state.shutting_down {
+                    let _ = reply_to.send(Err("node is not accepting children".to_owned()));
+                    return Ok(());
+                }
+
+                if let Some(child) = children.iter().find(|child| !actor_is_active(&child.actor)) {
+                    let _ = reply_to.send(Err(format!("{} actor is not running", child.name)));
+                    return Ok(());
+                }
+
+                for child in &children {
+                    if child.safety_critical {
+                        state.safety_critical_children.insert(child.actor.get_id());
+                    }
+                    if child.survives_safety_hang {
+                        state.safety_hang_survivors.insert(child.actor.get_id());
+                    }
+                    child.actor.link(myself.get_cell());
+                }
+
+                if let Some(child) = children.iter().find(|child| !actor_is_active(&child.actor)) {
+                    let error = format!("{} actor is not running", child.name);
+                    for child in &children {
+                        child.actor.unlink(myself.get_cell());
+                        state.safety_critical_children.remove(&child.actor.get_id());
+                        state.safety_hang_survivors.remove(&child.actor.get_id());
+                    }
+                    let _ = reply_to.send(Err(error));
+                    return Ok(());
+                }
+
+                let _ = reply_to.send(Ok(()));
                 Ok(())
             }
             NodeMsg::SafetyFailure(reason) => {
@@ -161,7 +244,7 @@ mod tests {
     use ractor::{Actor, ActorProcessingErr, ActorRef};
     use tokio::task::JoinHandle;
 
-    use super::{Node, NodeMsg, NodeRef};
+    use super::{ChildRegistration, Node, NodeMsg, NodeRef};
 
     struct Child;
 
@@ -262,6 +345,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn safety_hang_preserves_registered_survivor() {
+        let registry = SharedRegistry::new(Default::default(), None);
+        let metrics = Metrics::register(&registry);
+        let (node, mut handle) = Node::new(metrics, tracing::Span::none())
+            .spawn()
+            .await
+            .expect("spawn node");
+        let (stopped_child, _) = Actor::spawn(None, Child, ())
+            .await
+            .expect("spawn stopped child");
+        let (survivor, _) = Actor::spawn(None, Child, ()).await.expect("spawn survivor");
+        ractor::call!(
+            node,
+            NodeMsg::CommitChildren,
+            vec![
+                ChildRegistration::ordinary("runtime child", stopped_child.get_cell()),
+                ChildRegistration::safety_hang_survivor(
+                    "application connector",
+                    survivor.get_cell()
+                ),
+            ]
+        )
+        .expect("commit child roles")
+        .expect("children are active");
+
+        node.cast(NodeMsg::SafetyFailure("injected WAL failure".to_owned()))
+            .expect("cast safety failure");
+        stopped_child
+            .wait(Some(Duration::from_secs(2)))
+            .await
+            .expect("runtime child stopped");
+        assert_eq!(survivor.get_status(), ractor::ActorStatus::Running);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut handle)
+                .await
+                .is_err(),
+            "node must remain alive in safety hang"
+        );
+
+        node.stop(None);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("node cleanup timeout")
+            .expect("join node cleanup");
+        survivor
+            .wait(Some(Duration::from_secs(2)))
+            .await
+            .expect("explicit node stop must stop survivor");
+    }
+
+    #[tokio::test]
     async fn ordinary_child_failure_still_terminates_node() {
         let (_node, handle, child, metrics) = spawn_node_with_child().await;
 
@@ -283,9 +417,16 @@ mod tests {
             .expect("spawn node");
         let (child, _) = Actor::spawn(None, Child, ()).await.expect("spawn child");
 
-        ractor::call!(node, NodeMsg::RegisterSafetyCriticalChild, child.get_id())
-            .expect("register safety-critical child");
-        child.link(node.get_cell());
+        ractor::call!(
+            node,
+            NodeMsg::CommitChildren,
+            vec![ChildRegistration::safety_critical(
+                "test child",
+                child.get_cell()
+            )]
+        )
+        .expect("commit safety-critical child")
+        .expect("safety-critical child is running");
         child.cast(ChildMsg::Fail).expect("cast child failure");
         child
             .wait(Some(Duration::from_secs(2)))
@@ -305,6 +446,35 @@ mod tests {
                 .is_err(),
             "safety-critical child failure must keep the node alive"
         );
+
+        node.stop(None);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("node cleanup timeout")
+            .expect("join node cleanup");
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_a_child_that_is_already_stopped() {
+        let registry = SharedRegistry::new(Default::default(), None);
+        let metrics = Metrics::register(&registry);
+        let (node, handle) = Node::new(metrics, tracing::Span::none())
+            .spawn()
+            .await
+            .expect("spawn node");
+        let (child, _) = Actor::spawn(None, Child, ()).await.expect("spawn child");
+        child
+            .stop_and_wait(None, None)
+            .await
+            .expect("stop child before commit");
+
+        let result = ractor::call!(
+            node,
+            NodeMsg::CommitChildren,
+            vec![ChildRegistration::safety_critical("WAL", child.get_cell())]
+        )
+        .expect("commit RPC failed");
+        assert_eq!(result, Err("WAL actor is not running".to_owned()));
 
         node.stop(None);
         tokio::time::timeout(Duration::from_secs(2), handle)

@@ -210,8 +210,10 @@ state or gauge.
 - [ ] **Step 3: Implement the minimal supervisor state machine**
 
 Introduce the message and state described above. On the first safety failure, set the gauge, set `safety_hang`, and
-stop linked children. Ignore expected termination/failure events while safety-hung. Outside safety hang, keep the
-current liveness-failure disposition. Keep the node alive until an explicit stop.
+stop the safety-relevant runtime children while leaving the application connector alive. This keeps the embedding
+application's work channel open so the safety hang cannot become a process failure. Ignore expected
+termination/failure events while safety-hung. Outside safety hang, keep the current liveness-failure disposition.
+Keep the node and connector alive until an explicit stop.
 
 Add a failure utility that reports `NodeMsg::SafetyFailure` and then awaits `pending()` for uncertain runtime WAL
 operations. Do not add persisted state or a recovery command.
@@ -221,7 +223,9 @@ operations. Do not add persisted state or a recovery command.
 Change both app spawn paths so consensus can receive a `NodeRef`. In `EngineBuilder::build`, spawn the node first,
 then spawn dependencies. Keep the existing rollback ledger for defaults and add the new node to rollback. Do not
 link a caller-owned custom WAL, network, or sync actor during partial construction. After every component has
-started successfully, link all runtime children to the node in one success-only step.
+started successfully, commit all child roles and links in one supervisor message, then verify every child is still
+active before returning success. Reject an already-dead custom WAL before spawning dependent actors. This closes the
+registration/link race while retaining caller ownership on earlier build failure.
 
 If default actors need early supervision during construction, only link actors that the rollback ledger owns and
 ensure rollback remains bounded and ordered. Do not use a `Node::pre_start` implementation that unconditionally
@@ -393,8 +397,8 @@ required a minimal sync fix.
 **Interfaces:**
 - Documents: Phase 1 drops an unknown `0x08` record, reports replay failure, and continues with an empty replay
   result; it does not leave the WAL untouched and halt visibly.
-- Establishes: downgrade is allowed only after the validator has successfully advanced beyond the local height that
-  wrote `0x08` and its WAL sequence has advanced.
+- Establishes: downgrade is allowed only after proving the current WAL contains no `0x08`; advancing to a later
+  height alone is insufficient because the later height can write another `0x08`.
 
 - [ ] **Step 1: Replace the incorrect downgrade claims**
 

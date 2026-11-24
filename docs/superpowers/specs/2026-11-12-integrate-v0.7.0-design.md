@@ -285,9 +285,11 @@ Any newly discovered need for that machinery is a scope increase requiring a des
 ### 9. Enter an operator-visible safety hang after WAL durability loss
 
 Treat append, flush, and unknown-outcome WAL transport failures as safety failures. The consensus actor reports the
-failure to the node supervisor and remains pending. The supervisor idempotently enters a safety-hang state, stops its
-children, and remains alive. Child termination while entering that state is expected and must not stop the node.
-Ordinary child failures outside safety hang retain the existing liveness-failure disposition.
+failure to the node supervisor and remains pending. The supervisor idempotently enters a safety-hang state, stops the
+safety-relevant runtime children, and leaves the application connector and supervisor alive. Keeping the connector
+alive keeps Emerald's consensus work channel open, so the embedding application cannot turn the hang into a process
+failure. Child termination while entering that state is expected and must not stop the node. Ordinary child failures
+outside safety hang retain the existing liveness-failure disposition.
 
 Do not emit a fatal event that makes Emerald return a process error for this path. Emerald continues to fail on
 startup and replay corruption, but a runtime WAL durability failure must leave the process alive so
@@ -295,8 +297,9 @@ startup and replay corruption, but a runtime WAL durability failure must leave t
 explicit restart; deleting, truncating, replacing, or restoring a stale WAL is not recovery.
 
 Actor-level tests use `WalBuilder::Custom` with a WAL actor that fails a selected append or flush. They prove that no
-later publish or decide effect occurs, the child actors stop, the supervisor and engine handle stay alive, and an
-explicit test cleanup can terminate the hung runtime. Helper-only tests are insufficient for this contract.
+later publish or decide effect occurs, the safety-relevant child actors stop, the application connector stays open,
+the supervisor and engine handle stay alive, and an explicit test cleanup can terminate the hung runtime.
+Helper-only tests are insufficient for this contract.
 
 This is a runtime supervision change only. It does not change WAL tags, framing, sequence values, Emerald redb,
 validator identities, signed bytes, genesis, or persisted configuration, and requires no data migration.
@@ -307,9 +310,10 @@ Retain decoding for old tags `0x01`, `0x02`, and `0x04`, and add the v0.7.0 polk
 entry contents and replay effects, not only outer framing. New records written with `0x08` are unsupported by the old
 engine. Phase 1 logs and drops the unknown entry while decoding, returns a replay error after its entry-count check,
 then continues consensus with an empty replay result. The phase-2 downgrade boundary therefore depends on operator
-procedure, not a safe old-binary halt: the local validator must first advance beyond the height that wrote `0x08` and
-advance its WAL sequence. This work does not add a WAL marker, preflight command, or new CLI. Silent record loss or
-automatic WAL deletion is forbidden.
+procedure, not a safe old-binary halt: the current WAL must contain no `0x08` record. Merely advancing to a later
+height is insufficient because that later height can write another `0x08`. This work does not add a WAL marker,
+preflight command, or new CLI, so a validator is roll-forward-only when the absence of `0x08` cannot be proved.
+Silent record loss or automatic WAL deletion is forbidden.
 
 Repair the phase-1 compatibility test exposed by workspace-wide `--all-features`:
 
@@ -382,10 +386,11 @@ downstream behavior.
 No bulk database or WAL rewrite is planned. Existing raw records remain readable, and new records use the v0.7.0
 codec. Once a node writes a polka-certificate record with tag `0x08`, Phase 1 drops that record while decoding, emits
 a replay error, then continues with an empty replay result. A validator must therefore not downgrade while its local
-WAL contains `0x08`. Downgrade is permitted only after that validator has successfully entered a later height and its
-local WAL sequence has advanced. No new marker or CLI is planned. Operators must restore the new binary or a
-separately proven forward-compatible successor. Deleting, truncating, or replacing the WAL and restoring stale
-validator state are not recovery procedures.
+WAL contains `0x08`. Advancing to another height is not proof because that height can write another `0x08` record.
+Downgrade is permitted only after proving the current WAL contains no `0x08`; because no marker or preflight CLI is
+planned, the node remains roll-forward-only when that absence cannot be established. Operators must restore the new
+binary or a separately proven forward-compatible successor. Deleting, truncating, or replacing the WAL and restoring
+stale validator state are not recovery procedures.
 
 Development completion does not establish rolling readiness. Production qualification must exercise the actual old
 and new Emerald/Malachite pair with realistic voting power, persistent peers, restart state, proposal sizes, storage,

@@ -238,7 +238,7 @@ async fn run_fault_scenario(fault: Fault) {
         .await
         .expect("build engine");
     let mut events = channels.events.subscribe();
-    let app = tokio::spawn(drive_application(channels.consensus, validators));
+    let mut app = tokio::spawn(drive_application(channels.consensus, validators));
 
     tokio::time::timeout(Duration::from_secs(2), probe.reached.notified())
         .await
@@ -250,10 +250,12 @@ async fn run_fault_scenario(fault: Fault) {
         .wait(Some(Duration::from_secs(2)))
         .await
         .expect("node did not stop network child");
-    tokio::time::timeout(Duration::from_secs(2), app)
-        .await
-        .expect("application connector did not stop")
-        .expect("application driver panicked");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut app)
+            .await
+            .is_err(),
+        "application connector stopped and exposed the safety hang as a process failure"
+    );
 
     while let Ok(event) = events.try_recv() {
         assert!(
@@ -291,6 +293,10 @@ async fn run_fault_scenario(fault: Fault) {
         .await
         .expect("engine cleanup timeout")
         .expect("join engine cleanup");
+    tokio::time::timeout(Duration::from_secs(2), app)
+        .await
+        .expect("application connector did not stop during explicit cleanup")
+        .expect("application driver panicked");
 }
 
 #[tokio::test]

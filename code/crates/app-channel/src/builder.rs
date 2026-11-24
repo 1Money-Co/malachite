@@ -14,7 +14,7 @@ use malachitebft_app::types::codec::HasEncodedLen;
 use malachitebft_engine::consensus::ConsensusRef;
 use malachitebft_engine::host::HostRef;
 use malachitebft_engine::network::{NetworkIdentity, NetworkRef};
-use malachitebft_engine::node::{NodeMsg, NodeRef};
+use malachitebft_engine::node::{ChildRegistration, NodeMsg, NodeRef};
 use malachitebft_engine::sync::SyncRef;
 use malachitebft_engine::util::events::TxEvent;
 use malachitebft_engine::util::output_port::{OutputPort, OutputPortSubscriberTrait};
@@ -851,6 +851,14 @@ where
                 spawned
             }
         };
+        if !matches!(
+            wal.get_status(),
+            ractor::ActorStatus::Starting
+                | ractor::ActorStatus::Running
+                | ractor::ActorStatus::Upgrading
+        ) {
+            return rollback.fail(eyre::eyre!("WAL actor is not running")).await;
+        }
 
         // 4. Host actor (use the default channel-based Connector)
         let (connector, rx_consensus) = match spawn_host_actor(metrics.clone()).await {
@@ -912,23 +920,27 @@ where
             sync.subscribe_to_port(&sync_port);
         }
 
-        // A dead WAL leaves durability unknown, so register it before linking children.
-        if let Err(error) = ractor::call!(node, NodeMsg::RegisterSafetyCriticalChild, wal.get_id())
-        {
-            return rollback
-                .fail(eyre::eyre!(
-                    "failed to register WAL as safety-critical: {error}"
-                ))
-                .await;
-        }
-
-        // Linking is the build commit point. Custom actors remain caller-owned if an earlier step fails.
-        network.link(node.get_cell());
-        wal.link(node.get_cell());
-        connector.link(node.get_cell());
-        consensus.link(node.get_cell());
+        // Linking is the build commit point. The supervisor installs every child role and link in one
+        // actor turn, then verifies liveness. This closes the gap where a dead WAL could be registered
+        // before it was linked. The application connector intentionally survives a safety hang so its
+        // work channel stays open and the embedding process cannot turn the hang into an automatic restart.
+        let mut children = vec![
+            ChildRegistration::ordinary("network", network.get_cell()),
+            ChildRegistration::safety_critical("WAL", wal.get_cell()),
+            ChildRegistration::safety_hang_survivor("application connector", connector.get_cell()),
+            ChildRegistration::ordinary("consensus", consensus.get_cell()),
+        ];
         if let Some(sync) = &sync {
-            sync.link(node.get_cell());
+            children.push(ChildRegistration::ordinary("sync", sync.get_cell()));
+        }
+        match ractor::call!(node, NodeMsg::CommitChildren, children) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return rollback.fail(eyre::eyre!(error)).await,
+            Err(error) => {
+                return rollback
+                    .fail(eyre::eyre!("failed to commit engine children: {error}"))
+                    .await;
+            }
         }
 
         // Spawn request handling tasks
@@ -1289,6 +1301,69 @@ mod tests {
         wal.stop_and_wait(None, None)
             .await
             .expect("stop caller-owned WAL");
+    }
+
+    #[tokio::test]
+    async fn build_rejects_custom_wal_that_dies_before_commit() {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).expect("reserve test port");
+        let listen_addr = probe.local_addr().expect("read test port");
+        drop(probe);
+
+        let mut consensus = ConsensusConfig::default();
+        consensus.p2p.listen_addr = format!("/ip4/127.0.0.1/tcp/{}", listen_addr.port())
+            .parse()
+            .expect("valid listen multiaddr");
+        let config = FailingSyncConfig {
+            consensus,
+            value_sync: ValueSyncConfig::default(),
+        };
+        let wal_dir = tempfile::tempdir().expect("create WAL directory");
+        let wal = Wal::spawn(
+            &TestContext::default(),
+            ProtobufCodec,
+            wal_dir.path().join("dead-custom.wal"),
+            SharedRegistry::global().clone(),
+            tracing::Span::none(),
+        )
+        .await
+        .expect("spawn custom WAL");
+        wal.stop_and_wait(None, None)
+            .await
+            .expect("stop custom WAL before build commit");
+        let identity = NetworkIdentity::new(
+            config.moniker().to_owned(),
+            Keypair::generate_ed25519(),
+            None,
+        );
+
+        let result = EngineBuilder::new(TestContext::default(), config)
+            .with_custom_wal(wal)
+            .with_default_network(NetworkContext::new(identity, JsonCodec))
+            .with_no_sync()
+            .with_default_consensus(ConsensusContext::new_full_node(
+                Address::new([0; 20]),
+                Box::new(Ed25519Verifier),
+            ))
+            .with_default_request(RequestContext::new(1))
+            .build()
+            .await;
+
+        match result {
+            Err(error) => assert!(
+                error.to_string().contains("WAL actor is not running"),
+                "unexpected build error: {error}"
+            ),
+            Ok((_channels, engine)) => {
+                engine.actor.stop(None);
+                let _ = engine.handle.await;
+                panic!("builder accepted a WAL actor that died before commit");
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            TcpStream::connect_timeout(&listen_addr, Duration::from_secs(1)).is_err(),
+            "failed build must stop the network listener"
+        );
     }
 
     #[tokio::test]

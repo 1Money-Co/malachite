@@ -142,11 +142,12 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
   The raw and forced-compression matrices each passed 7/7 WAL compatibility tests, and the complete unit target
   passed 95/95 without retry.
 - **V7-E11 — runtime WAL safety hang:** real `WalBuilder::Custom` append, flush, and actor-loss failures each passed
-  through the production actor wiring. All cases stopped the runtime children, emitted no later publish, decide, or
-  `WalWriteError` event, set `node_safety_failure` to one, and left the engine handle pending until explicit test
-  cleanup. Builder regressions also prove failed construction preserves caller-owned custom actors and successful
-  construction links them to the safety supervisor. The focused engine supervisor suite passed 7/7, and the WAL,
-  replay, and finalization filter passed 7/7 without retry.
+  through the production actor wiring. All cases stopped safety-relevant runtime children while keeping the
+  application connector open, emitted no later publish, decide, or `WalWriteError` event, set `node_safety_failure`
+  to one, and left both the application driver and engine handle pending until explicit test cleanup. Builder
+  regressions also prove failed construction preserves caller-owned custom actors, rejects a WAL that dies before
+  commit, and atomically commits child roles and links. The focused engine supervisor suite and app-channel suite
+  passed without retry.
 - **V7-E12 — restored sync fault and mode coverage:** the complete value-sync integration filter passed 26/26
   scenarios without retry. The restored matrix covers decision-driven status updates and skipped early commits in
   eager and interval modes, plus local decode failures for parts-only and proposal-and-parts payloads in both modes.
@@ -155,8 +156,9 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
   new request without changing the serving peer's score.
 - **V7-E13 — downgrade and recovery boundary:** the documentation now matches the Phase-1 `fetch_entries` and
   `wal_fetch` paths: an unknown `0x08` is dropped during decode, reported as replay failure, replaced with an empty
-  replay result, and followed by normal consensus progress. Downgrade is allowed only after the local validator and
-  WAL sequence advance beyond the height that wrote `0x08`. Runtime append, flush, and WAL actor-loss failures use
+  replay result, and followed by normal consensus progress. Downgrade is allowed only after proving the current WAL
+  contains no `0x08`; advancing to a later height is insufficient because that height can write another `0x08`.
+  Runtime append, flush, and WAL actor-loss failures use
   the supervisor safety hang; startup corruption blocks normal startup; ordinary liveness failures may still exit.
   Recovery explicitly forbids deleting, truncating, replacing, or restoring a stale WAL.
 
@@ -175,8 +177,8 @@ parallel work, and the Phase-2 pull request must not merge before its linked evi
 - **V7-G5:** every height start/restart carries the intended validator set, timeouts, and target time.
 - **V7-G6:** every phase-1 sync lifecycle and peer-restart scenario passes on the v0.7 queue without retry.
 - **V7-G7:** Emerald authenticates local, forwarded, mixed-path, hidden-lock, and restreamed proposal content.
-- **V7-G8:** old WALs read; `0x08` round-trips and restarts; Phase 1 is used only after the local WAL advances beyond
-  a height that wrote `0x08`.
+- **V7-G8:** old WALs read; `0x08` round-trips and restarts; Phase 1 is used only after proving the current WAL
+  contains no `0x08`.
 - **V7-G9:** a non-empty validator WAL always replays before sync can change the crash height.
 - **V7-G10:** raw mode preserves fixture bytes and forced compression preserves decoded entries and replay behavior.
 

@@ -503,10 +503,11 @@ continues normal operation. The WAL bytes remain unchanged, but the validator
 has recovered without its recorded votes or lock certificate.
 
 Once a validator writes `0x08`, it must keep this version or a later compatible
-decoder at that local height. Downgrade is permitted only after the validator
-has successfully entered a later height and its local WAL sequence has advanced
-past the height that wrote `0x08`. There is no preflight guard or WAL marker that
-enforces this boundary.
+decoder while its current WAL contains any `0x08` record. Advancing to a later
+height is insufficient because that height can write another `0x08`. Downgrade
+is permitted only after proving the current WAL contains no `0x08`; there is no
+preflight guard or WAL marker, so the node is roll-forward-only when that
+absence cannot be established.
 
 ### Persistence
 
@@ -538,13 +539,16 @@ process.
 As a result, errors when attempting to append inputs to the WAL **must be
 critical**. Runtime append, flush, and unknown-outcome WAL actor-call failures
 notify the node supervisor before consensus remains pending. The supervisor
-sets the `node_safety_failure` gauge, stops its runtime children, and stays
-alive. It does not emit `WalWriteError` or return a process failure, so an
-automatic `Restart=on-failure` policy cannot restart the validator into an
-uncertain durability state.
+sets the `node_safety_failure` gauge, stops the safety-relevant runtime
+children, and keeps both itself and the application connector alive. The open
+connector keeps the embedding application's work channel pending. The path does
+not emit `WalWriteError` or return a process failure, so an automatic
+`Restart=on-failure` policy cannot restart the validator into an uncertain
+durability state.
 
 An operator should treat the safety gauge, the safety-failure log, stopped
-runtime children, and a still-running supervisor process as a safety halt. The
+safety-relevant runtime children, and a still-running connector and supervisor
+as a safety halt. The
 operator must diagnose the WAL and underlying storage, preserve the WAL and
 application state as evidence, and restart explicitly only after establishing
 that the stored state is safe. Deleting, truncating, replacing, or restoring a
