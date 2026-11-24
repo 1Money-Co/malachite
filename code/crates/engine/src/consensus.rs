@@ -124,6 +124,32 @@ fn finish_consensus_message(
     }
 }
 
+fn finish_consensus_effect<Ctx: Context>(
+    result: Result<Resume<Ctx>, ActorProcessingErr>,
+) -> Result<Resume<Ctx>, ActorProcessingErr> {
+    match result {
+        Ok(resume) => Ok(resume),
+        Err(error) => finish_consensus_effect_error(error).map(|()| Resume::Continue),
+    }
+}
+
+fn finish_consensus_effect_error(error: ActorProcessingErr) -> Result<(), ActorProcessingErr> {
+    error!("Error when processing effect: {error:?}");
+    if error.downcast_ref::<FatalConsensusError>().is_some() {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+fn propagate_fatal_consensus_error(error: ActorProcessingErr) -> Result<(), ActorProcessingErr> {
+    if error.downcast_ref::<FatalConsensusError>().is_some() {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
 pub struct Consensus<Ctx>
 where
     Ctx: Context,
@@ -371,12 +397,12 @@ where
         myself: &ActorRef<Msg<Ctx>>,
         state: &mut State<Ctx>,
         input: ConsensusInput<Ctx>,
-    ) -> Result<(), ConsensusError<Ctx>> {
+    ) -> Result<(), ActorProcessingErr> {
         malachitebft_core_consensus::process!(
             input: input,
             state: state.consensus.as_mut().expect("Consensus not started"),
             metrics: &self.metrics,
-            with: effect => {
+            try_with: effect => {
                 let handler_state = HandlerState {
                     phase: state.phase,
                     is_validator: state.is_validator,
@@ -384,7 +410,7 @@ where
                     timeouts: state.timeouts,
                 };
 
-                self.handle_effect(myself, handler_state, effect).await
+                finish_consensus_effect(self.handle_effect(myself, handler_state, effect).await)
             }
         )
     }
@@ -506,6 +532,7 @@ where
 
                 if let Err(e) = result {
                     error!(%height, "Error when starting height: {e}");
+                    propagate_fatal_consensus_error(e)?;
                 }
 
                 // A validator must reconstruct its recorded crash state before
@@ -546,6 +573,7 @@ where
                         height = %value.height, round = %value.round,
                         "Error when processing ProposeValue message: {e}"
                     );
+                    propagate_fatal_consensus_error(e)?;
                 }
 
                 self.tx_event.send(|| Event::ProposedValue(value));
@@ -598,6 +626,7 @@ where
                             .await
                         {
                             error!(%from, "Error when processing vote: {e}");
+                            propagate_fatal_consensus_error(e)?;
                         }
                     }
 
@@ -616,6 +645,7 @@ where
                             .await
                         {
                             error!(%from, "Error when processing proposal: {e}");
+                            propagate_fatal_consensus_error(e)?;
                         }
                     }
 
@@ -629,6 +659,7 @@ where
                             .await
                         {
                             error!(%from, "Error when processing polka certificate: {e}");
+                            propagate_fatal_consensus_error(e)?;
                         }
                     }
 
@@ -642,6 +673,7 @@ where
                             .await
                         {
                             error!(%from, "Error when processing round certificate: {e}");
+                            propagate_fatal_consensus_error(e)?;
                         }
                     }
 
@@ -723,6 +755,7 @@ where
 
                 if let Err(e) = self.timeout_elapsed(&myself, state, timeout).await {
                     error!("Error when processing TimeoutElapsed message: {e:?}");
+                    propagate_fatal_consensus_error(e)?;
                 }
 
                 Ok(())
@@ -738,6 +771,7 @@ where
 
                 if let Err(e) = result {
                     error!("Error when processing ReceivedProposedValue message: {e}");
+                    propagate_fatal_consensus_error(e)?;
                 }
 
                 Ok(())
@@ -762,6 +796,7 @@ where
                         %height, %round, %value, %peer,
                         "Failed to process sync response: {e:?}"
                     );
+                    propagate_fatal_consensus_error(e)?;
                 }
 
                 Ok(())
@@ -809,7 +844,7 @@ where
         myself: &ActorRef<Msg<Ctx>>,
         state: &mut State<Ctx>,
         timeout: Timeout,
-    ) -> Result<(), ConsensusError<Ctx>> {
+    ) -> Result<(), ActorProcessingErr> {
         // Make sure the associated timer is cancelled
         state.timers.cancel(&timeout);
 
@@ -894,7 +929,7 @@ where
         state: &mut State<Ctx>,
         height: Ctx::Height,
         entries: Vec<io::Result<WalEntry<Ctx>>>,
-    ) -> Result<(), Arc<ConsensusError<Ctx>>> {
+    ) -> Result<(), ActorProcessingErr> {
         use SignedConsensusMsg::*;
 
         assert_eq!(state.phase, Phase::Recovering);
@@ -921,7 +956,7 @@ where
                     self.tx_event
                         .send(|| Event::WalCorrupted(Arc::clone(&error)));
 
-                    return Err(Arc::new(ConsensusError::WalCorrupted(error)));
+                    return Err(Box::new(ConsensusError::<Ctx>::WalCorrupted(error)));
                 }
             };
 
@@ -937,13 +972,7 @@ where
                     {
                         error!("Error when replaying vote: {e}");
 
-                        let e = Arc::new(e);
-                        self.tx_event.send({
-                            let e = Arc::clone(&e);
-                            || Event::WalReplayError(e)
-                        });
-
-                        return Err(e);
+                        return Err(self.report_wal_replay_error(e));
                     }
                 }
 
@@ -956,13 +985,7 @@ where
                     {
                         error!("Error when replaying Proposal: {e}");
 
-                        let e = Arc::new(e);
-                        self.tx_event.send({
-                            let e = Arc::clone(&e);
-                            || Event::WalReplayError(e)
-                        });
-
-                        return Err(e);
+                        return Err(self.report_wal_replay_error(e));
                     }
                 }
 
@@ -972,13 +995,7 @@ where
                     if let Err(e) = self.timeout_elapsed(myself, state, timeout).await {
                         error!("Error when replaying TimeoutElapsed: {e}");
 
-                        let e = Arc::new(e);
-                        self.tx_event.send({
-                            let e = Arc::clone(&e);
-                            || Event::WalReplayError(e)
-                        });
-
-                        return Err(e);
+                        return Err(self.report_wal_replay_error(e));
                     }
                 }
 
@@ -995,13 +1012,7 @@ where
                     {
                         error!("Error when replaying LocallyProposedValue: {e}");
 
-                        let e = Arc::new(e);
-                        self.tx_event.send({
-                            let e = Arc::clone(&e);
-                            || Event::WalReplayError(e)
-                        });
-
-                        return Err(e);
+                        return Err(self.report_wal_replay_error(e));
                     }
                 }
 
@@ -1014,13 +1025,7 @@ where
                     {
                         error!("Error when replaying PolkaCertificate: {e}");
 
-                        let e = Arc::new(e);
-                        self.tx_event.send({
-                            let e = Arc::clone(&e);
-                            || Event::WalReplayError(e)
-                        });
-
-                        return Err(e);
+                        return Err(self.report_wal_replay_error(e));
                     }
                 }
             }
@@ -1029,6 +1034,20 @@ where
         self.tx_event.send(|| Event::WalReplayDone(state.height()));
 
         Ok(())
+    }
+
+    fn report_wal_replay_error(&self, error: ActorProcessingErr) -> ActorProcessingErr {
+        match error.downcast::<ConsensusError<Ctx>>() {
+            Ok(error) => {
+                let event_error = Arc::new(*error);
+                self.tx_event.send({
+                    let event_error = Arc::clone(&event_error);
+                    || Event::WalReplayError(event_error)
+                });
+                eyre!(event_error.to_string()).into()
+            }
+            Err(error) => error,
+        }
     }
 
     fn get_value(
@@ -1721,7 +1740,10 @@ mod tests {
 
     use ractor::ActorProcessingErr;
 
-    use super::{finish_consensus_message, wal_operation_result, FatalConsensusError};
+    use super::{
+        finish_consensus_effect_error, finish_consensus_message, propagate_fatal_consensus_error,
+        wal_operation_result, FatalConsensusError,
+    };
 
     #[test]
     fn wal_append_operation_failure_is_fatal() {
@@ -1788,12 +1810,22 @@ mod tests {
     }
 
     #[test]
-    fn fatal_wal_error_fails_the_consensus_actor() {
+    fn fatal_wal_effect_fails_the_consensus_actor() {
         let error: ActorProcessingErr =
             Box::new(FatalConsensusError("WAL durability lost".to_owned()));
 
-        let result = finish_consensus_message(Err(error));
+        let effect_error = finish_consensus_effect_error(error).unwrap_err();
+        let result = finish_consensus_message(propagate_fatal_consensus_error(effect_error));
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn nonfatal_effect_error_preserves_continue_semantics() {
+        let error: ActorProcessingErr = Box::new(io::Error::other("transient host failure"));
+
+        let result = finish_consensus_effect_error(error);
+
+        assert!(result.is_ok());
     }
 }

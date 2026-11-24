@@ -10,6 +10,8 @@ use malachitebft_test::{
     Address, Height, Proposal, Signature, TestContext, Validator, ValidatorSet, Value, Vote,
 };
 
+type TestProcessingError = Box<dyn std::error::Error + Send + Sync>;
+
 fn run(r: Result<(), Error<TestContext>>) {
     drop(r);
 }
@@ -41,6 +43,88 @@ fn handle_effect(effect: Effect<TestContext>) -> Result<Resume<TestContext>, ()>
         }
         _ => Resume::Continue,
     })
+}
+
+#[test]
+fn wal_append_failure_stops_before_signing_or_publishing() {
+    let [(validator, _private_key)] = make_validators([1]);
+    let proposer = validator.address;
+    let validators = vec![validator];
+    let validator_set = ValidatorSet::new(validators.clone());
+    let metrics = Metrics::new();
+    let mut state = make_state(&validators, proposer);
+
+    run(process!(
+        input: Input::StartHeight(Height::new(1), validator_set, false, None),
+        state: &mut state,
+        metrics: &metrics,
+        with: effect => handle_effect(effect)
+    ));
+
+    let value = Value::new(9999);
+    let proposal = SignedProposal::new(
+        Proposal::new(
+            Height::new(1),
+            Round::new(0),
+            value.clone(),
+            Round::Nil,
+            proposer,
+        ),
+        Signature::test(),
+    );
+    run(process!(
+        input: Input::Proposal(proposal),
+        state: &mut state,
+        metrics: &metrics,
+        with: effect => handle_effect(effect)
+    ));
+
+    let mut wal_failed = false;
+    let mut later_sign_or_publish = 0;
+    let processed: Result<(), TestProcessingError> = process!(
+        input: Input::ProposedValue(
+            ProposedValue {
+                height: Height::new(1),
+                round: Round::new(0),
+                valid_round: Round::Nil,
+                proposer,
+                value,
+                validity: Validity::Valid,
+            },
+            ValueOrigin::Consensus,
+        ),
+        state: &mut state,
+        metrics: &metrics,
+        try_with: effect => {
+            match effect {
+                Effect::WalAppend(_, _, _) => {
+                    wal_failed = true;
+                    Err(std::io::Error::other("injected WAL append failure").into())
+                }
+                Effect::SignVote(_, _)
+                | Effect::SignProposal(_, _)
+                | Effect::PublishConsensusMsg(_, _)
+                | Effect::PublishLivenessMsg(_, _) => {
+                    if wal_failed {
+                        later_sign_or_publish += 1;
+                    }
+                    handle_effect(effect).map_err(|()| {
+                        std::io::Error::other("effect handler failed unexpectedly").into()
+                    })
+                }
+                _ => handle_effect(effect).map_err(|()| {
+                    std::io::Error::other("effect handler failed unexpectedly").into()
+                }),
+            }
+        }
+    );
+
+    assert!(processed.is_err());
+    assert!(wal_failed, "test input must attempt to append to the WAL");
+    assert_eq!(
+        later_sign_or_publish, 0,
+        "no signing or publication effect may run after WAL append failure"
+    );
 }
 
 fn drive_to_finalization(

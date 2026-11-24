@@ -19,6 +19,21 @@
 /// ```
 #[macro_export]
 macro_rules! process {
+    (input: $input:expr, state: $state:expr, metrics: $metrics:expr, try_with: $effect:ident => $handle:expr) => {{
+        let mut gen = $crate::gen::Gen::new(|co| $crate::handle(co, $state, $metrics, $input));
+        let mut co_result = gen.resume_with($crate::Resume::Start);
+
+        'proc: loop {
+            match co_result {
+                $crate::gen::CoResult::Yielded($effect) => match $handle {
+                    Ok(resume) => co_result = gen.resume_with(resume),
+                    Err(error) => break 'proc Err(error),
+                },
+                $crate::gen::CoResult::Complete(result) => break 'proc result.map_err(Into::into),
+            }
+        }
+    }};
+
     (input: $input:expr, state: $state:expr, metrics: $metrics:expr, with: $effect:ident => $handle:expr) => {{
         let mut gen = $crate::gen::Gen::new(|co| $crate::handle(co, $state, $metrics, $input));
         let mut co_result = gen.resume_with($crate::Resume::Start);
