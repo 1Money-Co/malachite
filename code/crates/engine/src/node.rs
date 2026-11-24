@@ -13,6 +13,10 @@ use crate::wal::WalRef;
 
 pub type NodeRef = ActorRef<()>;
 
+fn propagate_child_failure(error: ActorProcessingErr) -> Result<(), ActorProcessingErr> {
+    Err(error)
+}
+
 #[allow(dead_code)]
 pub struct Node<Ctx: Context> {
     ctx: Ctx,
@@ -111,10 +115,25 @@ where
             }
             SupervisionEvent::ActorFailed(cell, error) => {
                 error!("Actor {} has failed: {error}", cell.get_id());
+                return propagate_child_failure(error);
             }
             SupervisionEvent::ProcessGroupChanged(_) => (),
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::propagate_child_failure;
+
+    #[test]
+    fn child_actor_failure_terminates_the_node_supervisor() {
+        let result = propagate_child_failure(Box::new(io::Error::other("child actor failed")));
+
+        assert_eq!(result.unwrap_err().to_string(), "child actor failed");
     }
 }

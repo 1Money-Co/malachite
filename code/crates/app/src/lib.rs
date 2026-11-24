@@ -16,7 +16,7 @@ pub mod spawn;
 pub mod types;
 
 pub mod events {
-    pub use malachitebft_engine::util::events::{RxEvent, TxEvent};
+    pub use malachitebft_engine::util::events::{Event, RxEvent, TxEvent};
 }
 
 pub mod net {
