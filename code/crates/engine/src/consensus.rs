@@ -29,8 +29,10 @@ use malachitebft_sync::HeightStartType;
 
 use crate::host::{HeightParams, HostMsg, HostRef, LocallyProposedValue, Next, ProposedValue};
 use crate::network::{NetworkEvent, NetworkMsg, NetworkRef};
+use crate::node::NodeRef;
 use crate::sync::Msg as SyncMsg;
 use crate::util::events::{Event, TxEvent};
+use crate::util::failure::hang_on_safety_failure;
 use crate::util::msg_buffer::MessageBuffer;
 use crate::util::output_port::OutputPort;
 use crate::util::ractor::cast_option_and_handle;
@@ -77,91 +79,6 @@ where
 
 pub type ConsensusRef<Ctx> = ActorRef<Msg<Ctx>>;
 
-#[derive(Debug)]
-struct FatalConsensusError(String);
-
-impl fmt::Display for FatalConsensusError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for FatalConsensusError {}
-
-fn wal_operation_result<OperationError, CallError>(
-    operation: &str,
-    call: &str,
-    result: Result<Result<(), OperationError>, CallError>,
-) -> Result<(), ActorProcessingErr>
-where
-    OperationError: fmt::Display,
-    CallError: fmt::Display,
-{
-    match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(Box::new(FatalConsensusError(format!(
-            "Failed to {operation}: {error}"
-        )))),
-        Err(error) => Err(Box::new(FatalConsensusError(format!(
-            "Failed to {call}: {error}"
-        )))),
-    }
-}
-
-fn finish_consensus_message(
-    result: Result<(), ActorProcessingErr>,
-) -> Result<(), ActorProcessingErr> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            error!("Error when handling message: {error:?}");
-            if error.downcast_ref::<FatalConsensusError>().is_some() {
-                Err(error)
-            } else {
-                Ok(())
-            }
-        }
-    }
-}
-
-fn finish_consensus_effect<Ctx: Context>(
-    result: Result<Resume<Ctx>, ActorProcessingErr>,
-) -> Result<Resume<Ctx>, ActorProcessingErr> {
-    match result {
-        Ok(resume) => Ok(resume),
-        Err(error) => finish_consensus_effect_error(error).map(|()| Resume::Continue),
-    }
-}
-
-fn finish_consensus_effect_error(error: ActorProcessingErr) -> Result<(), ActorProcessingErr> {
-    error!("Error when processing effect: {error:?}");
-    if error.downcast_ref::<FatalConsensusError>().is_some() {
-        Err(error)
-    } else {
-        Ok(())
-    }
-}
-
-fn propagate_fatal_consensus_error(error: ActorProcessingErr) -> Result<(), ActorProcessingErr> {
-    if error.downcast_ref::<FatalConsensusError>().is_some() {
-        Err(error)
-    } else {
-        Ok(())
-    }
-}
-
-fn finish_buffered_message(
-    result: Result<(), ActorProcessingErr>,
-) -> Result<(), ActorProcessingErr> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            error!("Error when handling buffered message: {error:?}");
-            propagate_fatal_consensus_error(error)
-        }
-    }
-}
-
 pub struct Consensus<Ctx>
 where
     Ctx: Context,
@@ -174,6 +91,7 @@ where
     network: NetworkRef<Ctx>,
     host: HostRef<Ctx>,
     wal: WalRef<Ctx>,
+    node: NodeRef,
     sync: Arc<OutputPort<SyncMsg<Ctx>>>,
     metrics: Metrics,
     tx_event: TxEvent<Ctx>,
@@ -373,6 +291,7 @@ where
         network: NetworkRef<Ctx>,
         host: HostRef<Ctx>,
         wal: WalRef<Ctx>,
+        node: NodeRef,
         sync: Arc<OutputPort<SyncMsg<Ctx>>>,
         metrics: Metrics,
         tx_event: TxEvent<Ctx>,
@@ -387,6 +306,7 @@ where
             network,
             host,
             wal,
+            node,
             sync,
             metrics,
             tx_event,
@@ -422,7 +342,13 @@ where
                     timeouts: state.timeouts,
                 };
 
-                finish_consensus_effect(self.handle_effect(myself, handler_state, effect).await)
+                match self.handle_effect(myself, handler_state, effect).await {
+                    Ok(resume) => Ok(resume),
+                    Err(error) => {
+                        error!("Error when processing effect: {error:?}");
+                        Ok(Resume::Continue)
+                    }
+                }
             }
         )
     }
@@ -447,7 +373,9 @@ where
         while let Some(msg) = state.msg_buffer.pop() {
             debug!("Replaying buffered message: {msg}");
 
-            finish_buffered_message(self.handle_msg(myself.clone(), state, msg).await)?;
+            if let Err(error) = self.handle_msg(myself.clone(), state, msg).await {
+                error!("Error when handling buffered message: {error:?}");
+            }
         }
 
         Ok(())
@@ -544,7 +472,6 @@ where
 
                 if let Err(e) = result {
                     error!(%height, "Error when starting height: {e}");
-                    propagate_fatal_consensus_error(e)?;
                 }
 
                 // A validator must reconstruct its recorded crash state before
@@ -586,7 +513,6 @@ where
                         height = %value.height, round = %value.round,
                         "Error when processing ProposeValue message: {e}"
                     );
-                    propagate_fatal_consensus_error(e)?;
                 }
 
                 self.tx_event.send(|| Event::ProposedValue(value));
@@ -639,7 +565,6 @@ where
                             .await
                         {
                             error!(%from, "Error when processing vote: {e}");
-                            propagate_fatal_consensus_error(e)?;
                         }
                     }
 
@@ -658,7 +583,6 @@ where
                             .await
                         {
                             error!(%from, "Error when processing proposal: {e}");
-                            propagate_fatal_consensus_error(e)?;
                         }
                     }
 
@@ -672,7 +596,6 @@ where
                             .await
                         {
                             error!(%from, "Error when processing polka certificate: {e}");
-                            propagate_fatal_consensus_error(e)?;
                         }
                     }
 
@@ -686,7 +609,6 @@ where
                             .await
                         {
                             error!(%from, "Error when processing round certificate: {e}");
-                            propagate_fatal_consensus_error(e)?;
                         }
                     }
 
@@ -768,7 +690,6 @@ where
 
                 if let Err(e) = self.timeout_elapsed(&myself, state, timeout).await {
                     error!("Error when processing TimeoutElapsed message: {e:?}");
-                    propagate_fatal_consensus_error(e)?;
                 }
 
                 Ok(())
@@ -784,7 +705,6 @@ where
 
                 if let Err(e) = result {
                     error!("Error when processing ReceivedProposedValue message: {e}");
-                    propagate_fatal_consensus_error(e)?;
                 }
 
                 Ok(())
@@ -809,7 +729,6 @@ where
                         %height, %round, %value, %peer,
                         "Failed to process sync response: {e:?}"
                     );
-                    propagate_fatal_consensus_error(e)?;
                 }
 
                 Ok(())
@@ -1130,13 +1049,22 @@ where
             return Ok(());
         }
 
-        let result = wal_operation_result(
-            "append entry to WAL",
-            "send Append command to WAL actor",
-            ractor::call!(self.wal, WalMsg::Append, height, entry),
-        );
-        self.publish_fatal_wal_error(&result);
-        result
+        hang_on_safety_failure(
+            &self.node,
+            async {
+                match ractor::call!(self.wal, WalMsg::Append, height, entry) {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(format!("Failed to append entry to WAL: {error}")),
+                    Err(error) => Err(format!(
+                        "Failed to send Append command to WAL actor: {error}"
+                    )),
+                }
+            },
+            |reason| reason,
+        )
+        .await;
+
+        Ok(())
     }
 
     async fn wal_flush(&self, phase: Phase, is_validator: bool) -> Result<(), ActorProcessingErr> {
@@ -1144,20 +1072,22 @@ where
             return Ok(());
         }
 
-        let result = wal_operation_result(
-            "flush WAL to disk",
-            "send Flush command to WAL actor",
-            ractor::call!(self.wal, WalMsg::Flush),
-        );
-        self.publish_fatal_wal_error(&result);
-        result
-    }
+        hang_on_safety_failure(
+            &self.node,
+            async {
+                match ractor::call!(self.wal, WalMsg::Flush) {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(format!("Failed to flush WAL to disk: {error}")),
+                    Err(error) => Err(format!(
+                        "Failed to send Flush command to WAL actor: {error}"
+                    )),
+                }
+            },
+            |reason| reason,
+        )
+        .await;
 
-    fn publish_fatal_wal_error(&self, result: &Result<(), ActorProcessingErr>) {
-        if let Err(error) = result {
-            let report = Arc::new(eyre!(error.to_string()));
-            self.tx_event.send(move || Event::WalWriteError(report));
-        }
+        Ok(())
     }
 
     async fn handle_effect(
@@ -1669,7 +1599,11 @@ where
             return Ok(());
         }
 
-        finish_consensus_message(self.handle_msg(myself.clone(), state, msg).await)
+        if let Err(error) = self.handle_msg(myself.clone(), state, msg).await {
+            error!("Error when handling message: {error:?}");
+        }
+
+        Ok(())
     }
 
     #[tracing::instrument(
@@ -1745,141 +1679,4 @@ async fn hang_on_failure<A, E>(
 async fn hang() -> ! {
     pending::<()>().await;
     unreachable!()
-}
-
-#[cfg(test)]
-mod tests {
-    use std::io;
-
-    use ractor::ActorProcessingErr;
-
-    use super::{
-        finish_buffered_message, finish_consensus_effect_error, finish_consensus_message,
-        propagate_fatal_consensus_error, wal_operation_result, FatalConsensusError,
-    };
-
-    #[test]
-    fn wal_append_operation_failure_is_fatal() {
-        let result: Result<Result<(), io::Error>, io::Error> =
-            Ok(Err(io::Error::other("append disk failure")));
-
-        let error = wal_operation_result(
-            "append entry to WAL",
-            "send Append command to WAL actor",
-            result,
-        )
-        .unwrap_err();
-
-        assert!(error.downcast_ref::<FatalConsensusError>().is_some());
-        assert!(error.to_string().contains("append disk failure"));
-    }
-
-    #[test]
-    fn wal_append_call_failure_is_fatal() {
-        let result: Result<Result<(), io::Error>, io::Error> =
-            Err(io::Error::other("append actor unavailable"));
-
-        let error = wal_operation_result(
-            "append entry to WAL",
-            "send Append command to WAL actor",
-            result,
-        )
-        .unwrap_err();
-
-        assert!(error.downcast_ref::<FatalConsensusError>().is_some());
-        assert!(error.to_string().contains("append actor unavailable"));
-    }
-
-    #[test]
-    fn wal_flush_operation_failure_is_fatal() {
-        let result: Result<Result<(), io::Error>, io::Error> =
-            Ok(Err(io::Error::other("flush disk failure")));
-
-        let error = wal_operation_result(
-            "flush WAL to disk",
-            "send Flush command to WAL actor",
-            result,
-        )
-        .unwrap_err();
-
-        assert!(error.downcast_ref::<FatalConsensusError>().is_some());
-        assert!(error.to_string().contains("flush disk failure"));
-    }
-
-    #[test]
-    fn wal_flush_call_failure_is_fatal() {
-        let result: Result<Result<(), io::Error>, io::Error> =
-            Err(io::Error::other("flush actor unavailable"));
-
-        let error = wal_operation_result(
-            "flush WAL to disk",
-            "send Flush command to WAL actor",
-            result,
-        )
-        .unwrap_err();
-
-        assert!(error.downcast_ref::<FatalConsensusError>().is_some());
-        assert!(error.to_string().contains("flush actor unavailable"));
-    }
-
-    #[test]
-    fn fatal_wal_effect_fails_the_consensus_actor() {
-        let error: ActorProcessingErr =
-            Box::new(FatalConsensusError("WAL durability lost".to_owned()));
-
-        let effect_error = finish_consensus_effect_error(error).unwrap_err();
-        let result = finish_consensus_message(propagate_fatal_consensus_error(effect_error));
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn nonfatal_effect_error_preserves_continue_semantics() {
-        let error: ActorProcessingErr = Box::new(io::Error::other("transient host failure"));
-
-        let result = finish_consensus_effect_error(error);
-
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn fatal_buffered_wal_error_stops_before_the_next_message() {
-        let buffered_results: Vec<Result<(), ActorProcessingErr>> = vec![
-            Err(Box::new(FatalConsensusError(
-                "injected buffered WAL failure".to_owned(),
-            ))),
-            Ok(()),
-        ];
-        let mut later_sign_or_publish = 0;
-
-        let processed = (|| {
-            for result in buffered_results {
-                finish_buffered_message(result)?;
-                later_sign_or_publish += 1;
-            }
-            Ok::<(), ActorProcessingErr>(())
-        })();
-
-        assert!(processed.is_err());
-        assert_eq!(
-            later_sign_or_publish, 0,
-            "a later buffered message must not reach signing or publication"
-        );
-    }
-
-    #[test]
-    fn nonfatal_buffered_error_continues_to_the_next_message() {
-        let buffered_results: Vec<Result<(), ActorProcessingErr>> = vec![
-            Err(Box::new(io::Error::other("transient buffered error"))),
-            Ok(()),
-        ];
-        let mut processed_messages = 0;
-
-        for result in buffered_results {
-            finish_buffered_message(result).expect("nonfatal buffered error must be suppressed");
-            processed_messages += 1;
-        }
-
-        assert_eq!(processed_messages, 2);
-    }
 }

@@ -14,6 +14,7 @@ use malachitebft_app::types::codec::HasEncodedLen;
 use malachitebft_engine::consensus::ConsensusRef;
 use malachitebft_engine::host::HostRef;
 use malachitebft_engine::network::{NetworkIdentity, NetworkRef};
+use malachitebft_engine::node::{NodeMsg, NodeRef};
 use malachitebft_engine::sync::SyncRef;
 use malachitebft_engine::util::events::TxEvent;
 use malachitebft_engine::util::output_port::{OutputPort, OutputPortSubscriberTrait};
@@ -166,6 +167,7 @@ pub enum RequestBuilder {
 }
 
 struct BuildRollback<Ctx: Context> {
+    node: Option<NodeRef>,
     network: Option<NetworkRef<Ctx>>,
     wal: Option<WalRef<Ctx>>,
     host: Option<HostRef<Ctx>>,
@@ -176,6 +178,7 @@ struct BuildRollback<Ctx: Context> {
 impl<Ctx: Context> BuildRollback<Ctx> {
     fn new() -> Self {
         Self {
+            node: None,
             network: None,
             wal: None,
             host: None,
@@ -204,6 +207,9 @@ impl<Ctx: Context> BuildRollback<Ctx> {
         }
         if let Some(network) = self.network.take() {
             stop_actor(network, "network").await;
+        }
+        if let Some(node) = self.node.take() {
+            stop_actor(node, "node").await;
         }
     }
 }
@@ -786,7 +792,7 @@ where
     /// - Request (via `with_request_builder`)
     ///
     /// The build process will:
-    /// 1. Spawn actors in dependency order (network → wal → host → consensus → sync → node)
+    /// 1. Spawn the node supervisor, then actors in dependency order
     /// 2. Set up request handling tasks
     /// 3. Return channels for the application and the engine handle
     pub async fn build(self) -> Result<(Channels<Ctx>, EngineHandle)> {
@@ -803,7 +809,14 @@ where
         let registry = SharedRegistry::global().with_moniker(self.config.moniker());
         let metrics = Metrics::register(&registry);
 
-        // 1. Network actor (default or custom)
+        // 1. Spawn the supervisor before its children, but do not link children until the build succeeds.
+        let (node, handle) = match spawn_node_actor(metrics.clone()).await {
+            Ok(spawned) => spawned,
+            Err(error) => return Err(error),
+        };
+        rollback.node = Some(node.clone());
+
+        // 2. Network actor (default or custom)
         let (network, tx_network) = match network_builder {
             NetworkBuilder::Custom(custom) => custom,
             NetworkBuilder::Default(network_ctx) => {
@@ -824,7 +837,7 @@ where
             }
         };
 
-        // 2. WAL actor (default or custom)
+        // 3. WAL actor (default or custom)
         let wal = match wal_builder {
             WalBuilder::Custom(wal_ref) => wal_ref,
             WalBuilder::Default(wal_ctx) => {
@@ -839,7 +852,7 @@ where
             }
         };
 
-        // 3. Host actor (use the default channel-based Connector)
+        // 4. Host actor (use the default channel-based Connector)
         let (connector, rx_consensus) = match spawn_host_actor(metrics.clone()).await {
             Ok(spawned) => spawned,
             Err(error) => return rollback.fail(error).await,
@@ -849,7 +862,7 @@ where
         let tx_event = TxEvent::new();
         let sync_port = Arc::new(OutputPort::new());
 
-        // 4. Consensus actor (spawned before sync so sync can reference it)
+        // 5. Consensus actor (spawned before sync so sync can reference it)
         let consensus = match spawn_consensus_actor(
             self.ctx.clone(),
             consensus_ctx.address,
@@ -859,6 +872,7 @@ where
             network.clone(),
             connector.clone(),
             wal.clone(),
+            node.clone(),
             sync_port.clone(),
             metrics,
             tx_event.clone(),
@@ -870,7 +884,7 @@ where
         };
         rollback.consensus = Some(consensus.clone());
 
-        // 5. Sync actor (default or custom)
+        // 6. Sync actor (default or custom)
         let sync = match sync_builder {
             SyncBuilder::Custom(sync_ref) => sync_ref,
             SyncBuilder::Default(sync_ctx) => {
@@ -898,20 +912,24 @@ where
             sync.subscribe_to_port(&sync_port);
         }
 
-        // 6. Node actor
-        let (node, handle) = match spawn_node_actor(
-            self.ctx,
-            network.clone(),
-            consensus.clone(),
-            wal,
-            sync,
-            connector,
-        )
-        .await
+        // A dead WAL leaves durability unknown, so register it before linking children.
+        if let Err(error) = ractor::call!(node, NodeMsg::RegisterSafetyCriticalChild, wal.get_id())
         {
-            Ok(spawned) => spawned,
-            Err(error) => return rollback.fail(error).await,
-        };
+            return rollback
+                .fail(eyre::eyre!(
+                    "failed to register WAL as safety-critical: {error}"
+                ))
+                .await;
+        }
+
+        // Linking is the build commit point. Custom actors remain caller-owned if an earlier step fails.
+        network.link(node.get_cell());
+        wal.link(node.get_cell());
+        connector.link(node.get_cell());
+        consensus.link(node.get_cell());
+        if let Some(sync) = &sync {
+            sync.link(node.get_cell());
+        }
 
         // Spawn request handling tasks
         let (tx_request, rx_request) = mpsc::channel(request_ctx.channel_size);
@@ -1082,10 +1100,13 @@ mod tests {
     use std::time::Duration;
 
     use malachitebft_config::{ConsensusConfig, ValueSyncConfig};
+    use malachitebft_engine::node::NodeMsg;
+    use malachitebft_engine::wal::Wal;
     use malachitebft_test::codec::json::JsonCodec;
     use malachitebft_test::codec::proto::ProtobufCodec;
     use malachitebft_test::node::Keypair;
     use malachitebft_test::{Address, Ed25519Signer, Ed25519Verifier, PrivateKey, TestContext};
+    use ractor::ActorStatus;
     use rand::{rngs::StdRng, SeedableRng};
 
     use super::*;
@@ -1215,6 +1236,123 @@ mod tests {
             TcpStream::connect_timeout(&listen_addr, Duration::from_secs(1)).is_err(),
             "failed build must stop the network listener"
         );
+    }
+
+    #[tokio::test]
+    async fn build_failure_preserves_custom_wal() {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).expect("reserve test port");
+        let listen_addr = probe.local_addr().expect("read test port");
+        drop(probe);
+
+        let mut consensus = ConsensusConfig::default();
+        consensus.p2p.listen_addr = format!("/ip4/127.0.0.1/tcp/{}", listen_addr.port())
+            .parse()
+            .expect("valid listen multiaddr");
+        let config = FailingSyncConfig {
+            consensus,
+            value_sync: ValueSyncConfig {
+                batch_size: 0,
+                ..Default::default()
+            },
+        };
+        let wal_dir = tempfile::tempdir().expect("create WAL directory");
+        let wal = Wal::spawn(
+            &TestContext::default(),
+            ProtobufCodec,
+            wal_dir.path().join("custom.wal"),
+            SharedRegistry::global().clone(),
+            tracing::Span::none(),
+        )
+        .await
+        .expect("spawn custom WAL");
+        let identity = NetworkIdentity::new(
+            config.moniker().to_owned(),
+            Keypair::generate_ed25519(),
+            None,
+        );
+
+        let result = EngineBuilder::new(TestContext::default(), config)
+            .with_custom_wal(wal.clone())
+            .with_default_network(NetworkContext::new(identity, JsonCodec))
+            .with_default_sync(SyncContext::new(JsonCodec))
+            .with_default_consensus(ConsensusContext::new_full_node(
+                Address::new([0; 20]),
+                Box::new(Ed25519Verifier),
+            ))
+            .with_default_request(RequestContext::new(1))
+            .build()
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(wal.get_status(), ActorStatus::Running);
+
+        wal.stop_and_wait(None, None)
+            .await
+            .expect("stop caller-owned WAL");
+    }
+
+    #[tokio::test]
+    async fn safety_failure_stops_custom_wal_after_successful_build() {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).expect("reserve test port");
+        let listen_addr = probe.local_addr().expect("read test port");
+        drop(probe);
+
+        let mut consensus = ConsensusConfig::default();
+        consensus.p2p.listen_addr = format!("/ip4/127.0.0.1/tcp/{}", listen_addr.port())
+            .parse()
+            .expect("valid listen multiaddr");
+        let config = FailingSyncConfig {
+            consensus,
+            value_sync: ValueSyncConfig::default(),
+        };
+        let wal_dir = tempfile::tempdir().expect("create WAL directory");
+        let wal = Wal::spawn(
+            &TestContext::default(),
+            ProtobufCodec,
+            wal_dir.path().join("custom.wal"),
+            SharedRegistry::global().clone(),
+            tracing::Span::none(),
+        )
+        .await
+        .expect("spawn custom WAL");
+        let identity = NetworkIdentity::new(
+            config.moniker().to_owned(),
+            Keypair::generate_ed25519(),
+            None,
+        );
+
+        let (_channels, mut engine) = EngineBuilder::new(TestContext::default(), config)
+            .with_custom_wal(wal.clone())
+            .with_default_network(NetworkContext::new(identity, JsonCodec))
+            .with_no_sync()
+            .with_default_consensus(ConsensusContext::new_full_node(
+                Address::new([0; 20]),
+                Box::new(Ed25519Verifier),
+            ))
+            .with_default_request(RequestContext::new(1))
+            .build()
+            .await
+            .expect("build engine with custom WAL");
+
+        engine
+            .actor
+            .cast(NodeMsg::SafetyFailure("injected safety failure".to_owned()))
+            .expect("cast safety failure");
+        wal.wait(Some(Duration::from_secs(2)))
+            .await
+            .expect("safety hang stops custom WAL");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut engine.handle)
+                .await
+                .is_err(),
+            "engine supervisor must remain alive"
+        );
+
+        engine.actor.stop(None);
+        tokio::time::timeout(Duration::from_secs(2), engine.handle)
+            .await
+            .expect("engine cleanup timeout")
+            .expect("join engine cleanup");
     }
 
     // All default actors

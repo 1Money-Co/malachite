@@ -27,27 +27,8 @@ use crate::metrics::{Metrics, SharedRegistry};
 use crate::types::core::Context;
 use crate::types::ValuePayload;
 
-pub async fn spawn_node_actor<Ctx>(
-    ctx: Ctx,
-    network: NetworkRef<Ctx>,
-    consensus: ConsensusRef<Ctx>,
-    wal: WalRef<Ctx>,
-    sync: Option<SyncRef<Ctx>>,
-    host: HostRef<Ctx>,
-) -> Result<(NodeRef, JoinHandle<()>)>
-where
-    Ctx: Context,
-{
-    // Spawn the node actor
-    let node = Node::new(
-        ctx,
-        network,
-        consensus,
-        wal,
-        sync,
-        host,
-        tracing::Span::current(),
-    );
+pub async fn spawn_node_actor(metrics: Metrics) -> Result<(NodeRef, JoinHandle<()>)> {
+    let node = Node::new(metrics, tracing::Span::current());
 
     let (actor_ref, handle) = node.spawn().await?;
     Ok((actor_ref, handle))
@@ -82,6 +63,7 @@ pub async fn spawn_consensus_actor<Ctx>(
     network: NetworkRef<Ctx>,
     host: HostRef<Ctx>,
     wal: WalRef<Ctx>,
+    node: NodeRef,
     sync: Arc<OutputPort<SyncMsg<Ctx>>>,
     metrics: Metrics,
     tx_event: TxEvent<Ctx>,
@@ -113,6 +95,7 @@ where
         network,
         host,
         wal,
+        node,
         sync,
         metrics,
         tx_event,

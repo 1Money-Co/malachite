@@ -99,6 +99,9 @@ pub struct Inner {
     /// Number of additional precommits received during finalization period
     pub additional_precommits: Counter,
 
+    /// Whether the node has entered the safety-hang state.
+    pub node_safety_failure: Gauge,
+
     /// Internal state for measuring time taken for consensus
     instant_consensus_started: Arc<AtomicInstant>,
 
@@ -130,6 +133,7 @@ impl Metrics {
             equivocation_votes: Counter::default(),
             equivocation_proposals: Counter::default(),
             additional_precommits: Counter::default(),
+            node_safety_failure: Gauge::default(),
             instant_consensus_started: Arc::new(AtomicInstant::empty()),
             instant_block_started: Arc::new(AtomicInstant::empty()),
             instant_step_started: Arc::new(Mutex::new((Step::Unstarted, Instant::now()))),
@@ -235,6 +239,12 @@ impl Metrics {
                 "Number of additional precommits received during finalization period",
                 metrics.additional_precommits.clone(),
             );
+
+            registry.register(
+                "node_safety_failure",
+                "1 while the node is safety-hung after a safety-critical failure",
+                metrics.node_safety_failure.clone(),
+            );
         });
 
         metrics
@@ -269,6 +279,10 @@ impl Metrics {
     pub fn step_start(&self, step: Step) {
         let mut guard = self.instant_step_started.lock().expect("poisoned mutex");
         *guard = (step, Instant::now());
+    }
+
+    pub fn set_safety_failure(&self) {
+        self.node_safety_failure.set(1);
     }
 
     pub fn step_end(&self, step: Step) {

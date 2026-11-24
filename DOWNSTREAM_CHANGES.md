@@ -33,9 +33,9 @@ must satisfy these rows before Emerald updates its pin:
 | Behavior | Risk | Disposition | Task | Status |
 | --- | --- | --- | --- | --- |
 | Corrupt replay | Read error truncates suffix | Preserve bytes across restart | 2 | Passed V7-E10 |
-| Runtime WAL failure | Fatal exit permits restart | Stop children; keep node alive | 3, 4 | Pending |
-| Custom ownership | Early linking stops custom actors | Link only after build success | 3 | Pending |
-| WAL fault wiring | Helpers miss live bypasses | Inject custom append/flush faults | 4 | Pending |
+| Runtime WAL failure | Fatal exit permits restart | Stop children; keep node alive | 3, 4 | Passed V7-E11 |
+| Custom ownership | Early linking stops custom actors | Link only after build success | 3 | Passed V7-E11 |
+| WAL fault wiring | Helpers miss live bypasses | Inject custom append/flush faults | 4 | Passed V7-E11 |
 | Sync fault modes | Removed scenarios leave gaps | Restore decode, status, and eager tests | 5 | Pending |
 | Downgrade boundary | Phase 1 accepts loss of `0x08` | Require local WAL advancement | 6 | Pending |
 | Emerald restart | WAL event becomes process failure | Pin candidate; keep event non-fatal | 7 | Pending |
@@ -139,6 +139,12 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
   replays through `Wal::spawn`, restarts the actor, and proves exact file bytes remain unchanged after both failures.
   The raw and forced-compression matrices each passed 7/7 WAL compatibility tests, and the complete unit target
   passed 95/95 without retry.
+- **V7-E11 — runtime WAL safety hang:** real `WalBuilder::Custom` append, flush, and actor-loss failures each passed
+  through the production actor wiring. All cases stopped the runtime children, emitted no later publish, decide, or
+  `WalWriteError` event, set `node_safety_failure` to one, and left the engine handle pending until explicit test
+  cleanup. Builder regressions also prove failed construction preserves caller-owned custom actors and successful
+  construction links them to the safety supervisor. The focused engine supervisor suite passed 7/7, and the WAL,
+  replay, and finalization filter passed 7/7 without retry.
 
 The first sandboxed `make tests` attempt was stopped after 325/330 completed tests passed and five networked
 byzantine cases timed out. The required unrestricted rerun passed those same cases in 1–3 seconds and completed the
