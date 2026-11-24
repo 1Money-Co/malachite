@@ -150,6 +150,18 @@ fn propagate_fatal_consensus_error(error: ActorProcessingErr) -> Result<(), Acto
     }
 }
 
+fn finish_buffered_message(
+    result: Result<(), ActorProcessingErr>,
+) -> Result<(), ActorProcessingErr> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            error!("Error when handling buffered message: {error:?}");
+            propagate_fatal_consensus_error(error)
+        }
+    }
+}
+
 pub struct Consensus<Ctx>
 where
     Ctx: Context,
@@ -421,9 +433,9 @@ where
         myself: &ActorRef<Msg<Ctx>>,
         state: &mut State<Ctx>,
         is_restart: bool,
-    ) {
+    ) -> Result<(), ActorProcessingErr> {
         if state.msg_buffer.is_empty() {
-            return;
+            return Ok(());
         }
 
         if is_restart {
@@ -435,10 +447,10 @@ where
         while let Some(msg) = state.msg_buffer.pop() {
             debug!("Replaying buffered message: {msg}");
 
-            if let Err(e) = self.handle_msg(myself.clone(), state, msg).await {
-                error!("Error when handling buffered message: {e:?}");
-            }
+            finish_buffered_message(self.handle_msg(myself.clone(), state, msg).await)?;
         }
+
+        Ok(())
     }
 
     async fn handle_msg(
@@ -558,7 +570,8 @@ where
                 self.sync.send(SyncMsg::StartedHeight(height, start_type));
 
                 // Process any buffered messages, now that we are in the `Running` phase
-                self.process_buffered_msgs(&myself, state, is_restart).await;
+                self.process_buffered_msgs(&myself, state, is_restart)
+                    .await?;
 
                 Ok(())
             }
@@ -1741,8 +1754,8 @@ mod tests {
     use ractor::ActorProcessingErr;
 
     use super::{
-        finish_consensus_effect_error, finish_consensus_message, propagate_fatal_consensus_error,
-        wal_operation_result, FatalConsensusError,
+        finish_buffered_message, finish_consensus_effect_error, finish_consensus_message,
+        propagate_fatal_consensus_error, wal_operation_result, FatalConsensusError,
     };
 
     #[test]
@@ -1827,5 +1840,46 @@ mod tests {
         let result = finish_consensus_effect_error(error);
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn fatal_buffered_wal_error_stops_before_the_next_message() {
+        let buffered_results: Vec<Result<(), ActorProcessingErr>> = vec![
+            Err(Box::new(FatalConsensusError(
+                "injected buffered WAL failure".to_owned(),
+            ))),
+            Ok(()),
+        ];
+        let mut later_sign_or_publish = 0;
+
+        let processed = (|| {
+            for result in buffered_results {
+                finish_buffered_message(result)?;
+                later_sign_or_publish += 1;
+            }
+            Ok::<(), ActorProcessingErr>(())
+        })();
+
+        assert!(processed.is_err());
+        assert_eq!(
+            later_sign_or_publish, 0,
+            "a later buffered message must not reach signing or publication"
+        );
+    }
+
+    #[test]
+    fn nonfatal_buffered_error_continues_to_the_next_message() {
+        let buffered_results: Vec<Result<(), ActorProcessingErr>> = vec![
+            Err(Box::new(io::Error::other("transient buffered error"))),
+            Ok(()),
+        ];
+        let mut processed_messages = 0;
+
+        for result in buffered_results {
+            finish_buffered_message(result).expect("nonfatal buffered error must be suppressed");
+            processed_messages += 1;
+        }
+
+        assert_eq!(processed_messages, 2);
     }
 }
