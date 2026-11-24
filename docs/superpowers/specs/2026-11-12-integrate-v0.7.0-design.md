@@ -305,8 +305,11 @@ validator identities, signed bytes, genesis, or persisted configuration, and req
 
 Retain decoding for old tags `0x01`, `0x02`, and `0x04`, and add the v0.7.0 polka-certificate tag `0x08`. Test actual
 entry contents and replay effects, not only outer framing. New records written with `0x08` are unsupported by the old
-engine. The phase-2 downgrade boundary is the old decoder's explicit failure plus operator recovery documentation;
-it does not add a WAL marker, preflight command, or new CLI. Silent record loss or automatic WAL deletion is forbidden.
+engine. Phase 1 logs and drops the unknown entry while decoding, returns a replay error after its entry-count check,
+then continues consensus with an empty replay result. The phase-2 downgrade boundary therefore depends on operator
+procedure, not a safe old-binary halt: the local validator must first advance beyond the height that wrote `0x08` and
+advance its WAL sequence. This work does not add a WAL marker, preflight command, or new CLI. Silent record loss or
+automatic WAL deletion is forbidden.
 
 Repair the phase-1 compatibility test exposed by workspace-wide `--all-features`:
 

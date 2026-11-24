@@ -16,7 +16,7 @@ rename. The release commit is merged only after the implementation candidate is 
 `0.7.0-pre` packages to `0.7.0` and stamps release metadata. Neither checkpoint by itself retires a downstream
 invariant or qualifies Emerald.
 
-The exact Malachite code candidate for Emerald is
+The pre-remediation Malachite code candidate was
 `cf0dc7ecfd4804ffdecda82e8ef8e85dad1c3c86`. It includes the final review fixes that make builder startup
 transactional: a failed default-actor spawn stops and awaits every default actor already created, in reverse
 dependency order, without stopping caller-owned custom actors. A linked child-actor failure also terminates the node
@@ -37,7 +37,7 @@ must satisfy these rows before Emerald updates its pin:
 | Custom ownership | Early linking stops custom actors | Link only after build success | 3 | Passed V7-E11 |
 | WAL fault wiring | Helpers miss live bypasses | Inject custom append/flush faults | 4 | Passed V7-E11 |
 | Sync fault modes | Removed scenarios leave gaps | Restore decode, status, and eager tests | 5 | Passed V7-E12 |
-| Downgrade boundary | Phase 1 accepts loss of `0x08` | Require local WAL advancement | 6 | Pending |
+| Downgrade boundary | Phase 1 accepts loss of `0x08` | Require local WAL advancement | 6 | Passed V7-E13 |
 | Emerald restart | WAL event becomes process failure | Pin candidate; keep event non-fatal | 7 | Pending |
 
 The safety-hang change is runtime-only. It must not change persisted WAL or database formats, signed bytes,
@@ -120,8 +120,10 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
   non-empty validator WAL before notifying sync, while empty WALs and full nodes start without replay. The `0x08`
   polka-certificate entry fixture has SHA-256
   `252be25c27c1ee934f606a80b38f6effda7902b0eaaaa7920c9ae96275f9bf50`. A detached worktree at phase-1 commit
-  `6f544d7efca221ee8e7d2da9af37795ed6745f99` proved its old decoder rejects that fixture with `invalid tag` and
-  leaves the WAL bytes and hash unchanged. Legacy `wal_replay_delay` TOML is ignored and has no runtime effect.
+  `6f544d7efca221ee8e7d2da9af37795ed6745f99` proved its old decoder logs `invalid tag`, returns a replay error,
+  and leaves the WAL bytes and hash unchanged. Its consensus path then substitutes an empty replay result and
+  continues, so unchanged bytes do not make the downgrade safe. Legacy `wal_replay_delay` TOML is ignored and has no
+  runtime effect.
 - **V7-E7 — WAL feature matrix:** package-default, explicit `wal-force-compression`, and workspace `--all-features`
   `wal_compatibility` nextest runs each passed 6/6. The checked-in phase-1 fixture paths and hashes were unchanged.
 - **V7-E8 — complete development gate:** `cargo build --workspace --all-features` passed. Outside the restricted
@@ -151,6 +153,12 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
   Each decode-failure case consumes the injected failure, observes a later decode, and completes catch-up. The
   focused lifecycle unit test also passed and proves `ValueProcessingError` releases the exact failed height for a
   new request without changing the serving peer's score.
+- **V7-E13 — downgrade and recovery boundary:** the documentation now matches the Phase-1 `fetch_entries` and
+  `wal_fetch` paths: an unknown `0x08` is dropped during decode, reported as replay failure, replaced with an empty
+  replay result, and followed by normal consensus progress. Downgrade is allowed only after the local validator and
+  WAL sequence advance beyond the height that wrote `0x08`. Runtime append, flush, and WAL actor-loss failures use
+  the supervisor safety hang; startup corruption blocks normal startup; ordinary liveness failures may still exit.
+  Recovery explicitly forbids deleting, truncating, replacing, or restoring a stale WAL.
 
 The first sandboxed `make tests` attempt was stopped after 325/330 completed tests passed and five networked
 byzantine cases timed out. The required unrestricted rerun passed those same cases in 1–3 seconds and completed the
@@ -167,7 +175,8 @@ parallel work, and the Phase-2 pull request must not merge before its linked evi
 - **V7-G5:** every height start/restart carries the intended validator set, timeouts, and target time.
 - **V7-G6:** every phase-1 sync lifecycle and peer-restart scenario passes on the v0.7 queue without retry.
 - **V7-G7:** Emerald authenticates local, forwarded, mixed-path, hidden-lock, and restreamed proposal content.
-- **V7-G8:** old WALs read; `0x08` round-trips and restarts; an old decoder rejects it without mutation.
+- **V7-G8:** old WALs read; `0x08` round-trips and restarts; Phase 1 is used only after the local WAL advances beyond
+  a height that wrote `0x08`.
 - **V7-G9:** a non-empty validator WAL always replays before sync can change the crash height.
 - **V7-G10:** raw mode preserves fixture bytes and forced compression preserves decoded entries and replay behavior.
 

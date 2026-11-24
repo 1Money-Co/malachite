@@ -495,9 +495,18 @@ WAL as usual.
 
 The entry framing uses stable tag bytes: `0x01` for a signed consensus message,
 `0x02` for a timeout, `0x04` for a proposed value, and `0x08` for a polka
-certificate. Versions predating the `0x08` entry reject it as an unknown tag and
-must leave the WAL unchanged. Once a validator writes `0x08`, recovery requires
-this version or a later compatible decoder; downgrading that WAL is unsupported.
+certificate. The Phase-1 decoder does not safely halt on an unknown `0x08`
+entry. It logs and drops the entry while collecting the WAL, detects that fewer
+entries decoded than the WAL contains, and returns a replay error. Phase-1
+consensus then emits `WalReplayError`, substitutes an empty replay result, and
+continues normal operation. The WAL bytes remain unchanged, but the validator
+has recovered without its recorded votes or lock certificate.
+
+Once a validator writes `0x08`, it must keep this version or a later compatible
+decoder at that local height. Downgrade is permitted only after the validator
+has successfully entered a later height and its local WAL sequence has advanced
+past the height that wrote `0x08`. There is no preflight guard or WAL marker that
+enforces this boundary.
 
 ### Persistence
 
@@ -526,11 +535,26 @@ way to propagate and handle errors asynchronously ([#1435][issue-async]).
 
 The Write-Ahead Log is a crucial component for the operation of a consensus
 process.
-As a result, errors when attempting to append inputs to the WAL
-**must be critical**.
-At the moment, from
-[this commit](https://github.com/circlefin/malachite/commit/38f113f6c81da0af32a748718b2d87ab64e3a72f),
-consensus hangs forever in case of any WAL operational error.
+As a result, errors when attempting to append inputs to the WAL **must be
+critical**. Runtime append, flush, and unknown-outcome WAL actor-call failures
+notify the node supervisor before consensus remains pending. The supervisor
+sets the `node_safety_failure` gauge, stops its runtime children, and stays
+alive. It does not emit `WalWriteError` or return a process failure, so an
+automatic `Restart=on-failure` policy cannot restart the validator into an
+uncertain durability state.
+
+An operator should treat the safety gauge, the safety-failure log, stopped
+runtime children, and a still-running supervisor process as a safety halt. The
+operator must diagnose the WAL and underlying storage, preserve the WAL and
+application state as evidence, and restart explicitly only after establishing
+that the stored state is safe. Deleting, truncating, replacing, or restoring a
+stale WAL is not a recovery procedure.
+
+This runtime durability halt is distinct from startup corruption. A corrupt or
+undecodable entry discovered during startup leaves the WAL bytes unchanged and
+prevents consensus from transitioning to normal operation. It is also distinct
+from an ordinary non-safety child failure, which terminates the node so the
+embedding application or service manager can recover liveness.
 
 A second source of errors occurs during WAL replay and requires special
 attention: an error at a given entry implies that all subsequent WAL entries
@@ -544,10 +568,11 @@ associated state-machine transition are only emitted after the WAL is
 Since the append operation has not been concluded with success, the output was
 not emitted, therefore it is just like it has never been produced.
 
-In summary, replay fails closed at the first corrupt or unknown entry. Consensus
-does not transition to normal operation after that error. A frame-level read
-failure may truncate an incomplete tail to the last complete frame; a decoded
-unknown tag such as `0x08` on an older binary does not mutate the WAL.
+In summary, this version fails closed at the first corrupt or unknown replay
+entry, does not transition consensus to normal operation, and does not mutate
+the WAL on frame-read or decode failure. Phase 1 is different: an unknown
+`0x08` produces a replay error but consensus continues with an empty replay
+result. The unchanged bytes do not make that downgrade safe.
 
 ## Status
 
