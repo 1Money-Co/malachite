@@ -27,8 +27,8 @@ consensus actor. The evidence-only documentation commit that follows this record
 ### Safety-review remediation
 
 The review of PR #3 identified safety gaps that supersede the fatal-exit candidate above. The approved remediation
-is tracked by `docs/superpowers/plans/2026-11-24-malachite-v0.7-safety-review-remediation.md`. The final candidate
-must satisfy these rows before Emerald updates its pin:
+is tracked by `docs/superpowers/plans/2026-11-24-malachite-v0.7-safety-review-remediation.md`. The final Malachite
+code candidate is `0aab3dace548a5f639efcba083832139f1774eee`; it satisfies these rows and is pinned by Emerald:
 
 | Behavior | Risk | Disposition | Task | Status |
 | --- | --- | --- | --- | --- |
@@ -37,8 +37,8 @@ must satisfy these rows before Emerald updates its pin:
 | Custom ownership | Early linking stops custom actors | Link only after build success | 3 | Passed V7-E11 |
 | WAL fault wiring | Helpers miss live bypasses | Inject custom append/flush faults | 4 | Passed V7-E11 |
 | Sync fault modes | Removed scenarios leave gaps | Restore decode, status, and eager tests | 5 | Passed V7-E12 |
-| Downgrade boundary | Phase 1 accepts loss of `0x08` | Require local WAL advancement | 6 | Passed V7-E13 |
-| Emerald restart | WAL event becomes process failure | Pin candidate; keep event non-fatal | 7 | Pending |
+| Downgrade boundary | Phase 1 accepts loss of `0x08` | Prove current WAL has no `0x08` | 6 | Passed V7-E13 |
+| Emerald restart | WAL event becomes process failure | Pin candidate; keep event non-fatal | 7 | Passed V7-E14 |
 
 The safety-hang change is runtime-only. It must not change persisted WAL or database formats, signed bytes,
 validator identity, genesis, or configuration, and it requires no data migration. Operator recovery must never
@@ -161,6 +161,14 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
   Runtime append, flush, and WAL actor-loss failures use
   the supervisor safety hang; startup corruption blocks normal startup; ordinary liveness failures may still exit.
   Recovery explicitly forbids deleting, truncating, replacing, or restoring a stale WAL.
+- **V7-E14 — exact safety-remediation candidate:** Emerald pins
+  `0aab3dace548a5f639efcba083832139f1774eee` and its process-level regression proves an open application connector,
+  a defensive `WalWriteError`, and a safety-hung engine leave the Emerald runtime pending. The unrestricted
+  `cargo all-tests` run passed 560/560 tests with 14 intentional skips. Three pre-existing network, crash, and stress
+  cases passed on their configured retry. A preceding restricted-sandbox run was discarded because macOS listener
+  denial prevented network tests from starting. `cargo clippy --tests -- -D warnings` and
+  `cargo +nightly fmt --all --check` passed. The safety remediation changes runtime supervision only: it adds no
+  persisted format, schema, signed-byte, identity, genesis, configuration, or data migration.
 
 The first sandboxed `make tests` attempt was stopped after 325/330 completed tests passed and five networked
 byzantine cases timed out. The required unrestricted rerun passed those same cases in 1–3 seconds and completed the
