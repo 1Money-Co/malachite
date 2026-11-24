@@ -36,7 +36,7 @@ must satisfy these rows before Emerald updates its pin:
 | Runtime WAL failure | Fatal exit permits restart | Stop children; keep node alive | 3, 4 | Passed V7-E11 |
 | Custom ownership | Early linking stops custom actors | Link only after build success | 3 | Passed V7-E11 |
 | WAL fault wiring | Helpers miss live bypasses | Inject custom append/flush faults | 4 | Passed V7-E11 |
-| Sync fault modes | Removed scenarios leave gaps | Restore decode, status, and eager tests | 5 | Pending |
+| Sync fault modes | Removed scenarios leave gaps | Restore decode, status, and eager tests | 5 | Passed V7-E12 |
 | Downgrade boundary | Phase 1 accepts loss of `0x08` | Require local WAL advancement | 6 | Pending |
 | Emerald restart | WAL event becomes process failure | Pin candidate; keep event non-fatal | 7 | Pending |
 
@@ -145,6 +145,12 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
   cleanup. Builder regressions also prove failed construction preserves caller-owned custom actors and successful
   construction links them to the safety supervisor. The focused engine supervisor suite passed 7/7, and the WAL,
   replay, and finalization filter passed 7/7 without retry.
+- **V7-E12 — restored sync fault and mode coverage:** the complete value-sync integration filter passed 26/26
+  scenarios without retry. The restored matrix covers decision-driven status updates and skipped early commits in
+  eager and interval modes, plus local decode failures for parts-only and proposal-and-parts payloads in both modes.
+  Each decode-failure case consumes the injected failure, observes a later decode, and completes catch-up. The
+  focused lifecycle unit test also passed and proves `ValueProcessingError` releases the exact failed height for a
+  new request without changing the serving peer's score.
 
 The first sandboxed `make tests` attempt was stopped after 325/330 completed tests passed and five networked
 byzantine cases timed out. The required unrestricted rerun passed those same cases in 1–3 seconds and completed the

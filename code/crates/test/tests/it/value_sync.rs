@@ -14,8 +14,10 @@ use malachitebft_core_types::{CommitCertificate, NilOrVal, Round, SignedVote};
 use malachitebft_sync::{RawDecidedValue, Response, ValueResponse};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rstest::rstest;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub async fn crash_restart_from_start(params: TestParams) {
@@ -1003,4 +1005,177 @@ pub async fn full_node_sync_after_all_persistent_peer_restart() {
             },
         )
         .await
+}
+
+#[rstest]
+#[case::eager(Duration::ZERO)]
+#[case::interval(Duration::from_secs(1))]
+#[tokio::test]
+pub async fn status_update_on_decision(#[case] status_update_interval: Duration) {
+    const HEIGHT: u64 = 10;
+
+    let mut test = TestBuilder::<()>::new();
+
+    test.add_node()
+        .with_voting_power(10)
+        .start()
+        .wait_until(HEIGHT * 2)
+        .success();
+    test.add_node()
+        .with_voting_power(10)
+        .start()
+        .wait_until(HEIGHT * 2)
+        .success();
+    test.add_node()
+        .full_node()
+        .start_after(1, Duration::from_secs(10))
+        .wait_until(HEIGHT)
+        .success();
+
+    test.build()
+        .run_with_params(
+            Duration::from_secs(60),
+            TestParams {
+                enable_value_sync: true,
+                status_update_interval,
+                ..Default::default()
+            },
+        )
+        .await
+}
+
+#[derive(Debug)]
+struct SkipEarlyCommitMiddleware {
+    from_height: u64,
+    to_height: u64,
+}
+
+impl Middleware for SkipEarlyCommitMiddleware {
+    fn skip_early_commit(
+        &self,
+        _ctx: &TestContext,
+        certificate: &CommitCertificate<TestContext>,
+    ) -> bool {
+        let height = certificate.height.as_u64();
+        height >= self.from_height && height <= self.to_height
+    }
+}
+
+#[rstest]
+#[case::eager(Duration::ZERO)]
+#[case::interval(Duration::from_secs(1))]
+#[tokio::test]
+pub async fn skipped_early_commit_does_not_break_sync(#[case] status_update_interval: Duration) {
+    const TARGET_HEIGHT: u64 = 6;
+
+    let mut test = TestBuilder::<()>::new();
+
+    for _ in 0..2 {
+        test.add_node()
+            .with_voting_power(10)
+            .with_middleware(SkipEarlyCommitMiddleware {
+                from_height: 1,
+                to_height: 100,
+            })
+            .start()
+            .wait_until(TARGET_HEIGHT * 2)
+            .success();
+    }
+    test.add_node()
+        .full_node()
+        .start_after(1, Duration::from_secs(10))
+        .wait_until(TARGET_HEIGHT)
+        .success();
+
+    test.build()
+        .run_with_params(
+            Duration::from_secs(60),
+            TestParams {
+                enable_value_sync: true,
+                status_update_interval,
+                ..Default::default()
+            },
+        )
+        .await
+}
+
+#[derive(Debug, Clone)]
+struct FailSyncDecode {
+    remaining_failures: Arc<AtomicU32>,
+    decode_attempts: Arc<AtomicU32>,
+}
+
+impl Middleware for FailSyncDecode {
+    fn fail_synced_value_decode(&self, _ctx: &TestContext, _height: Height, _round: Round) -> bool {
+        self.decode_attempts.fetch_add(1, Ordering::SeqCst);
+        self.remaining_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+    }
+}
+
+async fn sync_recovers_from_decode_failure(params: TestParams) {
+    const HEIGHT: u64 = 6;
+    const CRASH_HEIGHT: u64 = 3;
+
+    let mut test = TestBuilder::<()>::new();
+    for _ in 0..2 {
+        test.add_node()
+            .with_voting_power(10)
+            .start()
+            .wait_until(HEIGHT)
+            .success();
+    }
+
+    let remaining_failures = Arc::new(AtomicU32::new(1));
+    let decode_attempts = Arc::new(AtomicU32::new(0));
+    test.add_node()
+        .with_voting_power(5)
+        .with_middleware(FailSyncDecode {
+            remaining_failures: Arc::clone(&remaining_failures),
+            decode_attempts: Arc::clone(&decode_attempts),
+        })
+        .start()
+        .wait_until(CRASH_HEIGHT)
+        .crash()
+        .reset_db()
+        .restart_after(Duration::from_secs(5))
+        .wait_until(HEIGHT)
+        .success();
+
+    test.build()
+        .run_with_params(
+            Duration::from_secs(60),
+            TestParams {
+                enable_value_sync: true,
+                ..params
+            },
+        )
+        .await;
+
+    assert_eq!(remaining_failures.load(Ordering::SeqCst), 0);
+    assert!(
+        decode_attempts.load(Ordering::SeqCst) >= 2,
+        "sync did not retry after the injected local decode failure"
+    );
+}
+
+#[rstest]
+#[case::parts_only_eager(ValuePayload::PartsOnly, Duration::ZERO)]
+#[case::parts_only_interval(ValuePayload::PartsOnly, Duration::from_secs(1))]
+#[case::proposal_and_parts_eager(ValuePayload::ProposalAndParts, Duration::ZERO)]
+#[case::proposal_and_parts_interval(ValuePayload::ProposalAndParts, Duration::from_secs(1))]
+#[tokio::test]
+pub async fn sync_recovers_from_decode_failure_ok(
+    #[case] value_payload: ValuePayload,
+    #[case] status_update_interval: Duration,
+) {
+    sync_recovers_from_decode_failure(TestParams {
+        value_payload,
+        status_update_interval,
+        ..Default::default()
+    })
+    .await
 }
