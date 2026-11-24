@@ -67,6 +67,7 @@ pub enum Event<Ctx: Context> {
     WalReplayDone(Ctx::Height),
     WalReplayError(Arc<ConsensusError<Ctx>>),
     WalResetError(Arc<eyre::Report>),
+    WalWriteError(Arc<eyre::Report>),
     WalCorrupted(Arc<io::Error>),
 }
 
@@ -129,6 +130,7 @@ impl<Ctx: Context> fmt::Display for Event<Ctx> {
             Event::WalReplayDone(height) => write!(f, "WalReplayDone(height: {height})"),
             Event::WalReplayError(error) => write!(f, "WalReplayError({error})"),
             Event::WalResetError(error) => write!(f, "WalResetError({error})"),
+            Event::WalWriteError(error) => write!(f, "WalWriteError({error})"),
             Event::WalCorrupted(error) => write!(f, "WalCorrupted(error: {error:?})"),
 
             Event::PolkaCertificate(certificate) => {

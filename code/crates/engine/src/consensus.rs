@@ -77,6 +77,53 @@ where
 
 pub type ConsensusRef<Ctx> = ActorRef<Msg<Ctx>>;
 
+#[derive(Debug)]
+struct FatalConsensusError(String);
+
+impl fmt::Display for FatalConsensusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FatalConsensusError {}
+
+fn wal_operation_result<OperationError, CallError>(
+    operation: &str,
+    call: &str,
+    result: Result<Result<(), OperationError>, CallError>,
+) -> Result<(), ActorProcessingErr>
+where
+    OperationError: fmt::Display,
+    CallError: fmt::Display,
+{
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(Box::new(FatalConsensusError(format!(
+            "Failed to {operation}: {error}"
+        )))),
+        Err(error) => Err(Box::new(FatalConsensusError(format!(
+            "Failed to {call}: {error}"
+        )))),
+    }
+}
+
+fn finish_consensus_message(
+    result: Result<(), ActorProcessingErr>,
+) -> Result<(), ActorProcessingErr> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            error!("Error when handling message: {error:?}");
+            if error.downcast_ref::<FatalConsensusError>().is_some() {
+                Err(error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
 pub struct Consensus<Ctx>
 where
     Ctx: Context,
@@ -1051,21 +1098,13 @@ where
             return Ok(());
         }
 
-        let result = ractor::call!(self.wal, WalMsg::Append, height, entry);
-
-        match result {
-            Ok(Ok(())) => {
-                // Success
-            }
-            Ok(Err(e)) => {
-                error!("Failed to append entry to WAL: {e}");
-            }
-            Err(e) => {
-                error!("Failed to send Append command to WAL actor: {e}");
-            }
-        }
-
-        Ok(())
+        let result = wal_operation_result(
+            "append entry to WAL",
+            "send Append command to WAL actor",
+            ractor::call!(self.wal, WalMsg::Append, height, entry),
+        );
+        self.publish_fatal_wal_error(&result);
+        result
     }
 
     async fn wal_flush(&self, phase: Phase, is_validator: bool) -> Result<(), ActorProcessingErr> {
@@ -1073,21 +1112,20 @@ where
             return Ok(());
         }
 
-        let result = ractor::call!(self.wal, WalMsg::Flush);
+        let result = wal_operation_result(
+            "flush WAL to disk",
+            "send Flush command to WAL actor",
+            ractor::call!(self.wal, WalMsg::Flush),
+        );
+        self.publish_fatal_wal_error(&result);
+        result
+    }
 
-        match result {
-            Ok(Ok(())) => {
-                // Success
-            }
-            Ok(Err(e)) => {
-                error!("Failed to flush WAL to disk: {e}");
-            }
-            Err(e) => {
-                error!("Failed to send Flush command to WAL: {e}");
-            }
+    fn publish_fatal_wal_error(&self, result: &Result<(), ActorProcessingErr>) {
+        if let Err(error) = result {
+            let report = Arc::new(eyre!(error.to_string()));
+            self.tx_event.send(move || Event::WalWriteError(report));
         }
-
-        Ok(())
     }
 
     async fn handle_effect(
@@ -1599,11 +1637,7 @@ where
             return Ok(());
         }
 
-        if let Err(e) = self.handle_msg(myself.clone(), state, msg).await {
-            error!("Error when handling message: {e:?}");
-        }
-
-        Ok(())
+        finish_consensus_message(self.handle_msg(myself.clone(), state, msg).await)
     }
 
     #[tracing::instrument(
@@ -1679,4 +1713,87 @@ async fn hang_on_failure<A, E>(
 async fn hang() -> ! {
     pending::<()>().await;
     unreachable!()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use ractor::ActorProcessingErr;
+
+    use super::{finish_consensus_message, wal_operation_result, FatalConsensusError};
+
+    #[test]
+    fn wal_append_operation_failure_is_fatal() {
+        let result: Result<Result<(), io::Error>, io::Error> =
+            Ok(Err(io::Error::other("append disk failure")));
+
+        let error = wal_operation_result(
+            "append entry to WAL",
+            "send Append command to WAL actor",
+            result,
+        )
+        .unwrap_err();
+
+        assert!(error.downcast_ref::<FatalConsensusError>().is_some());
+        assert!(error.to_string().contains("append disk failure"));
+    }
+
+    #[test]
+    fn wal_append_call_failure_is_fatal() {
+        let result: Result<Result<(), io::Error>, io::Error> =
+            Err(io::Error::other("append actor unavailable"));
+
+        let error = wal_operation_result(
+            "append entry to WAL",
+            "send Append command to WAL actor",
+            result,
+        )
+        .unwrap_err();
+
+        assert!(error.downcast_ref::<FatalConsensusError>().is_some());
+        assert!(error.to_string().contains("append actor unavailable"));
+    }
+
+    #[test]
+    fn wal_flush_operation_failure_is_fatal() {
+        let result: Result<Result<(), io::Error>, io::Error> =
+            Ok(Err(io::Error::other("flush disk failure")));
+
+        let error = wal_operation_result(
+            "flush WAL to disk",
+            "send Flush command to WAL actor",
+            result,
+        )
+        .unwrap_err();
+
+        assert!(error.downcast_ref::<FatalConsensusError>().is_some());
+        assert!(error.to_string().contains("flush disk failure"));
+    }
+
+    #[test]
+    fn wal_flush_call_failure_is_fatal() {
+        let result: Result<Result<(), io::Error>, io::Error> =
+            Err(io::Error::other("flush actor unavailable"));
+
+        let error = wal_operation_result(
+            "flush WAL to disk",
+            "send Flush command to WAL actor",
+            result,
+        )
+        .unwrap_err();
+
+        assert!(error.downcast_ref::<FatalConsensusError>().is_some());
+        assert!(error.to_string().contains("flush actor unavailable"));
+    }
+
+    #[test]
+    fn fatal_wal_error_fails_the_consensus_actor() {
+        let error: ActorProcessingErr =
+            Box::new(FatalConsensusError("WAL durability lost".to_owned()));
+
+        let result = finish_consensus_message(Err(error));
+
+        assert!(result.is_err());
+    }
 }
