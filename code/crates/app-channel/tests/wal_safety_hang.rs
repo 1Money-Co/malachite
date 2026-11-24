@@ -25,6 +25,7 @@ enum Fault {
     Append,
     AppendCall,
     Flush,
+    Registration,
 }
 
 #[derive(Clone)]
@@ -86,7 +87,7 @@ impl Actor for FaultingWal {
                         probe.reached.notify_one();
                         myself.stop(Some("injected WAL actor loss".to_owned()));
                     }
-                    Fault::Flush => {
+                    Fault::Flush | Fault::Registration => {
                         let _ = reply.send(Ok(()));
                     }
                 }
@@ -98,6 +99,14 @@ impl Actor for FaultingWal {
                     let _ = reply.send(Err(eyre::eyre!("injected WAL flush failure")));
                 } else {
                     let _ = reply.send(Ok(()));
+                }
+            }
+            WalMsg::LivenessProbe(reply) => {
+                if probe.fault == Fault::Registration {
+                    probe.reached.notify_one();
+                    myself.stop(Some("injected WAL loss during child commit".to_owned()));
+                } else {
+                    let _ = reply.send(());
                 }
             }
             WalMsg::Dump => {}
@@ -286,6 +295,7 @@ async fn run_fault_scenario(fault: Fault) {
             assert_eq!(probe.append_calls.load(Ordering::SeqCst), 1)
         }
         Fault::Flush => assert_eq!(probe.flush_calls.load(Ordering::SeqCst), 1),
+        Fault::Registration => unreachable!("registration failure uses its own scenario"),
     }
 
     engine.actor.stop(None);
@@ -312,4 +322,60 @@ async fn append_call_failure_enters_safety_hang_before_publish_or_decide() {
 #[tokio::test]
 async fn flush_failure_enters_safety_hang_before_publish_or_decide() {
     run_fault_scenario(Fault::Flush).await;
+}
+
+#[tokio::test]
+async fn wal_dying_during_child_commit_is_rejected() {
+    let [(validator, private_key)] = make_validators([1]);
+    let probe = FaultProbe::new(Fault::Registration);
+    let (wal, _) = Actor::spawn(None, FaultingWal, probe.clone())
+        .await
+        .expect("spawn registration-failing WAL");
+    let (network, _) = Actor::spawn(None, NetworkSink, ())
+        .await
+        .expect("spawn network sink");
+    let (tx_network, _rx_network) = mpsc::channel::<NetworkMsg<TestContext>>(1);
+    let config = Config {
+        moniker: "wal-registration-race".to_owned(),
+        consensus: ConsensusConfig {
+            value_payload: ValuePayload::ProposalOnly,
+            ..ConsensusConfig::default()
+        },
+        value_sync: ValueSyncConfig::default(),
+    };
+
+    let result = EngineBuilder::new(TestContext::default(), config)
+        .with_custom_wal(wal.clone())
+        .with_custom_network(network, tx_network)
+        .with_no_sync()
+        .with_default_consensus(ConsensusContext::new_validator(
+            validator.address,
+            Box::new(Ed25519Verifier),
+            Box::new(Ed25519Signer::new(private_key)),
+        ))
+        .with_default_request(RequestContext::new(1))
+        .build()
+        .await;
+
+    match result {
+        Err(error) => assert!(
+            error.to_string().contains("WAL liveness probe failed"),
+            "unexpected build error: {error}"
+        ),
+        Ok((_channels, engine)) => {
+            engine.actor.stop(None);
+            let _ = engine.handle.await;
+            panic!("builder accepted a WAL that died during child commit");
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(2), probe.reached.notified())
+        .await
+        .expect("child commit did not probe WAL liveness");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while wal.get_status() != ractor::ActorStatus::Stopped {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("registration-failing WAL did not stop");
 }

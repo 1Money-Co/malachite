@@ -1,4 +1,7 @@
 use std::collections::HashSet;
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 
 use async_trait::async_trait;
 use ractor::{
@@ -10,18 +13,32 @@ use tracing::{error, info, warn};
 
 use malachitebft_metrics::Metrics;
 
+type PostLinkProbe = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+
 #[derive(Debug)]
 pub enum NodeMsg {
     CommitChildren(Vec<ChildRegistration>, RpcReplyPort<Result<(), String>>),
     SafetyFailure(String),
 }
 
-#[derive(Debug)]
 pub struct ChildRegistration {
     name: &'static str,
     actor: ActorCell,
     safety_critical: bool,
     survives_safety_hang: bool,
+    post_link_probe: Option<PostLinkProbe>,
+}
+
+impl fmt::Debug for ChildRegistration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChildRegistration")
+            .field("name", &self.name)
+            .field("actor", &self.actor)
+            .field("safety_critical", &self.safety_critical)
+            .field("survives_safety_hang", &self.survives_safety_hang)
+            .field("has_post_link_probe", &self.post_link_probe.is_some())
+            .finish()
+    }
 }
 
 impl ChildRegistration {
@@ -31,6 +48,7 @@ impl ChildRegistration {
             actor,
             safety_critical: false,
             survives_safety_hang: false,
+            post_link_probe: None,
         }
     }
 
@@ -40,6 +58,24 @@ impl ChildRegistration {
             actor,
             safety_critical: true,
             survives_safety_hang: false,
+            post_link_probe: None,
+        }
+    }
+
+    pub fn safety_critical_with_probe<F>(
+        name: &'static str,
+        actor: ActorCell,
+        post_link_probe: F,
+    ) -> Self
+    where
+        F: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        Self {
+            name,
+            actor,
+            safety_critical: true,
+            survives_safety_hang: false,
+            post_link_probe: Some(Box::pin(post_link_probe)),
         }
     }
 
@@ -49,6 +85,7 @@ impl ChildRegistration {
             actor,
             safety_critical: false,
             survives_safety_hang: true,
+            post_link_probe: None,
         }
     }
 }
@@ -127,7 +164,7 @@ impl Actor for Node {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match msg {
-            NodeMsg::CommitChildren(children, reply_to) => {
+            NodeMsg::CommitChildren(mut children, reply_to) => {
                 if state.safety_hang || state.shutting_down {
                     let _ = reply_to.send(Err("node is not accepting children".to_owned()));
                     return Ok(());
@@ -150,6 +187,7 @@ impl Actor for Node {
 
                 if let Some(child) = children.iter().find(|child| !actor_is_active(&child.actor)) {
                     let error = format!("{} actor is not running", child.name);
+                    state.shutting_down = true;
                     for child in &children {
                         child.actor.unlink(myself.get_cell());
                         state.safety_critical_children.remove(&child.actor.get_id());
@@ -157,6 +195,24 @@ impl Actor for Node {
                     }
                     let _ = reply_to.send(Err(error));
                     return Ok(());
+                }
+
+                for index in 0..children.len() {
+                    let Some(probe) = children[index].post_link_probe.take() else {
+                        continue;
+                    };
+                    if let Err(error) = probe.await {
+                        let error =
+                            format!("{} liveness probe failed: {error}", children[index].name);
+                        state.shutting_down = true;
+                        for child in &children {
+                            child.actor.unlink(myself.get_cell());
+                            state.safety_critical_children.remove(&child.actor.get_id());
+                            state.safety_hang_survivors.remove(&child.actor.get_id());
+                        }
+                        let _ = reply_to.send(Err(error));
+                        return Ok(());
+                    }
                 }
 
                 let _ = reply_to.send(Ok(()));

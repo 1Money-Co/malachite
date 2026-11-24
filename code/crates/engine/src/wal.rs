@@ -58,6 +58,7 @@ pub enum Msg<Ctx: Context> {
     Reset(Ctx::Height, WalReply<()>),
     Append(Ctx::Height, WalEntry<Ctx>, WalReply<()>),
     Flush(WalReply<()>),
+    LivenessProbe(RpcReplyPort<()>),
     Dump,
 }
 
@@ -121,6 +122,10 @@ where
 
             Msg::Flush(reply_to) => {
                 self.flush_log(state, reply_to).await?;
+            }
+
+            Msg::LivenessProbe(reply_to) => {
+                let _ = reply_to.send(());
             }
 
             Msg::Dump => {

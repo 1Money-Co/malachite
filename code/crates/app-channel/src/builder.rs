@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use eyre::Result;
 use tokio::sync::mpsc::{self, Sender};
@@ -215,11 +216,23 @@ impl<Ctx: Context> BuildRollback<Ctx> {
 }
 
 async fn stop_actor<M: ractor::Message>(actor: ractor::ActorRef<M>, name: &'static str) {
-    if let Err(error) = actor
-        .stop_and_wait(Some("engine build failed".to_owned()), None)
+    let timeout = Some(Duration::from_secs(1));
+    if let Err(stop_error) = actor
+        .stop_and_wait(Some("engine build failed".to_owned()), timeout)
         .await
     {
-        tracing::warn!(actor = name, ?error, "Failed to roll back spawned actor");
+        tracing::warn!(
+            actor = name,
+            ?stop_error,
+            "Graceful build rollback timed out; killing actor"
+        );
+        if let Err(kill_error) = actor.kill_and_wait(timeout).await {
+            tracing::warn!(
+                actor = name,
+                ?kill_error,
+                "Failed to kill actor during build rollback"
+            );
+        }
     }
 }
 
@@ -921,12 +934,21 @@ where
         }
 
         // Linking is the build commit point. The supervisor installs every child role and link in one
-        // actor turn, then verifies liveness. This closes the gap where a dead WAL could be registered
-        // before it was linked. The application connector intentionally survives a safety hang so its
-        // work channel stays open and the embedding process cannot turn the hang into an automatic restart.
+        // actor turn, then verifies liveness. The WAL also acknowledges a mailbox probe after the link is
+        // installed, proving it can still process work under supervision. The application connector intentionally
+        // survives a safety hang so its work channel stays open and the embedding process cannot turn the hang into
+        // an automatic restart.
+        let wal_probe = wal.clone();
         let mut children = vec![
             ChildRegistration::ordinary("network", network.get_cell()),
-            ChildRegistration::safety_critical("WAL", wal.get_cell()),
+            ChildRegistration::safety_critical_with_probe("WAL", wal.get_cell(), async move {
+                ractor::call_t!(
+                    wal_probe,
+                    malachitebft_engine::wal::Msg::LivenessProbe,
+                    1_000
+                )
+                .map_err(|error| error.to_string())
+            }),
             ChildRegistration::safety_hang_survivor("application connector", connector.get_cell()),
             ChildRegistration::ordinary("consensus", consensus.get_cell()),
         ];
