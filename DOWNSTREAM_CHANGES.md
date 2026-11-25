@@ -224,8 +224,9 @@ engineering checkpoints and provenance anchors, not separate production deployme
 The reconciliation merge includes the exact rc.3 commit in branch ancestry. Conflict resolution retains the fork's
 ECDSA crate and separate inflight/pending value-sync architecture, while accepting compatible rc.3 lifecycle,
 reconnection, and logging changes. Repository workflow changes are not accepted implicitly: the fork retains its QA
-tooling and its explicit reverts of Circle's managed-action substitutions. This does not retire the fork or qualify
-the result for production.
+tooling, its explicit reverts of Circle's managed-action substitutions, and `ubuntu-latest` runners because Circle's
+private `github-hosted-small` and `github-hosted-large` labels are unavailable in the 1Money organization. This does
+not retire the fork or qualify the result for production.
 
 WAL and ECDSA compatibility fixtures in this branch were generated from the production source commit. They were not
 captured from running production nodes.
