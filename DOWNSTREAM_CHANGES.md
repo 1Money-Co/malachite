@@ -28,7 +28,7 @@ consensus actor. The evidence-only documentation commit that follows this record
 
 The review of PR #3 identified safety gaps that supersede the fatal-exit candidate above. The approved remediation
 is tracked by `docs/superpowers/plans/2026-11-24-malachite-v0.7-safety-review-remediation.md`. The final Malachite
-code candidate is `78c617c83a7a0fdb65cb9e98e49968f527690ef2`; it satisfies these rows and is pinned by Emerald:
+code candidate is `b4854c77562bd3add6d00d21e390dbfa5edf8a9d`; it satisfies these rows and is pinned by Emerald:
 
 | Behavior | Risk | Disposition | Task | Status |
 | --- | --- | --- | --- | --- |
@@ -127,7 +127,7 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
 - **V7-E7 — WAL feature matrix:** package-default, explicit `wal-force-compression`, and workspace `--all-features`
   `wal_compatibility` nextest runs each passed 6/6. The checked-in phase-1 fixture paths and hashes were unchanged.
 - **V7-E8 — complete development gate:** `cargo build --workspace --all-features` passed. Outside the restricted
-  sandbox, the final candidate's `cargo all-tests` passed 545/545 tests with 14 intentional skips. Five
+  sandbox, the pre-remediation merge candidate's `cargo all-tests` passed 545/545 tests with 14 intentional skips. Five
   filesystem-sensitive test-app/WAL cases passed on their configured retry, then all five passed serial isolated
   no-retry runs. The earlier
   candidate's `make tests` passed 530/530 main tests with 13 intentional skips, then 13/13 discovery tests with one
@@ -162,13 +162,19 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
   the supervisor safety hang; startup corruption blocks normal startup; ordinary liveness failures may still exit.
   Recovery explicitly forbids deleting, truncating, replacing, or restoring a stale WAL.
 - **V7-E14 — exact safety-remediation candidate:** Emerald pins
-  `78c617c83a7a0fdb65cb9e98e49968f527690ef2` and its process-level regression proves an open application connector,
+  `b4854c77562bd3add6d00d21e390dbfa5edf8a9d` and its process-level regression proves an open application connector,
   a defensive `WalWriteError`, and a safety-hung engine leave the Emerald runtime pending. The WAL acknowledges a
   bounded mailbox probe after its supervisor link is installed; a synchronized regression stops the WAL on that
   probe and proves the builder rejects the commit. Failed-build shutdown is bounded and force-kills a stuck actor
-  after its graceful timeout. The unrestricted `cargo all-tests` run passed 561/561 tests with 14 intentional skips.
-  Three pre-existing filesystem-sensitive cases passed on their configured retry. A preceding restricted-sandbox
-  run was discarded because macOS listener denial prevented network tests from starting.
+  after its graceful timeout. Normal WAL shutdown joins the blocking WAL thread before actor shutdown returns. The
+  engine shutdown API gracefully stops the node, and the node awaits its safety-critical WAL before bounding cleanup
+  of other children. Separate 64-cycle regressions prove both direct WAL stop and production node stop release the
+  advisory lock before returning. The unrestricted `cargo all-tests` run passed 562/563 tests with 14 intentional
+  skips. One upstream shared-temporary-directory WAL test failed on both configured attempts in aggregate, then
+  passed 1/1 in an isolated no-retry run. Two other pre-existing timing- or filesystem-sensitive cases passed on
+  configured retry. A
+  preceding restricted-sandbox run was discarded because macOS listener denial prevented network tests from
+  starting.
   `cargo clippy --tests -- -D warnings` and `cargo +nightly fmt --all --check` passed. The safety remediation changes
   runtime supervision only: it adds no persisted format, schema, signed-byte, identity, genesis, configuration, or
   data migration.
