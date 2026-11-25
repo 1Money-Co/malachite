@@ -228,7 +228,8 @@ tooling, its explicit reverts of Circle's managed-action substitutions, and `ubu
 private `github-hosted-small` and `github-hosted-large` labels are unavailable in the 1Money organization. This does
 not retire the fork or qualify the result for production. Standalone Quint spec commands are pinned to the
 repository's documented `0.22.4` toolchain so model semantics do not drift with the latest npm release. Semver checks
-run on the workspace's Rust 1.88.0 MSRV so moving stable rustdoc formats cannot outpace `cargo-semver-checks`.
+run on Rust 1.90.0, the lowest toolchain supported by the checker, so moving stable rustdoc formats cannot outpace
+`cargo-semver-checks`. The workspace MSRV remains Rust 1.88.
 
 WAL and ECDSA compatibility fixtures in this branch were generated from the production source commit. They were not
 captured from running production nodes.
