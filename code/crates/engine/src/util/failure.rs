@@ -1,8 +1,39 @@
 use std::future::{pending, Future};
+use std::{error::Error, fmt};
 
+use ractor::ActorProcessingErr;
 use tracing::error;
 
 use crate::node::{NodeMsg, NodeRef};
+
+#[derive(Debug)]
+struct LivenessFailure(String);
+
+impl fmt::Display for LivenessFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "liveness failure: {}", self.0)
+    }
+}
+
+impl Error for LivenessFailure {}
+
+pub fn is_liveness_failure(error: &ActorProcessingErr) -> bool {
+    error.downcast_ref::<LivenessFailure>().is_some()
+}
+
+pub async fn stop_on_failure<A, E>(
+    operation: impl Future<Output = Result<A, E>>,
+    format_error: impl FnOnce(E) -> String,
+) -> Result<A, ActorProcessingErr> {
+    match operation.await {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let reason = format_error(error);
+            error!(%reason, "Liveness failure; failing actor to trigger restart");
+            Err(Box::new(LivenessFailure(reason)))
+        }
+    }
+}
 
 pub async fn hang_on_safety_failure<A, E>(
     node: &NodeRef,

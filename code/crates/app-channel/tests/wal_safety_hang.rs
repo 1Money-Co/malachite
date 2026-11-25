@@ -1,3 +1,4 @@
+use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +25,10 @@ use tokio::sync::{mpsc, Notify};
 enum Fault {
     Append,
     AppendCall,
+    Fetch,
     Flush,
+    Replay,
+    Reset,
     Registration,
 }
 
@@ -70,11 +74,29 @@ impl Actor for FaultingWal {
         probe: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match msg {
-            WalMsg::StartedHeight(_, reply) => {
-                let _ = reply.send(Ok(Vec::new()));
-            }
+            WalMsg::StartedHeight(_, reply) => match probe.fault {
+                Fault::Fetch => {
+                    probe.reached.notify_one();
+                    let _ = reply.send(Err(eyre::eyre!("injected WAL fetch failure")));
+                }
+                Fault::Replay => {
+                    probe.reached.notify_one();
+                    let _ = reply.send(Ok(vec![Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "injected corrupt replay entry",
+                    ))]));
+                }
+                _ => {
+                    let _ = reply.send(Ok(Vec::new()));
+                }
+            },
             WalMsg::Reset(_, reply) => {
-                let _ = reply.send(Ok(()));
+                if probe.fault == Fault::Reset {
+                    probe.reached.notify_one();
+                    let _ = reply.send(Err(eyre::eyre!("injected WAL reset failure")));
+                } else {
+                    let _ = reply.send(Ok(()));
+                }
             }
             WalMsg::Append(_, _, reply) => {
                 probe.append_calls.fetch_add(1, Ordering::SeqCst);
@@ -87,7 +109,11 @@ impl Actor for FaultingWal {
                         probe.reached.notify_one();
                         myself.stop(Some("injected WAL actor loss".to_owned()));
                     }
-                    Fault::Flush | Fault::Registration => {
+                    Fault::Fetch
+                    | Fault::Flush
+                    | Fault::Replay
+                    | Fault::Reset
+                    | Fault::Registration => {
                         let _ = reply.send(Ok(()));
                     }
                 }
@@ -295,6 +321,8 @@ async fn run_fault_scenario(fault: Fault) {
             assert_eq!(probe.append_calls.load(Ordering::SeqCst), 1)
         }
         Fault::Flush => assert_eq!(probe.flush_calls.load(Ordering::SeqCst), 1),
+        Fault::Replay => {}
+        Fault::Fetch | Fault::Reset => unreachable!("startup failure uses its own scenario"),
         Fault::Registration => unreachable!("registration failure uses its own scenario"),
     }
 
@@ -322,6 +350,100 @@ async fn append_call_failure_enters_safety_hang_before_publish_or_decide() {
 #[tokio::test]
 async fn flush_failure_enters_safety_hang_before_publish_or_decide() {
     run_fault_scenario(Fault::Flush).await;
+}
+
+#[tokio::test]
+async fn corrupt_replay_enters_supervisor_safety_hang() {
+    run_fault_scenario(Fault::Replay).await;
+}
+
+async fn run_startup_liveness_scenario(fault: Fault) {
+    let moniker = format!("wal-startup-{fault:?}").to_lowercase();
+    let [(validator, private_key), (full_node, _)] = make_validators([1, 2]);
+    let validators = ValidatorSet::new([validator.clone()]);
+    let probe = FaultProbe::new(fault);
+    let (wal, _) = Actor::spawn(None, FaultingWal, probe.clone())
+        .await
+        .expect("spawn faulting WAL");
+    let (network, _) = Actor::spawn(None, NetworkSink, ())
+        .await
+        .expect("spawn network sink");
+    let (tx_network, _rx_network) = mpsc::channel::<NetworkMsg<TestContext>>(1);
+    let config = Config {
+        moniker: moniker.clone(),
+        consensus: ConsensusConfig {
+            value_payload: ValuePayload::ProposalOnly,
+            ..ConsensusConfig::default()
+        },
+        value_sync: ValueSyncConfig::default(),
+    };
+
+    let builder = EngineBuilder::new(TestContext::default(), config)
+        .with_custom_wal(wal.clone())
+        .with_custom_network(network.clone(), tx_network)
+        .with_no_sync();
+    let builder = match fault {
+        Fault::Fetch => builder.with_default_consensus(ConsensusContext::new_validator(
+            validator.address,
+            Box::new(Ed25519Verifier),
+            Box::new(Ed25519Signer::new(private_key)),
+        )),
+        Fault::Reset => builder.with_default_consensus(ConsensusContext::new_full_node(
+            full_node.address,
+            Box::new(Ed25519Verifier),
+        )),
+        _ => unreachable!("only fetch and reset are startup liveness failures"),
+    };
+    let (channels, mut engine) = builder
+        .with_default_request(RequestContext::new(1))
+        .build()
+        .await
+        .expect("build engine");
+    let mut events = channels.events.subscribe();
+    let app = tokio::spawn(drive_application(channels.consensus, validators));
+
+    tokio::time::timeout(Duration::from_secs(2), probe.reached.notified())
+        .await
+        .expect("consensus did not reach injected startup WAL fault");
+
+    if tokio::time::timeout(Duration::from_secs(2), &mut engine.handle)
+        .await
+        .is_err()
+    {
+        engine.actor.stop(None);
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut engine.handle).await;
+        app.abort();
+        panic!("startup WAL failure left the engine invisibly hung");
+    }
+
+    tokio::time::timeout(Duration::from_secs(2), app)
+        .await
+        .expect("application connector did not stop after liveness failure")
+        .expect("application driver panicked");
+
+    let reset_errors = std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|event| matches!(event, Event::WalResetError(_)))
+        .count();
+    assert_eq!(reset_errors, 1, "startup WAL failure was not emitted");
+
+    let mut exported = String::new();
+    metrics::export(&mut exported);
+    let unexpected_metric =
+        format!("malachitebft_core_consensus_node_safety_failure{{moniker=\"{moniker}\"}} 1");
+    assert!(
+        exported.lines().all(|line| line != unexpected_metric),
+        "restartable startup failure was misclassified as a safety hang"
+    );
+}
+
+#[tokio::test]
+async fn wal_fetch_failure_terminates_through_liveness_path() {
+    run_startup_liveness_scenario(Fault::Fetch).await;
+}
+
+#[tokio::test]
+async fn wal_reset_failure_terminates_through_liveness_path() {
+    run_startup_liveness_scenario(Fault::Reset).await;
 }
 
 #[tokio::test]

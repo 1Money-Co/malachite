@@ -1,6 +1,5 @@
 use core::fmt;
 use std::collections::BTreeSet;
-use std::future::{pending, Future};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +31,7 @@ use crate::network::{NetworkEvent, NetworkMsg, NetworkRef};
 use crate::node::NodeRef;
 use crate::sync::Msg as SyncMsg;
 use crate::util::events::{Event, TxEvent};
-use crate::util::failure::hang_on_safety_failure;
+use crate::util::failure::{hang_on_safety_failure, is_liveness_failure, stop_on_failure};
 use crate::util::msg_buffer::MessageBuffer;
 use crate::util::output_port::OutputPort;
 use crate::util::ractor::cast_option_and_handle;
@@ -431,26 +430,24 @@ where
                 // Fetch entries from the WAL or reset the WAL if this is a restart.
                 // Non-validators skip WAL recovery and reset any stale entries.
                 let wal_entries = if is_restart {
-                    hang_on_failure(self.wal_reset(height), |e| {
-                        error!(%height, "Error when resetting WAL: {e}");
-                        error!(%height, "Consensus may be in an inconsistent state after WAL reset failure");
+                    stop_on_failure(self.wal_reset(height), |e| {
+                        format!("wal_reset at height {height} failed: {e}")
                     })
-                    .await;
+                    .await?;
 
                     vec![]
                 } else if !state.is_validator {
-                    hang_on_failure(self.wal_reset(height), |e| {
-                        error!(%height, "Error when resetting WAL for non-validator: {e}");
+                    stop_on_failure(self.wal_reset(height), |e| {
+                        format!("wal_reset for non-validator at height {height} failed: {e}")
                     })
-                    .await;
+                    .await?;
 
                     vec![]
                 } else {
-                    hang_on_failure(self.wal_fetch(height), |e| {
-                        error!(%height, "Error when fetching WAL entries: {e}");
-                        error!(%height, "Consensus may be in an inconsistent state after WAL fetch failure");
+                    stop_on_failure(self.wal_fetch(height), |e| {
+                        format!("wal_fetch at height {height} failed: {e}")
                     })
-                    .await
+                    .await?
                 };
 
                 // Update the timeouts
@@ -479,10 +476,11 @@ where
                 if !wal_entries.is_empty() {
                     state.set_phase(Phase::Recovering);
 
-                    hang_on_failure(self.wal_replay(&myself, state, height, wal_entries), |e| {
-                        error!(%height, "Error when replaying WAL: {e}");
-                        error!(%height, "Consensus may be in an inconsistent state after WAL replay failure");
-                    })
+                    hang_on_safety_failure(
+                        &self.node,
+                        self.wal_replay(&myself, state, height, wal_entries),
+                        |e| format!("WAL replay at height {height} failed: {e}"),
+                    )
                     .await;
                 }
 
@@ -803,56 +801,58 @@ where
         let result = ractor::call!(self.wal, WalMsg::Reset, height);
 
         match result {
-            Ok(Ok(())) => {
-                // Success
-            }
+            Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
-                error!(%height, "Failed to reset WAL: {e}");
-                return Err(e
-                    .wrap_err(format!("Failed to reset WAL for height {height}"))
-                    .into());
+                let message = format!("Failed to reset WAL for height {height}: {e}");
+                Err(self.report_wal_reset_error(message))
             }
             Err(e) => {
-                error!(%height, "Failed to send Reset command to WAL actor: {e}");
-                return Err(eyre!(e)
-                    .wrap_err(format!(
-                        "Failed to send Reset command to WAL actor for height {height}"
-                    ))
-                    .into());
+                let message =
+                    format!("Failed to send Reset command to WAL actor for height {height}: {e}");
+                Err(self.report_wal_reset_error(message))
             }
         }
-
-        Ok(())
     }
 
     async fn wal_fetch(
         &self,
         height: Ctx::Height,
     ) -> Result<Vec<io::Result<WalEntry<Ctx>>>, ActorProcessingErr> {
-        let result = ractor::call!(self.wal, WalMsg::StartedHeight, height)?;
+        let result = ractor::call!(self.wal, WalMsg::StartedHeight, height);
 
         match result {
-            Ok(entries) if entries.is_empty() => {
+            Ok(Ok(entries)) if entries.is_empty() => {
                 debug!(%height, "No WAL entries to replay");
 
                 // Nothing to replay
                 Ok(Vec::new())
             }
 
-            Ok(entries) => {
+            Ok(Ok(entries)) => {
                 info!("Found {} WAL entries", entries.len());
 
                 Ok(entries)
             }
 
+            Ok(Err(e)) => {
+                let message = format!("Failed to fetch WAL entries for height {height}: {e}");
+                Err(self.report_wal_reset_error(message))
+            }
             Err(e) => {
-                error!(%height, "Error when notifying WAL of started height: {e}");
-
-                self.tx_event.send(|| Event::WalResetError(Arc::new(e)));
-
-                Err(eyre!("Failed to fetch WAL entries for height {height}").into())
+                let message = format!(
+                    "Failed to send StartedHeight command to WAL actor for height {height}: {e}"
+                );
+                Err(self.report_wal_reset_error(message))
             }
         }
+    }
+
+    fn report_wal_reset_error(&self, message: String) -> ActorProcessingErr {
+        error!(%message, "WAL startup operation failed");
+        let event_message = message.clone();
+        self.tx_event
+            .send(move || Event::WalResetError(Arc::new(eyre!(event_message))));
+        eyre!(message).into()
     }
 
     async fn wal_replay(
@@ -1600,6 +1600,9 @@ where
         }
 
         if let Err(error) = self.handle_msg(myself.clone(), state, msg).await {
+            if is_liveness_failure(&error) {
+                return Err(error);
+            }
             error!("Error when handling message: {error:?}");
         }
 
@@ -1655,28 +1658,4 @@ fn span_round<Ctx: Context>(round: Round, msg: &Msg<Ctx>) -> Round {
     } else {
         round
     }
-}
-
-async fn hang_on_failure<A, E>(
-    f: impl Future<Output = Result<A, E>>,
-    on_error: impl FnOnce(E),
-) -> A {
-    match f.await {
-        Ok(value) => value,
-        Err(e) => {
-            on_error(e);
-            error!("Critical consensus failure, hanging to prevent safety violations. Manual intervention required!");
-            hang().await
-        }
-    }
-}
-
-/// Hangs the consensus actor indefinitely to prevent safety violations.
-///
-/// This is called when WAL operations fail and consensus cannot safely continue.
-/// The node operator should investigate the WAL issue and restart the node
-/// only after ensuring data integrity.
-async fn hang() -> ! {
-    pending::<()>().await;
-    unreachable!()
 }
