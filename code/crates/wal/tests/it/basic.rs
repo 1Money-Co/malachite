@@ -163,11 +163,16 @@ fn corrupted_wal() -> io::Result<()> {
         file.set_len(truncate_len)?;
     }
 
-    // Reopen and verify it handles corruption gracefully
-    let wal = Log::open(&path)?;
-
-    // Should have fewer entries due to corruption
-    assert!(wal.len() < 2);
+    let expected = fs::read(&path)?;
+    for attempt in 1..=2 {
+        let error = Log::open(&path).expect_err("truncated WAL must fail to open");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            fs::read(&path)?,
+            expected,
+            "failed open attempt {attempt} mutated WAL bytes"
+        );
+    }
 
     Ok(())
 }

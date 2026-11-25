@@ -261,30 +261,65 @@ where
             let mut pos = FIRST_ENTRY_OFFSET; // Start after header
             let mut len = 0;
 
-            // Scan through entries to validate and count them
+            // Scan through entries to validate and count them. Opening a WAL is deliberately
+            // non-mutating: an incomplete frame can also be the result of corruption in a
+            // previously valid length field, so it is not safe to repair it automatically.
+            while pos < size {
+                let remaining = size - pos;
 
-            // Check if there's enough space for the fixed part of the header.
-            while size.saturating_sub(pos) >= ENTRY_COMPRESSION_FLAG_SIZE + ENTRY_LENGTH_SIZE {
+                if remaining < ENTRY_HEADER_SIZE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "Incomplete WAL entry header at offset {pos}: \
+                             {remaining} bytes remain, {ENTRY_HEADER_SIZE} required"
+                        ),
+                    ));
+                }
+
                 // Skip over compression flag
                 read_u8(&mut storage)?;
 
                 // Read entry length
                 let data_length = read_u64(&mut storage)?;
 
+                if data_length > MAX_ENTRY_SIZE as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "WAL entry at offset {pos} declares {data_length} bytes, \
+                             exceeding the maximum of {MAX_ENTRY_SIZE}"
+                        ),
+                    ));
+                }
+
                 // Calculate the full size required for this entry (header + data).
-                let Some(full_entry_size) = data_length.checked_add(ENTRY_HEADER_SIZE) else {
-                    break; // Corrupt, entry length overflows u64
-                };
+                let full_entry_size =
+                    data_length.checked_add(ENTRY_HEADER_SIZE).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("WAL entry length overflows at offset {pos}"),
+                        )
+                    })?;
 
                 // Check if enough bytes remain for full entry
-                if size.saturating_sub(pos) < full_entry_size {
-                    break; // Partial/corrupt entry
+                if remaining < full_entry_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "Incomplete WAL entry at offset {pos}: frame declares \
+                             {full_entry_size} bytes, {remaining} remain"
+                        ),
+                    ));
                 }
 
                 // Calculate just the payload size for seeking past it.
-                let Some(payload_size) = data_length.checked_add(ENTRY_CRC_SIZE) else {
-                    break; // Integer overflow, file is corrupt
-                };
+                let payload_size = data_length.checked_add(ENTRY_CRC_SIZE).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("WAL entry payload length overflows at offset {pos}"),
+                    )
+                })?;
 
                 // Skip to next entry
                 let seek_offset = i64::try_from(payload_size).map_err(|_| {
@@ -297,10 +332,6 @@ where
                 pos = storage.seek(SeekFrom::Current(seek_offset))?;
                 len += 1;
             }
-
-            // Truncate any partial entries at the end
-            storage.truncate_to(pos)?;
-            storage.sync_all()?;
 
             return Ok(Self {
                 version,

@@ -1,4 +1,4 @@
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::LazyLock;
@@ -103,15 +103,7 @@ fn incomplete_entries() -> io::Result<()> {
         file.set_len(truncate_pos)?;
     }
 
-    // Reopen and verify
-    {
-        let mut wal = Log::open(&path)?;
-        let entries: Vec<_> = wal.iter()?.collect::<Result<Vec<_>, _>>()?;
-
-        // Should only have the first entry
-        assert_eq!(entries.len(), 1);
-        assert_eq!(&entries[0], b"entry1");
-    }
+    assert_open_fails_without_mutation(&path, io::ErrorKind::UnexpectedEof);
 
     Ok(())
 }
@@ -205,17 +197,7 @@ fn multiple_corruptions() -> io::Result<()> {
         write_u32(&mut file, 0xdeadbeef)?;
     }
 
-    // Attempt to open and read
-    {
-        let mut wal = Log::open(&path)?;
-        let entries: Vec<_> = wal
-            .iter()?
-            .take_while(|r| r.is_ok())
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Should have recovered what it could
-        assert!(entries.len() < 3);
-    }
+    assert_open_fails_without_mutation(&path, io::ErrorKind::InvalidData);
 
     Ok(())
 }
@@ -274,7 +256,7 @@ fn max_entry_size() -> io::Result<()> {
 /// the log, leading to a corrupt state. The corrected logic must identify
 /// that the full entry cannot fit and truncate the file correctly.
 #[test]
-fn recovery_fails_to_truncate_with_carefully_corrupted_length() -> io::Result<()> {
+fn plausible_corrupted_length_fails_without_mutating_wal() -> io::Result<()> {
     let path = testwal!();
 
     let second_entry_start_pos;
@@ -309,27 +291,92 @@ fn recovery_fails_to_truncate_with_carefully_corrupted_length() -> io::Result<()
         write_u64(&mut file, malicious_data_length)?;
     }
 
-    // Reopen the WAL. The recovery logic should run.
-    {
-        // With the BUG, Log::open succeeds but wal.len() would be 2.
-        // With the FIX, Log::open succeeds and wal.len() is correctly 1.
-        let mut wal = Log::open(&path)?;
-        assert_eq!(
-            wal.len(),
-            1,
-            "WAL should have recovered only one valid entry"
-        );
-
-        let entries = wal.iter()?.collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(
-            entries.len(),
-            1,
-            "Iterator should yield only the first valid entry"
-        );
-        assert_eq!(entries[0], b"entry1");
-    }
+    assert_open_fails_without_mutation(&path, io::ErrorKind::UnexpectedEof);
 
     Ok(())
+}
+
+#[test]
+fn oversized_corrupted_length_fails_without_mutating_wal() -> io::Result<()> {
+    let path = testwal!();
+
+    {
+        let mut wal = Log::open(&path)?;
+        wal.append(b"entry1")?;
+        wal.flush()?;
+    }
+
+    {
+        let mut file = OpenOptions::new().write(true).open(&path)?;
+        file.seek(SeekFrom::Start(
+            FIRST_ENTRY_OFFSET + ENTRY_COMPRESSION_FLAG_SIZE,
+        ))?;
+        write_u64(&mut file, u64::MAX)?;
+        file.sync_all()?;
+    }
+
+    assert_open_fails_without_mutation(&path, io::ErrorKind::InvalidData);
+
+    Ok(())
+}
+
+#[test]
+fn partial_entry_header_fails_without_mutating_wal() -> io::Result<()> {
+    let path = testwal!();
+
+    {
+        let mut wal = Log::open(&path)?;
+        wal.append(b"entry1")?;
+        wal.flush()?;
+    }
+
+    {
+        let mut file = OpenOptions::new().append(true).open(&path)?;
+        file.write_all(&[0, 0, 0])?;
+        file.sync_all()?;
+    }
+
+    assert_open_fails_without_mutation(&path, io::ErrorKind::UnexpectedEof);
+
+    Ok(())
+}
+
+#[test]
+fn incomplete_entry_payload_fails_without_mutating_wal() -> io::Result<()> {
+    let path = testwal!();
+
+    {
+        let mut wal = Log::open(&path)?;
+        wal.append(b"entry1")?;
+        wal.flush()?;
+    }
+
+    {
+        let mut file = OpenOptions::new().append(true).open(&path)?;
+        write_u8(&mut file, 0)?;
+        write_u64(&mut file, 4)?;
+        write_u32(&mut file, 0)?;
+        file.write_all(&[1, 2])?;
+        file.sync_all()?;
+    }
+
+    assert_open_fails_without_mutation(&path, io::ErrorKind::UnexpectedEof);
+
+    Ok(())
+}
+
+fn assert_open_fails_without_mutation(path: &Path, expected_kind: io::ErrorKind) {
+    let expected = fs::read(path).expect("read WAL before failed open");
+
+    for attempt in 1..=2 {
+        let error = Log::open(path).expect_err("corrupt WAL must fail to open");
+        assert_eq!(error.kind(), expected_kind, "failed open attempt {attempt}");
+        assert_eq!(
+            fs::read(path).expect("read WAL after failed open"),
+            expected,
+            "failed open attempt {attempt} mutated WAL bytes"
+        );
+    }
 }
 
 #[test]

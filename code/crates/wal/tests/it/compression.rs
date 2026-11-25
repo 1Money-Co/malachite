@@ -1,3 +1,4 @@
+use std::fs;
 use std::io;
 use std::sync::LazyLock;
 
@@ -33,10 +34,11 @@ const ENTRIES: &[&[u8]] = &[
 #[test]
 fn large_entries() -> io::Result<()> {
     let temp = testwal!();
+    fs::create_dir_all(&temp)?;
 
     let mut no_compression = Log::open(temp.join("no-compression.wal"))?;
     for entry in ENTRIES {
-        no_compression.write(entry)?;
+        no_compression.write_raw(entry)?;
     }
 
     verify_entries(&mut no_compression, ENTRIES)?;
