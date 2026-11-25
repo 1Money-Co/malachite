@@ -46,6 +46,9 @@
 
 ### `malachitebft-engine`
 
+- `NodeRef` now accepts public `NodeMsg` supervision messages, and `Node::new` takes metrics and a tracing span.
+- `ChildRegistration` is a new public type used to assign supervision and shutdown roles to engine children.
+- `wal::Msg` adds the `LivenessProbe` variant. Exhaustive downstream matches must handle it.
 - Added new `NetworkEvent::ValidatorProofReceived` variant for receiving validator proofs (ADR-006)
 - Added new `Msg::ValidatorProofVerified` variant for communicating proof verification results
 - Network codec trait bounds now require `Codec<ValidatorProof<Ctx>>` implementation
@@ -64,6 +67,9 @@
 
 ### `malachitebft-app-channel`
 
+- `spawn_node_actor` now accepts engine metrics and returns the new supervised `NodeRef`.
+- `spawn_consensus_actor` now accepts separate verifier and optional signer objects plus the supervised node reference;
+  height and validator-set startup data are supplied through the application lifecycle.
 - Changed `NetworkContext` struct for Proof-of-Validator support (ADR-006):
   - Old: `NetworkContext::new(identity: NetworkIdentity, codec: Codec)` (where `NetworkIdentity` had no proof)
   - New: `NetworkContext::new(identity: NetworkIdentity, codec: Codec)` (where `NetworkIdentity` carries pre-signed proof bytes)

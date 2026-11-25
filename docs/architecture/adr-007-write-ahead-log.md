@@ -509,6 +509,11 @@ is permitted only after proving the current WAL contains no `0x08`; there is no
 preflight guard or WAL marker, so the node is roll-forward-only when that
 absence cannot be established.
 
+The only decoder-free proof is taken while the node is stopped: a WAL file that is exactly 12 bytes contains only
+the four-byte version and eight-byte sequence header, so it contains no entries and therefore no `0x08`. Any longer
+WAL requires a compatible decoder or dump tool to inspect every entry. Grepping the file is not proof because entries
+may be compressed. If the operator cannot prove absence, the only safe action is to roll forward.
+
 ### Persistence
 
 The commands for persisting inputs to the WAL are `WalMsg::Append`, receiving a
@@ -546,19 +551,26 @@ not emit `WalWriteError` or return a process failure, so an automatic
 `Restart=on-failure` policy cannot restart the validator into an uncertain
 durability state.
 
-An operator should treat the safety gauge, the safety-failure log, stopped
-safety-relevant runtime children, and a still-running connector and supervisor
-as a safety halt. The
-operator must diagnose the WAL and underlying storage, preserve the WAL and
-application state as evidence, and restart explicitly only after establishing
-that the stored state is safe. Deleting, truncating, replacing, or restoring a
-stale WAL is not a recovery procedure.
+An operator should treat the safety gauge, the safety-failure log, stopped safety-relevant runtime children, and a
+still-running connector and supervisor as a safety halt. The operator must diagnose the WAL and underlying storage,
+preserve the WAL and application state as evidence, and restart explicitly only after establishing that the stored
+state is safe. Deleting, truncating, replacing, or restoring a stale WAL is not a recovery procedure.
 
-This runtime durability halt is distinct from startup corruption. A corrupt or
-undecodable entry discovered during startup leaves the WAL bytes unchanged and
-prevents consensus from transitioning to normal operation. It is also distinct
-from an ordinary non-safety child failure, which terminates the node so the
-embedding application or service manager can recover liveness.
+Startup failures are split by what is known:
+
+- A malformed file found while opening the WAL fails the build visibly and leaves every byte unchanged.
+- A reset or fetch transport/I/O failure emits `WalResetError` and stops consensus and the node. This is a liveness
+  failure: no successfully fetched replay state was discarded and the embedding process may restart it.
+- A fetched entry that fails frame reading or decoding enters the supervisor safety hang. The gauge is set before
+  safety-relevant children stop, and consensus never transitions to normal operation.
+
+This is also distinct from an ordinary non-safety child failure, which terminates the node so the embedding
+application or service manager can recover liveness.
+
+Normal shutdown stops consensus and sync before the WAL, continues cleanup after an individual child-stop failure,
+and joins the blocking WAL worker before the WAL actor returns. `EngineHandle::shutdown` deliberately has no internal
+deadline: a worker stuck inside `fsync` can therefore block it. Deployments must configure a service-manager stop
+timeout and use forced process termination as the final backstop after preserving diagnostics.
 
 A second source of errors occurs during WAL replay and requires special
 attention: an error at a given entry implies that all subsequent WAL entries
@@ -572,11 +584,18 @@ associated state-machine transition are only emitted after the WAL is
 Since the append operation has not been concluded with success, the output was
 not emitted, therefore it is just like it has never been produced.
 
-In summary, this version fails closed at the first corrupt or unknown replay
-entry, does not transition consensus to normal operation, and does not mutate
-the WAL on frame-read or decode failure. Phase 1 is different: an unknown
-`0x08` produces a replay error but consensus continues with an empty replay
-result. The unchanged bytes do not make that downgrade safe.
+Opening validates every frame header and declared payload boundary. A partial header, oversized length, arithmetic
+overflow, payload extending past EOF, bad CRC, decompression error, or decode error is never repaired by truncation.
+The original file bytes are preserved across repeated attempts.
+
+For a bad final frame, stop the node and retain a byte-for-byte copy of the WAL and its storage diagnostics. Do not
+remove the frame, replace the file, reset the height, or restore an older copy. Escalate the artifact for a compatible
+roll-forward recovery binary or a safety analysis that accounts for every recorded vote and certificate. A fresh
+database or stale backup does not prove that signing again is safe.
+
+In summary, this version fails closed at the first corrupt or unknown replay entry and does not transition consensus
+to normal operation. Phase 1 is different: an unknown `0x08` produces a replay error but consensus continues with an
+empty replay result. The unchanged bytes do not make that downgrade safe.
 
 ## Status
 

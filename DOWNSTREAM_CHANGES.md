@@ -28,7 +28,8 @@ consensus actor. The evidence-only documentation commit that follows this record
 
 The review of PR #3 identified safety gaps that supersede the fatal-exit candidate above. The approved remediation
 is tracked by `docs/superpowers/plans/2026-11-24-malachite-v0.7-safety-review-remediation.md`. The final Malachite
-code candidate is `b4854c77562bd3add6d00d21e390dbfa5edf8a9d`; it satisfies these rows and is pinned by Emerald:
+code candidate is `9828de163970f79be4ac0096fdca245bc683583a`; it satisfies these rows and is consumed by
+[Emerald PR #68](https://github.com/1Money-Co/om-emerald/pull/68):
 
 | Behavior | Risk | Disposition | Task | Status |
 | --- | --- | --- | --- | --- |
@@ -39,10 +40,44 @@ code candidate is `b4854c77562bd3add6d00d21e390dbfa5edf8a9d`; it satisfies these
 | Sync fault modes | Removed scenarios leave gaps | Restore decode, status, and eager tests | 5 | Passed V7-E12 |
 | Downgrade boundary | Phase 1 accepts loss of `0x08` | Prove current WAL has no `0x08` | 6 | Passed V7-E13 |
 | Emerald restart | WAL event becomes process failure | Pin candidate; keep event non-fatal | 7 | Passed V7-E14 |
+| WAL open scan | Corrupt length truncates suffix | Reject without mutation | Follow-up | Passed V7-E15 |
+| Startup visibility | Reset/fetch hangs invisibly | Exit visibly; hang replay | Follow-up | Passed V7-E15 |
+| Exact flushes | First-flush tests miss sites | Mutation-test both sites | Follow-up | Passed V7-E15 |
+| Shutdown order | WAL stops before producers | Stop producers first | Follow-up | Passed V7-E15 |
 
 The safety-hang change is runtime-only. It must not change persisted WAL or database formats, signed bytes,
 validator identity, genesis, or configuration, and it requires no data migration. Operator recovery must never
 delete, truncate, replace, or restore a stale WAL.
+
+### Phase-3 upstream and retirement inventory
+
+Phase 3 rebases this fork onto Circle v0.8.2 without adopting a persisted-data migration implicitly. Generic fixes
+that Circle v0.8.2 does not contain will be proposed upstream. The forked implementation remains authoritative until
+a tagged Circle release contains each accepted fix and Emerald passes the same focused and rolling-upgrade gates on
+that release.
+
+| Improvement | Circle v0.8.2 | Phase-3 action | Retirement gate |
+| --- | --- | --- | --- |
+| Non-mutating WAL scan | Still truncates suffix | Contribute strict validation | Tagged release; WAL matrix |
+| Visible replay safety halt | Different policy | Contribute remaining delta | Tagged release; fault tests |
+| Nth-flush tests | Not complete | Contribute actor tests | Deletion mutations fail |
+| Producer-before-WAL stop | Not complete | Contribute ordered shutdown | Actor-order tests pass |
+| Worker-backed WAL liveness probe | Not present | Contribute worker round-trip | Builder rejects a dead worker |
+| Harmless network reply races | Present | Drop downstream copy during rebase | Circle implementation retained |
+
+### Deferred review items
+
+The repository has GitHub issues disabled, so the remaining non-blocking items are linked to the migration umbrella
+and the review that identified them. They do not weaken the Phase-2 safety boundary and must be re-evaluated before
+fork retirement.
+
+| Item | Phase-2 disposition | Follow-up |
+| --- | --- | --- |
+| Cancelling `EngineBuilder::build` leaks actors | Emerald awaits it; defer guard | [Emerald #48][emerald-48] |
+| Invalid synced bytes do not penalize peer | Preserve v0.7 scoring policy | [PR #3 review][pr-3] |
+| Legacy keys have no warning | Preserve compatibility; add diagnostics | [Emerald #48][emerald-48] |
+| Wrong-height append returns success | Compare with v0.8.2 before change | [PR #3 review][pr-3] |
+| Port-reservation tests have a bind race | Replace with owned listeners | [Emerald #48][emerald-48] |
 
 ### v0.7 behavior inventory
 
@@ -178,6 +213,13 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
   `cargo clippy --tests -- -D warnings` and `cargo +nightly fmt --all --check` passed. The safety remediation changes
   runtime supervision only: it adds no persisted format, schema, signed-byte, identity, genesis, configuration, or
   data migration.
+- **V7-E15 — follow-up safety review:** WAL-open regressions cover partial headers, incomplete payloads, oversized
+  lengths, and plausible corrupt lengths past EOF, preserving exact bytes across repeated attempts in raw and
+  compressed modes. Real-engine faults exercise reset/fetch liveness exits, corrupt-replay safety hang, and selected
+  flush failures immediately before publish and decide. Deleting either production flush makes its boundary test
+  fail. Engine actor tests prove consensus and sync stop before the WAL and cleanup continues after a stop failure.
+  The builder liveness probe now round-trips through the blocking WAL worker. No persisted format, schema, signed
+  bytes, identity, genesis, configuration, or data migration changed.
 
 The first sandboxed `make tests` attempt was stopped after 325/330 completed tests passed and five networked
 byzantine cases timed out. The required unrestricted rerun passed those same cases in 1–3 seconds and completed the
@@ -473,3 +515,5 @@ removing their IDs alone would classify honest late replies as unknown requests 
 [startup]: https://github.com/circlefin/malachite/blob/v0.8.1/code/crates/sync/src/handle.rs#L258
 [pruning]: https://github.com/circlefin/malachite/blob/v0.8.1/code/crates/sync/src/state.rs#L280
 [stale]: https://github.com/circlefin/malachite/blob/v0.8.1/code/crates/engine/src/sync.rs#L670
+[emerald-48]: https://github.com/1Money-Co/om-emerald/issues/48
+[pr-3]: https://github.com/1Money-Co/malachite/pull/3
