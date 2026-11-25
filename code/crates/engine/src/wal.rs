@@ -70,7 +70,7 @@ pub struct Args<Codec> {
 pub struct State<Ctx: Context> {
     height: Ctx::Height,
     wal_sender: mpsc::Sender<self::thread::WalMsg<Ctx>>,
-    _handle: std::thread::JoinHandle<()>,
+    thread_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl<Ctx, Codec> Wal<Ctx, Codec>
@@ -256,7 +256,7 @@ where
         Ok(State {
             height: Ctx::Height::ZERO,
             wal_sender: tx,
-            _handle: handle,
+            thread_handle: Some(handle),
         })
     }
 
@@ -293,6 +293,13 @@ where
         info!("Shutting down WAL");
 
         let _ = state.wal_sender.send(self::thread::WalMsg::Shutdown).await;
+
+        if let Some(handle) = state.thread_handle.take() {
+            tokio::task::spawn_blocking(move || handle.join())
+                .await
+                .map_err(|e| eyre!("Failed to join WAL thread task: {e}"))?
+                .map_err(|_| eyre!("WAL thread panicked during shutdown"))?;
+        }
 
         Ok(())
     }

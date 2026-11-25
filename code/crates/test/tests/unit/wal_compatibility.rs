@@ -367,6 +367,30 @@ async fn repeated_started_height_returns_no_replay_entries() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn stopping_wal_releases_file_lock_before_returning() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("wal.log");
+
+    for _ in 0..64 {
+        let wal = Wal::spawn(
+            &TestContext::new(),
+            ProtobufCodec,
+            path.clone(),
+            SharedRegistry::global().clone(),
+            tracing::Span::none(),
+        )
+        .await?;
+
+        wal.stop_and_wait(None, None).await?;
+
+        let log = Log::open(&path)?;
+        drop(log);
+    }
+
+    Ok(())
+}
+
 #[test]
 fn truncated_fixture_helper_rejects_open_time_mutation() -> Result<()> {
     let directory = tempfile::tempdir()?;

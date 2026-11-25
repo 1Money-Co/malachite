@@ -1108,11 +1108,15 @@ struct FailSyncDecode {
 impl Middleware for FailSyncDecode {
     fn fail_synced_value_decode(&self, _ctx: &TestContext, _height: Height, _round: Round) -> bool {
         self.decode_attempts.fetch_add(1, Ordering::SeqCst);
-        self.remaining_failures
+        // `try_update` is the replacement on current Rust, but is unavailable on our 1.88 MSRV.
+        #[allow(deprecated)]
+        let failed = self
+            .remaining_failures
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                 remaining.checked_sub(1)
             })
-            .is_ok()
+            .is_ok();
+        failed
     }
 }
 
