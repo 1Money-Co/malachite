@@ -125,6 +125,12 @@ where
             }
 
             Msg::LivenessProbe(reply_to) => {
+                let (tx, rx) = oneshot::channel();
+                state
+                    .wal_sender
+                    .send(self::thread::WalMsg::LivenessProbe(tx))
+                    .await?;
+                rx.await??;
                 let _ = reply_to.send(());
             }
 

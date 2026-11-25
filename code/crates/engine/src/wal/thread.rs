@@ -20,6 +20,7 @@ pub enum WalMsg<Ctx: Context> {
     Reset(Ctx::Height, ReplyTo<()>),
     Append(WalEntry<Ctx>, ReplyTo<()>),
     Flush(ReplyTo<()>),
+    LivenessProbe(ReplyTo<()>),
     Shutdown,
     Dump,
 }
@@ -154,6 +155,12 @@ where
 
             if reply.send(result).is_err() {
                 error!("Failed to send WAL flush reply");
+            }
+        }
+
+        WalMsg::LivenessProbe(reply) => {
+            if reply.send(Ok(())).is_err() {
+                error!("Failed to send WAL liveness probe reply");
             }
         }
 

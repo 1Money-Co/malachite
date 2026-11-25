@@ -26,7 +26,7 @@ enum Fault {
     Append,
     AppendCall,
     Fetch,
-    Flush,
+    Flush(usize),
     Replay,
     Reset,
     Registration,
@@ -110,7 +110,7 @@ impl Actor for FaultingWal {
                         myself.stop(Some("injected WAL actor loss".to_owned()));
                     }
                     Fault::Fetch
-                    | Fault::Flush
+                    | Fault::Flush(_)
                     | Fault::Replay
                     | Fault::Reset
                     | Fault::Registration => {
@@ -119,10 +119,17 @@ impl Actor for FaultingWal {
                 }
             }
             WalMsg::Flush(reply) => {
-                probe.flush_calls.fetch_add(1, Ordering::SeqCst);
-                if probe.fault == Fault::Flush {
+                let call = probe.flush_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                let fail_at = match probe.fault {
+                    Fault::Flush(fail_at) => Some(fail_at),
+                    _ => None,
+                };
+                if fail_at == Some(call) {
+                    let appends = probe.append_calls.load(Ordering::SeqCst);
                     probe.reached.notify_one();
-                    let _ = reply.send(Err(eyre::eyre!("injected WAL flush failure")));
+                    let _ = reply.send(Err(eyre::eyre!(
+                        "injected WAL flush failure on call {call} after {appends} appends"
+                    )));
                 } else {
                     let _ = reply.send(Ok(()));
                 }
@@ -234,13 +241,25 @@ async fn drive_application(mut rx: mpsc::Receiver<AppMsg<TestContext>>, validato
 }
 
 async fn run_fault_scenario(fault: Fault) {
+    run_fault_scenario_with_quorum(fault, true, None).await;
+}
+
+async fn run_fault_scenario_with_quorum(
+    fault: Fault,
+    single_validator_quorum: bool,
+    expected_appends: Option<usize>,
+) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("arc_malachitebft=trace")
         .with_test_writer()
         .try_init();
     let moniker = format!("wal-safety-{fault:?}").to_lowercase();
-    let [(validator, private_key)] = make_validators([1]);
-    let validators = ValidatorSet::new([validator.clone()]);
+    let [(validator, private_key), (other_validator, _)] = make_validators([1, 1]);
+    let mut validator_entries = vec![validator.clone()];
+    if !single_validator_quorum {
+        validator_entries.push(other_validator);
+    }
+    let validators = ValidatorSet::new(validator_entries);
     let probe = FaultProbe::new(fault);
     let (wal, _) = Actor::spawn(None, FaultingWal, probe.clone())
         .await
@@ -320,10 +339,15 @@ async fn run_fault_scenario(fault: Fault) {
         Fault::Append | Fault::AppendCall => {
             assert_eq!(probe.append_calls.load(Ordering::SeqCst), 1)
         }
-        Fault::Flush => assert_eq!(probe.flush_calls.load(Ordering::SeqCst), 1),
+        Fault::Flush(fail_at) => {
+            assert_eq!(probe.flush_calls.load(Ordering::SeqCst), fail_at)
+        }
         Fault::Replay => {}
         Fault::Fetch | Fault::Reset => unreachable!("startup failure uses its own scenario"),
         Fault::Registration => unreachable!("registration failure uses its own scenario"),
+    }
+    if let Some(expected_appends) = expected_appends {
+        assert_eq!(probe.append_calls.load(Ordering::SeqCst), expected_appends);
     }
 
     engine.actor.stop(None);
@@ -349,7 +373,17 @@ async fn append_call_failure_enters_safety_hang_before_publish_or_decide() {
 
 #[tokio::test]
 async fn flush_failure_enters_safety_hang_before_publish_or_decide() {
-    run_fault_scenario(Fault::Flush).await;
+    run_fault_scenario(Fault::Flush(1)).await;
+}
+
+#[tokio::test]
+async fn second_flush_failure_stops_before_publish() {
+    run_fault_scenario_with_quorum(Fault::Flush(2), false, Some(3)).await;
+}
+
+#[tokio::test]
+async fn second_flush_failure_stops_before_decide() {
+    run_fault_scenario_with_quorum(Fault::Flush(2), true, Some(4)).await;
 }
 
 #[tokio::test]

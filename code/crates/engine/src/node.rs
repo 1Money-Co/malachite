@@ -27,6 +27,7 @@ pub struct ChildRegistration {
     actor: ActorCell,
     safety_critical: bool,
     survives_safety_hang: bool,
+    shutdown_first: bool,
     post_link_probe: Option<PostLinkProbe>,
 }
 
@@ -37,6 +38,7 @@ impl fmt::Debug for ChildRegistration {
             .field("actor", &self.actor)
             .field("safety_critical", &self.safety_critical)
             .field("survives_safety_hang", &self.survives_safety_hang)
+            .field("shutdown_first", &self.shutdown_first)
             .field("has_post_link_probe", &self.post_link_probe.is_some())
             .finish()
     }
@@ -49,6 +51,18 @@ impl ChildRegistration {
             actor,
             safety_critical: false,
             survives_safety_hang: false,
+            shutdown_first: false,
+            post_link_probe: None,
+        }
+    }
+
+    pub fn shutdown_first(name: &'static str, actor: ActorCell) -> Self {
+        Self {
+            name,
+            actor,
+            safety_critical: false,
+            survives_safety_hang: false,
+            shutdown_first: true,
             post_link_probe: None,
         }
     }
@@ -59,6 +73,7 @@ impl ChildRegistration {
             actor,
             safety_critical: true,
             survives_safety_hang: false,
+            shutdown_first: false,
             post_link_probe: None,
         }
     }
@@ -76,6 +91,7 @@ impl ChildRegistration {
             actor,
             safety_critical: true,
             survives_safety_hang: false,
+            shutdown_first: false,
             post_link_probe: Some(Box::pin(post_link_probe)),
         }
     }
@@ -86,6 +102,7 @@ impl ChildRegistration {
             actor,
             safety_critical: false,
             survives_safety_hang: true,
+            shutdown_first: false,
             post_link_probe: None,
         }
     }
@@ -120,6 +137,7 @@ pub struct Node {
 }
 
 pub struct NodeState {
+    shutdown_first_children: HashSet<ActorId>,
     safety_critical_children: HashSet<ActorId>,
     safety_hang_survivors: HashSet<ActorId>,
     safety_hang: bool,
@@ -164,6 +182,7 @@ impl Actor for Node {
         _args: (),
     ) -> Result<Self::State, ActorProcessingErr> {
         Ok(NodeState {
+            shutdown_first_children: HashSet::new(),
             safety_critical_children: HashSet::new(),
             safety_hang_survivors: HashSet::new(),
             safety_hang: false,
@@ -191,6 +210,9 @@ impl Actor for Node {
                 }
 
                 for child in &children {
+                    if child.shutdown_first {
+                        state.shutdown_first_children.insert(child.actor.get_id());
+                    }
                     if child.safety_critical {
                         state.safety_critical_children.insert(child.actor.get_id());
                     }
@@ -205,6 +227,7 @@ impl Actor for Node {
                     state.shutting_down = true;
                     for child in &children {
                         child.actor.unlink(myself.get_cell());
+                        state.shutdown_first_children.remove(&child.actor.get_id());
                         state.safety_critical_children.remove(&child.actor.get_id());
                         state.safety_hang_survivors.remove(&child.actor.get_id());
                     }
@@ -222,6 +245,7 @@ impl Actor for Node {
                         state.shutting_down = true;
                         for child in &children {
                             child.actor.unlink(myself.get_cell());
+                            state.shutdown_first_children.remove(&child.actor.get_id());
                             state.safety_critical_children.remove(&child.actor.get_id());
                             state.safety_hang_survivors.remove(&child.actor.get_id());
                         }
@@ -247,15 +271,27 @@ impl Actor for Node {
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         let children = myself.get_cell().get_children();
+        let mut first_error = None;
+        for child in &children {
+            if state.shutdown_first_children.contains(&child.get_id()) {
+                if let Err(error) = stop_child_and_wait(child).await {
+                    error!(actor = %child.get_id(), %error, "Failed to stop shutdown-first child");
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
         for child in &children {
             if state.safety_critical_children.contains(&child.get_id()) {
-                stop_child_and_wait(child).await?;
+                if let Err(error) = stop_child_and_wait(child).await {
+                    error!(actor = %child.get_id(), %error, "Failed to stop safety-critical child");
+                    first_error.get_or_insert(error);
+                }
             }
         }
         myself
             .stop_children_and_wait(None, Some(Duration::from_secs(1)))
             .await;
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     #[tracing::instrument(name = "node", parent = &self.span, skip_all)]
@@ -326,6 +362,7 @@ impl Actor for Node {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -336,6 +373,49 @@ mod tests {
     use super::{ChildRegistration, Node, NodeMsg, NodeRef};
 
     struct Child;
+
+    struct ShutdownChild {
+        name: &'static str,
+        order: Arc<Mutex<Vec<&'static str>>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl Actor for ShutdownChild {
+        type Msg = ();
+        type State = ();
+        type Arguments = ();
+
+        async fn pre_start(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            _args: (),
+        ) -> Result<Self::State, ActorProcessingErr> {
+            Ok(())
+        }
+
+        async fn handle(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            _msg: Self::Msg,
+            _state: &mut Self::State,
+        ) -> Result<(), ActorProcessingErr> {
+            Ok(())
+        }
+
+        async fn post_stop(
+            &self,
+            _myself: ActorRef<Self::Msg>,
+            _state: &mut Self::State,
+        ) -> Result<(), ActorProcessingErr> {
+            self.order.lock().unwrap().push(self.name);
+            if self.fail {
+                Err(eyre::eyre!("injected {} shutdown failure", self.name).into())
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     enum ChildMsg {
         Fail,
@@ -589,5 +669,125 @@ mod tests {
             .await
             .expect("node cleanup timeout")
             .expect("join node cleanup");
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_consensus_and_sync_before_wal() {
+        let registry = SharedRegistry::new(Default::default(), None);
+        let metrics = Metrics::register(&registry);
+        let (node, handle) = Node::new(metrics, tracing::Span::none())
+            .spawn()
+            .await
+            .expect("spawn node");
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (consensus, _) = Actor::spawn(
+            None,
+            ShutdownChild {
+                name: "consensus",
+                order: order.clone(),
+                fail: false,
+            },
+            (),
+        )
+        .await
+        .expect("spawn consensus");
+        let (sync, _) = Actor::spawn(
+            None,
+            ShutdownChild {
+                name: "sync",
+                order: order.clone(),
+                fail: false,
+            },
+            (),
+        )
+        .await
+        .expect("spawn sync");
+        let (wal, _) = Actor::spawn(
+            None,
+            ShutdownChild {
+                name: "WAL",
+                order: order.clone(),
+                fail: false,
+            },
+            (),
+        )
+        .await
+        .expect("spawn WAL");
+
+        ractor::call!(
+            node,
+            NodeMsg::CommitChildren,
+            vec![
+                ChildRegistration::shutdown_first("consensus", consensus.get_cell()),
+                ChildRegistration::shutdown_first("sync", sync.get_cell()),
+                ChildRegistration::safety_critical("WAL", wal.get_cell()),
+            ]
+        )
+        .expect("commit child roles")
+        .expect("children are active");
+        node.stop(None);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("node cleanup timeout")
+            .expect("join node cleanup");
+
+        let order = order.lock().unwrap();
+        let consensus = order.iter().position(|name| *name == "consensus").unwrap();
+        let sync = order.iter().position(|name| *name == "sync").unwrap();
+        let wal = order.iter().position(|name| *name == "WAL").unwrap();
+        assert!(consensus < wal, "shutdown order was {order:?}");
+        assert!(sync < wal, "shutdown order was {order:?}");
+    }
+
+    #[tokio::test]
+    async fn shutdown_continues_after_child_stop_failure() {
+        let registry = SharedRegistry::new(Default::default(), None);
+        let metrics = Metrics::register(&registry);
+        let (node, handle) = Node::new(metrics, tracing::Span::none())
+            .spawn()
+            .await
+            .expect("spawn node");
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (consensus, _) = Actor::spawn(
+            None,
+            ShutdownChild {
+                name: "consensus",
+                order: order.clone(),
+                fail: true,
+            },
+            (),
+        )
+        .await
+        .expect("spawn consensus");
+        let (wal, _) = Actor::spawn(
+            None,
+            ShutdownChild {
+                name: "WAL",
+                order: order.clone(),
+                fail: false,
+            },
+            (),
+        )
+        .await
+        .expect("spawn WAL");
+
+        ractor::call!(
+            node,
+            NodeMsg::CommitChildren,
+            vec![
+                ChildRegistration::shutdown_first("consensus", consensus.get_cell()),
+                ChildRegistration::safety_critical("WAL", wal.get_cell()),
+            ]
+        )
+        .expect("commit child roles")
+        .expect("children are active");
+        node.stop(None);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("node cleanup timeout")
+            .expect("join node cleanup");
+
+        let order = order.lock().unwrap();
+        assert_eq!(order.as_slice(), &["consensus", "WAL"]);
     }
 }

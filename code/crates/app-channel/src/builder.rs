@@ -935,9 +935,9 @@ where
 
         // Linking is the build commit point. The supervisor installs every child role and link in one
         // actor turn, then verifies liveness. The WAL also acknowledges a mailbox probe after the link is
-        // installed, proving it can still process work under supervision. The application connector intentionally
-        // survives a safety hang so its work channel stays open and the embedding process cannot turn the hang into
-        // an automatic restart.
+        // installed, proving that the blocking WAL worker can still process work under supervision. The application
+        // connector intentionally survives a safety hang so its work channel stays open and the embedding process
+        // cannot turn the hang into an automatic restart.
         let wal_probe = wal.clone();
         let mut children = vec![
             ChildRegistration::ordinary("network", network.get_cell()),
@@ -950,10 +950,10 @@ where
                 .map_err(|error| error.to_string())
             }),
             ChildRegistration::safety_hang_survivor("application connector", connector.get_cell()),
-            ChildRegistration::ordinary("consensus", consensus.get_cell()),
+            ChildRegistration::shutdown_first("consensus", consensus.get_cell()),
         ];
         if let Some(sync) = &sync {
-            children.push(ChildRegistration::ordinary("sync", sync.get_cell()));
+            children.push(ChildRegistration::shutdown_first("sync", sync.get_cell()));
         }
         match ractor::call!(node, NodeMsg::CommitChildren, children) {
             Ok(Ok(())) => {}

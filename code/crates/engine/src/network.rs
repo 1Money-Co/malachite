@@ -3,7 +3,6 @@ use std::marker::PhantomData;
 
 use async_trait::async_trait;
 use derive_where::derive_where;
-use eyre::eyre;
 use libp2p::request_response;
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 use tokio::task::JoinHandle;
@@ -344,7 +343,11 @@ where
                 match request {
                     Ok(data) => {
                         let p2p_request_id = ctrl_handle.sync_request(peer_id, data).await?;
-                        reply_to.send(OutboundRequestId::new(p2p_request_id))?;
+                        // The requester may have dropped its reply receiver; that is benign,
+                        // so do not fail the actor (which would stop the node).
+                        if let Err(e) = reply_to.send(OutboundRequestId::new(p2p_request_id)) {
+                            error!("Failed to send outbound request ID to requester: {e:?}");
+                        }
                     }
                     Err(e) => error!("Failed to encode request message: {e:?}"),
                 }
@@ -355,9 +358,12 @@ where
 
                 match response {
                     Ok(data) => {
-                        let request_id = inbound_requests
-                            .remove(&request_id)
-                            .ok_or_else(|| eyre!("Unknown inbound request ID: {request_id}"))?;
+                        // The request may already have timed out and been removed. Dropping
+                        // this late response is benign and must not stop the node.
+                        let Some(request_id) = inbound_requests.remove(&request_id) else {
+                            error!(%request_id, "Unknown inbound request ID, dropping response");
+                            return Ok(());
+                        };
 
                         ctrl_handle.sync_reply(request_id, data).await?
                     }
