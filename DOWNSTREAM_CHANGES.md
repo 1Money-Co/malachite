@@ -226,7 +226,8 @@ ECDSA crate and separate inflight/pending value-sync architecture, while accepti
 reconnection, and logging changes. Repository workflow changes are not accepted implicitly: the fork retains its QA
 tooling, its explicit reverts of Circle's managed-action substitutions, and `ubuntu-latest` runners because Circle's
 private `github-hosted-small` and `github-hosted-large` labels are unavailable in the 1Money organization. This does
-not retire the fork or qualify the result for production.
+not retire the fork or qualify the result for production. Standalone Quint spec commands are pinned to the
+repository's documented `0.22.4` toolchain so model semantics do not drift with the latest npm release.
 
 WAL and ECDSA compatibility fixtures in this branch were generated from the production source commit. They were not
 captured from running production nodes.

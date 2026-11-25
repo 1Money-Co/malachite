@@ -44,7 +44,7 @@ function nextFilename() {
 }
 
 TRACE_PATH=$(nextFilename "$TRACES_DIR" "$PROP" "itf.json")
-OUTPUT=$(npx @informalsystems/quint run \
+OUTPUT=$(npx @informalsystems/quint@0.22.4 run \
     --max-steps=$MAX_STEPS \
     --max-samples=1 \
     --invariant "$PROP" \

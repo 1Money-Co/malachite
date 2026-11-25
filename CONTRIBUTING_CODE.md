@@ -58,7 +58,7 @@ To build and test Malachite, you need the following tools:
 3. **Install Quint**: (only required for running model-based tests)
 
    ```bash
-   npm install -g @informalsystems/quint
+   npm install -g @informalsystems/quint@0.22.4
    ```
 
 4. **Install cargo-nextest**:

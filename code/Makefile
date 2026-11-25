@@ -4,7 +4,7 @@ help: ## Show this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage: make \033[36m\033[0m\n"} /^[$$()% a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
 install: ## Install the required tools.
-	npm i @informalsystems/quint -g
+	npm i @informalsystems/quint@0.22.4 -g
 	cargo install --locked cargo-nextest
 
 lint: ## Lint the workspace.
