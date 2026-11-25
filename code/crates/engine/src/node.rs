@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ractor::{
@@ -97,6 +98,20 @@ fn actor_is_active(actor: &ActorCell) -> bool {
         actor.get_status(),
         ActorStatus::Starting | ActorStatus::Running | ActorStatus::Upgrading
     )
+}
+
+async fn stop_child_and_wait(actor: &ActorCell) -> Result<(), ActorProcessingErr> {
+    match actor.get_status() {
+        ActorStatus::Stopped => Ok(()),
+        ActorStatus::Draining | ActorStatus::Stopping => {
+            actor.wait(None).await?;
+            Ok(())
+        }
+        _ => {
+            actor.stop_and_wait(None, None).await?;
+            Ok(())
+        }
+    }
 }
 
 pub struct Node {
@@ -223,6 +238,24 @@ impl Actor for Node {
                 Ok(())
             }
         }
+    }
+
+    #[tracing::instrument(name = "node", parent = &self.span, skip_all)]
+    async fn post_stop(
+        &self,
+        myself: NodeRef,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        let children = myself.get_cell().get_children();
+        for child in &children {
+            if state.safety_critical_children.contains(&child.get_id()) {
+                stop_child_and_wait(child).await?;
+            }
+        }
+        myself
+            .stop_children_and_wait(None, Some(Duration::from_secs(1)))
+            .await;
+        Ok(())
     }
 
     #[tracing::instrument(name = "node", parent = &self.span, skip_all)]

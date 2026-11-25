@@ -33,6 +33,13 @@ impl EngineHandle {
     pub fn new(actor: NodeRef, handle: JoinHandle<()>) -> Self {
         Self { actor, handle }
     }
+
+    pub async fn shutdown(&self, reason: Option<String>) -> Result<()> {
+        self.actor
+            .stop_and_wait(reason, None)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 /// Start the consensus engine with default actors.

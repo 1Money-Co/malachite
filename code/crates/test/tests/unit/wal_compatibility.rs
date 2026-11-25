@@ -7,6 +7,7 @@ use arc_malachitebft_test::utils::validators::make_validators;
 use arc_malachitebft_test::{Address, Height, Signature, TestContext, ValidatorSet, ValueId, Vote};
 use bytes::Bytes;
 use eyre::{bail, eyre, Result};
+use malachitebft_app::engine::node::{ChildRegistration, Node, NodeMsg};
 use malachitebft_app::engine::wal::{log_entries, Msg, Wal, WalEntry};
 use malachitebft_app::metrics::{Metrics, SharedRegistry};
 use malachitebft_app::wal::Log;
@@ -383,6 +384,45 @@ async fn stopping_wal_releases_file_lock_before_returning() -> Result<()> {
         .await?;
 
         wal.stop_and_wait(None, None).await?;
+
+        let log = Log::open(&path)?;
+        drop(log);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stopping_node_releases_child_wal_lock_before_returning() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("node-child.wal");
+
+    for _ in 0..64 {
+        let wal = Wal::spawn(
+            &TestContext::new(),
+            ProtobufCodec,
+            path.clone(),
+            SharedRegistry::global().clone(),
+            tracing::Span::none(),
+        )
+        .await?;
+        let metrics = Metrics::register(SharedRegistry::global());
+        let (node, node_handle) = Node::new(metrics, tracing::Span::none()).spawn().await?;
+        node.call(
+            |reply| {
+                NodeMsg::CommitChildren(
+                    vec![ChildRegistration::safety_critical("WAL", wal.get_cell())],
+                    reply,
+                )
+            },
+            None,
+        )
+        .await?
+        .success_or(eyre!("node child commit call failed"))?
+        .map_err(|error| eyre!(error))?;
+
+        node.stop_and_wait(None, None).await?;
+        node_handle.await?;
 
         let log = Log::open(&path)?;
         drop(log);
