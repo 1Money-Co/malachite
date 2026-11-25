@@ -129,4 +129,3 @@ condition.
 - [ ] Run focused regression suites, `cargo all-tests`, Clippy, nightly formatting, and the applicable Quint/MBT gates.
 - [ ] Run a fresh whole-branch review and fix any Critical or Important findings with RED-GREEN evidence.
 - [ ] Push the branch, wait for final CI, and update PR #3 with exact commands, results, limitations, and candidate SHA.
-

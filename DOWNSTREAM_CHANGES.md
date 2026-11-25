@@ -219,7 +219,10 @@ be deleted. The following map keeps each rc.3 row active until its named test pa
   flush failures immediately before publish and decide. Deleting either production flush makes its boundary test
   fail. Engine actor tests prove consensus and sync stop before the WAL and cleanup continues after a stop failure.
   The builder liveness probe now round-trips through the blocking WAL worker. No persisted format, schema, signed
-  bytes, identity, genesis, configuration, or data migration changed.
+  bytes, identity, genesis, configuration, or data migration changed. The unrestricted `cargo all-tests` gate passed
+  573/573 with 14 intentional skips; one WAL stress test passed its configured retry and an isolated no-retry run.
+  Both MBT tests, the pinned Quint 0.22.4 typecheck/test matrices, Clippy with warnings denied, and nightly formatting
+  passed. A fresh whole-branch review found no Critical or Important issues.
 
 The first sandboxed `make tests` attempt was stopped after 325/330 completed tests passed and five networked
 byzantine cases timed out. The required unrestricted rerun passed those same cases in 1–3 seconds and completed the
