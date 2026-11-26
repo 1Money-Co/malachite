@@ -3,13 +3,16 @@
 //! # Warning
 //! Not for regular use, use [`crate::Log`] instead.
 
-use std::io::{self, SeekFrom, Write};
+use std::io::{self, Read, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use cfg_if::cfg_if;
 
 use crate::ext::{read_u32, read_u64, read_u8, write_u32, write_u64, write_u8};
 use crate::{Storage, Version};
+
+mod recovery;
+pub use recovery::RecoveryLog;
 
 /// The maximum size of a single log entry in bytes. (1 GiB)
 const MAX_ENTRY_SIZE: usize = 1024 * 1024 * 1024;
@@ -60,43 +63,9 @@ where
     /// * `Err` - If an I/O error occurs or the CRC check fails
     pub fn read_to_next<W: Write>(mut self, writer: &mut W) -> io::Result<Option<Self>> {
         let is_compressed = self.read_compression_flag()?;
-        let length = self.read_length()? as usize;
+        let length = self.read_length()?;
         let expected_crc = self.read_crc()?;
-
-        if length > MAX_ENTRY_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Entry size {length} exceeds maximum of {MAX_ENTRY_SIZE}"),
-            ));
-        }
-
-        let mut data = vec![0; length];
-        self.log.storage.read_exact(&mut data)?;
-
-        #[cfg(not(feature = "compression"))]
-        if is_compressed {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Entry is compressed but compression is disabled",
-            ));
-        }
-
-        #[cfg(feature = "compression")]
-        if is_compressed {
-            data = lz4_flex::decompress_size_prepended(&data).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Failed to decompress entry: {e}"),
-                )
-            })?;
-        }
-
-        let actual_crc = compute_crc(&data);
-
-        if expected_crc != actual_crc {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "CRC mismatch"));
-        }
-
+        let data = read_payload(&mut self.log.storage, is_compressed, length, expected_crc)?;
         writer.write_all(&data)?;
 
         let pos = self.log.storage.stream_position()?;
@@ -108,6 +77,54 @@ where
             Ok(None)
         }
     }
+}
+
+fn read_payload(
+    mut reader: impl Read,
+    is_compressed: bool,
+    length: u64,
+    expected_crc: u32,
+) -> io::Result<Vec<u8>> {
+    if length > MAX_ENTRY_SIZE as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Entry size {length} exceeds maximum of {MAX_ENTRY_SIZE}"),
+        ));
+    }
+
+    let mut data = vec![0; length as usize];
+    reader.read_exact(&mut data)?;
+
+    #[cfg(not(feature = "compression"))]
+    if is_compressed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Entry is compressed but compression is disabled",
+        ));
+    }
+
+    #[cfg(feature = "compression")]
+    if is_compressed {
+        // The frame length bounds the compressed bytes, not the size asserted by the LZ4 payload.
+        let uncompressed_size = data
+            .get(..4)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map(u32::from_le_bytes)
+            .filter(|size| *size as usize <= MAX_ENTRY_SIZE)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid LZ4 entry size"))?;
+        data =
+            lz4_flex::block::decompress(&data[4..], uncompressed_size as usize).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Failed to decompress entry: {e}"),
+                )
+            })?;
+    }
+
+    if expected_crc != compute_crc(&data) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "CRC mismatch"));
+    }
+    Ok(data)
 }
 
 /// Write-Ahead Log (WAL)

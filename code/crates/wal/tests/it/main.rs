@@ -1,6 +1,7 @@
 pub mod basic;
 pub mod corruption;
 pub mod crashes;
+pub mod recovery;
 pub mod stress;
 pub mod truncation;
 

@@ -743,6 +743,7 @@ dependencies = [
  "lz4_flex",
  "nix 0.31.2",
  "rand 0.8.5",
+ "sha2 0.10.8",
  "tempfile",
  "testdir",
 ]
