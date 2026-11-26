@@ -61,6 +61,7 @@ that release.
 | Durable WAL boundary | No checkpoint | Carry WAL patch and adapt worker | Crash and reset tests on a Circle release |
 | Replay signing guard | Signing index | Reuse Circle's index | Recorded signatures survive a second crash |
 | Sync status on subscription | Present | Drop the v0.7 backport | Eager restart catches up while peers wait |
+| Status during actor startup | No status replay | Revalidate and contribute the cache | Eager restart catches up |
 | Visible replay safety halt | Different policy | Contribute remaining delta | Tagged release; fault tests |
 | Nth-flush tests | Not complete | Contribute actor tests | Deletion mutations fail |
 | Producer-before-WAL stop | Not complete | Contribute ordered shutdown | Actor-order tests pass |

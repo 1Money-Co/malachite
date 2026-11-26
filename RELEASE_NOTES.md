@@ -9,6 +9,8 @@
   choices before publication. Startup or buffered height-reset failures remain visible to the supervisor.
 - Broadcast sync status when a peer subscribes to the sync topic. This backports the Circle v0.8 behavior in
   `72143f6c` so a restarting node can catch up even when Identify completes before its subscription.
+- Deliver the latest authenticated status from each connected peer when the sync actor subscribes to engine
+  network events. This preserves announcements that reach the engine before the sync actor starts.
 
 ## 0.7.0
 

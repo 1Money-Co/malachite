@@ -1771,6 +1771,7 @@ fn should_buffer<Ctx: Context>(msg: &Msg<Ctx>) -> bool {
             | Msg::NetworkEvent(NetworkEvent::PeerConnected(..))
             | Msg::NetworkEvent(NetworkEvent::PeerDisconnected(..))
             | Msg::NetworkEvent(NetworkEvent::PeerSyncSubscribed(..))
+            | Msg::NetworkEvent(NetworkEvent::Status(..))
     )
 }
 

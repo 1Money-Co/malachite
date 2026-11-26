@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::marker::PhantomData;
 
 use async_trait::async_trait;
@@ -136,6 +136,7 @@ pub enum State<Ctx: Context> {
         listen_addrs: Vec<Multiaddr>,
         peers: BTreeSet<PeerId>,
         sync_subscriptions: BTreeSet<PeerId>,
+        peer_statuses: Box<BTreeMap<PeerId, Status<Ctx>>>,
         output_port: OutputPort<NetworkEvent<Ctx>>,
         ctrl_handle: Box<CtrlHandle>,
         recv_task: JoinHandle<()>,
@@ -244,6 +245,7 @@ where
             listen_addrs: Vec::new(),
             peers: BTreeSet::new(),
             sync_subscriptions: BTreeSet::new(),
+            peer_statuses: Box::default(),
             output_port: OutputPort::with_capacity(128),
             ctrl_handle: Box::new(ctrl_handle),
             recv_task,
@@ -281,6 +283,7 @@ where
             listen_addrs,
             peers,
             sync_subscriptions,
+            peer_statuses,
             output_port,
             ctrl_handle,
             inbound_requests,
@@ -302,6 +305,13 @@ where
 
                 for peer in sync_subscriptions.iter() {
                     subscriber.send(NetworkEvent::PeerSyncSubscribed(*peer));
+                }
+
+                // An eager status can arrive while the engine is still spawning its sync actor.
+                // Give late subscribers the latest status from each connected peer.
+                for (peer, status) in peer_statuses.iter() {
+                    debug!(%peer, tip_height = %status.tip_height, "Delivering earlier peer status to subscriber");
+                    subscriber.send(NetworkEvent::Status(*peer, status.clone()));
                 }
 
                 subscriber.subscribe_to_port(output_port);
@@ -395,6 +405,7 @@ where
             Msg::NewEvent(Event::PeerDisconnected(peer_id)) => {
                 peers.remove(&peer_id);
                 sync_subscriptions.remove(&peer_id);
+                peer_statuses.remove(&peer_id);
                 output_port.send(NetworkEvent::PeerDisconnected(peer_id));
             }
 
@@ -485,10 +496,9 @@ where
 
                 trace!(%from, tip_height = %status.tip_height, "Received status");
 
-                output_port.send(NetworkEvent::Status(
-                    status.peer_id,
-                    Status::new(status.tip_height, status.history_min_height),
-                ));
+                let status = Status::new(status.tip_height, status.history_min_height);
+                peer_statuses.insert(from, status.clone());
+                output_port.send(NetworkEvent::Status(from, status));
             }
 
             Msg::NewEvent(Event::ConsensusMessage(channel, from, _)) => {
