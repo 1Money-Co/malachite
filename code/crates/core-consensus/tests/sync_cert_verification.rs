@@ -372,3 +372,96 @@ fn sync_value_response_emits_valid_sync_value_when_not_decided() {
         "ValidSyncValue must be emitted when no decision was reached during certificate processing"
     );
 }
+
+#[test]
+fn sync_decides_and_finalizes_after_replay_of_an_invalid_earlier_round_value() {
+    let (validators, signers): (Vec<_>, Vec<_>) = make_validators([25, 25, 25, 25])
+        .into_iter()
+        .map(|(validator, key)| (validator, Ed25519Signer::new(key)))
+        .unzip();
+    let address = validators[0].address;
+    let mut state = make_state(&validators, address);
+    let metrics = Metrics::new();
+    let height = Height::new(1);
+    let commit_round = Round::new(1);
+    let value = Value::new(42);
+    let certificate = build_commit_certificate(&validators, &signers, height, commit_round, &value);
+    let replayed = ProposedValue {
+        height,
+        round: Round::new(0),
+        valid_round: Round::Nil,
+        proposer: address,
+        value,
+        validity: Validity::Invalid,
+    };
+    let response = ValueResponse::new(PeerId::random(), Bytes::from("value-bytes"), certificate);
+
+    let verify_count = Cell::new(0);
+    let mut sync_value_forwarded = false;
+    let mut effects = Vec::new();
+    let mut handle_effect = |effect| -> Result<Resume<TestContext>, ()> {
+        Ok(handle_effect_with_default(
+            &signers,
+            Some(&verify_count),
+            effect,
+            |effect| match effect {
+                Effect::ValidSyncValue(_, _, resume) => {
+                    sync_value_forwarded = true;
+                    resume.resume_with(())
+                }
+                Effect::Decide(certificate, _, resume) => {
+                    effects.push((
+                        "decide",
+                        certificate.height,
+                        certificate.round,
+                        certificate.value_id,
+                    ));
+                    resume.resume_with(())
+                }
+                Effect::Finalize(certificate, _, _, resume) => {
+                    effects.push((
+                        "finalize",
+                        certificate.height,
+                        certificate.round,
+                        certificate.value_id,
+                    ));
+                    resume.resume_with(())
+                }
+                _ => Resume::Continue,
+            },
+        ))
+    };
+
+    for input in [
+        Input::StartHeight(height, ValidatorSet::new(validators), false, None),
+        // The engine replays a WAL proposed-value record as a consensus-origin input.
+        Input::ProposedValue(replayed.clone(), ValueOrigin::Consensus),
+        Input::SyncValueResponse(response),
+        Input::ProposedValue(
+            ProposedValue {
+                round: commit_round,
+                validity: Validity::Valid,
+                ..replayed
+            },
+            ValueOrigin::Sync,
+        ),
+    ] {
+        let result: Result<(), Error<TestContext>> = process!(
+            input: input,
+            state: &mut state,
+            metrics: &metrics,
+            with: effect => handle_effect(effect)
+        );
+        result.unwrap();
+    }
+
+    assert_eq!(verify_count.get(), 1);
+    assert!(sync_value_forwarded);
+    assert_eq!(
+        effects,
+        [
+            ("decide", height, commit_round, Value::new(42).id()),
+            ("finalize", height, commit_round, Value::new(42).id()),
+        ],
+    );
+}

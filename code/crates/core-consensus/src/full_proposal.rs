@@ -267,141 +267,94 @@ impl<Ctx: Context> FullProposalKeeper<Ctx> {
     }
 
     pub fn store_value(&mut self, new_value: &ProposedValue<Ctx>) {
-        self.store_value_at_value_round(new_value);
-        self.upgrade_matching_proposals_at_height(new_value);
-    }
-
-    fn handle_validity_change(
-        height: &Ctx::Height,
-        round: Round,
-        value_id: &ValueId<Ctx>,
-        stored_validity: &mut Validity,
-        new_validity: Validity,
-        kind_phrase: &str,
-    ) {
         use Validity::{Invalid, Valid};
 
-        // Match previous behavior exactly:
-        // - log warning and update for Invalid -> Valid
-        // - log error but do not update for Valid -> Invalid
-        match (*stored_validity, new_validity) {
-            (Invalid, Valid) => {
+        let height = new_value.height;
+        let round = new_value.round;
+        let value_id = new_value.value.id();
+        let previous_validity = self.get_value_by_id(&height, &value_id).map(|(_, v)| v);
+
+        // Validity applies to the value at this height and can only advance from Invalid to Valid.
+        let validity = match (previous_validity, new_value.validity) {
+            (Some(Invalid), Valid) => {
                 warn!(
                     height = %height,
                     round = %round,
                     value.id = ?value_id,
-                    "Application changed its mind on {}'s validity: Invalid --> Valid",
-                    kind_phrase
+                    "Application changed its mind on the value's validity: Invalid --> Valid"
                 );
-
-                *stored_validity = new_validity;
+                Valid
             }
-            (Valid, Invalid) => {
+            (Some(Valid), Invalid) => {
                 error!(
                     height = %height,
                     round = %round,
                     value.id = ?value_id,
-                    "Application changed its mind on {}'s validity: Valid --> Invalid; this should not happen",
-                    kind_phrase
+                    "Application changed its mind on the value's validity: Valid --> Invalid; this should not happen"
                 );
-
-                // Do not modify stored_validity per original behavior.
+                Valid
             }
-            _ => {
-                // No change in validity
-            }
-        }
-    }
-
-    fn store_value_at_value_round(&mut self, new_value: &ProposedValue<Ctx>) {
-        let key = (new_value.height, new_value.round);
-        let entries = self.keeper.get_mut(&key);
-
-        match entries {
-            None => {
-                // First time we see something (a proposed value) for this height and round
-                // Create a full proposal with just the proposal
-                let entry = Entry::ValueOnly(new_value.value.clone(), new_value.validity);
-                self.keeper.insert(key, vec![entry]);
-            }
-            Some(entries) => {
-                // We have seen proposals and/ or values for this height and round.
-                // Iterate over the vector of full proposals and determine if a new entry needs
-                // to be appended or an existing one has to be modified.
-                for entry in entries.iter_mut() {
-                    match entry {
-                        Entry::ProposalOnly(proposal) => {
-                            if proposal.value().id() == new_value.value.id() {
-                                // Found a matching proposal. Change the entry at index i
-                                replace_with!(entry, Entry::ProposalOnly(proposal) => {
-                                    Entry::full(new_value.value.clone(), new_value.validity, proposal)
-                                });
-
-                                return;
-                            }
-                        }
-                        Entry::ValueOnly(old_value, old_validity) => {
-                            if old_value.id() == new_value.value.id() {
-                                // Same value received before; handle potential validity change.
-                                Self::handle_validity_change(
-                                    &new_value.height,
-                                    new_value.round,
-                                    &new_value.value.id(),
-                                    old_validity,
-                                    new_value.validity,
-                                    "value",
-                                );
-                                return;
-                            }
-                        }
-                        Entry::Full(full_proposal) => {
-                            if full_proposal.proposal.value().id() == new_value.value.id() {
-                                // Same value received before; handle potential validity change.
-                                Self::handle_validity_change(
-                                    &new_value.height,
-                                    new_value.round,
-                                    &new_value.value.id(),
-                                    &mut full_proposal.validity,
-                                    new_value.validity,
-                                    "full proposal",
-                                );
-                                return;
-                            }
-                        }
-                        Entry::Empty => {
-                            // Should not happen
-                            panic!("Empty entry found");
-                        }
-                    }
-                }
-
-                // Append new value
-                entries.push(Entry::ValueOnly(
-                    new_value.value.clone(),
-                    new_value.validity,
-                ));
-            }
-        }
-    }
-
-    /// Attach a stored payload to every outstanding `ProposalOnly` at this height that references
-    /// the same value id (any `round` / `pol_round`), so restreamed parts can meet proposals.
-    fn upgrade_matching_proposals_at_height(&mut self, new_value: &ProposedValue<Ctx>) {
-        let Some((stored_value, stored_validity)) = self
-            .get_value_by_id(&new_value.height, &new_value.value.id())
-            .map(|(v, val)| (v.clone(), val))
-        else {
-            return;
+            (_, validity) => validity,
         };
 
-        for (_, proposals) in self.entries_at_mut(new_value.height) {
-            for entry in proposals.iter_mut() {
-                if let Entry::ProposalOnly(proposal) = entry {
-                    if proposal.value().id() == new_value.value.id() {
+        self.store_value_at_value_round(new_value, &value_id, validity);
+        self.update_matching_entries_at_height(height, &value_id, validity);
+    }
+
+    fn store_value_at_value_round(
+        &mut self,
+        new_value: &ProposedValue<Ctx>,
+        value_id: &ValueId<Ctx>,
+        validity: Validity,
+    ) {
+        let key = (new_value.height, new_value.round);
+        let entries = self.keeper.entry(key).or_default();
+
+        for entry in entries.iter_mut() {
+            match entry {
+                Entry::ProposalOnly(proposal) if proposal.value().id() == *value_id => {
+                    replace_with!(entry, Entry::ProposalOnly(proposal) => {
+                        Entry::full(new_value.value.clone(), validity, proposal)
+                    });
+                    return;
+                }
+                Entry::ValueOnly(value, _) if value.id() == *value_id => return,
+                Entry::Full(full) if full.proposal.value().id() == *value_id => return,
+                Entry::Empty => panic!("Empty entry found"),
+                _ => {}
+            }
+        }
+
+        entries.push(Entry::ValueOnly(new_value.value.clone(), validity));
+    }
+
+    /// Apply the same validity to every copy and complete any matching proposal at this height.
+    fn update_matching_entries_at_height(
+        &mut self,
+        height: Ctx::Height,
+        value_id: &ValueId<Ctx>,
+        validity: Validity,
+    ) {
+        let (stored_value, _) = self
+            .get_value_by_id(&height, value_id)
+            .expect("the value was just stored");
+        let stored_value = stored_value.clone();
+
+        for (_, entries) in self.entries_at_mut(height) {
+            for entry in entries {
+                match entry {
+                    Entry::ProposalOnly(proposal) if proposal.value().id() == *value_id => {
                         replace_with!(entry, Entry::ProposalOnly(proposal) => {
-                            Entry::full(stored_value.clone(), stored_validity, proposal)
+                            Entry::full(stored_value.clone(), validity, proposal)
                         });
                     }
+                    Entry::Full(full) if full.proposal.value().id() == *value_id => {
+                        full.validity = validity;
+                    }
+                    Entry::ValueOnly(value, stored_validity) if value.id() == *value_id => {
+                        *stored_validity = validity;
+                    }
+                    _ => {}
                 }
             }
         }

@@ -103,6 +103,65 @@ fn proposals_for_proposed_value(
     keeper.proposals_for_value(pv)
 }
 
+#[test]
+fn validity_is_monotonic_across_rounds_for_the_same_height_and_value() {
+    let [(validator, key)] = make_validators([1]);
+    let address = validator.address;
+    let signer = Ed25519Signer::new(key);
+    let mut keeper = FullProposalKeeper::new();
+    let height = Height::new(1);
+    let other_height = Height::new(2);
+    let value_id = Value::new(10).id();
+
+    keeper.store_value(&proposed_value(address, 1, 10, Validity::Invalid));
+    keeper.store_proposal(signed_proposal(&signer, address, 2, 10, 1));
+    keeper.store_value(&proposed_value(address, 2, 11, Validity::Invalid));
+    keeper.store_value(&ProposedValue {
+        height: other_height,
+        ..proposed_value(address, 1, 10, Validity::Invalid)
+    });
+    assert_eq!(
+        full_proposal_at(&keeper, 2, 10).unwrap().validity,
+        Validity::Invalid
+    );
+
+    keeper.store_value(&proposed_value(address, 3, 10, Validity::Valid));
+    assert_eq!(
+        keeper.get_value_by_id(&height, &value_id).unwrap().1,
+        Validity::Valid
+    );
+    assert_eq!(
+        full_proposal_at(&keeper, 2, 10).unwrap().validity,
+        Validity::Valid
+    );
+
+    // A newly received invalid copy at an earlier round must inherit the accepted validity.
+    keeper.store_value(&proposed_value(address, 0, 10, Validity::Invalid));
+    keeper.store_proposal(signed_proposal(&signer, address, 0, 10, -1));
+    keeper.store_proposal(signed_proposal(&signer, address, 3, 10, 2));
+    for round in [0, 2, 3] {
+        assert_eq!(
+            full_proposal_at(&keeper, round, 10).unwrap().validity,
+            Validity::Valid
+        );
+    }
+    assert_eq!(
+        keeper.get_value_by_id(&height, &value_id).unwrap().1,
+        Validity::Valid
+    );
+    assert_eq!(
+        keeper
+            .get_value_by_id(&height, &Value::new(11).id())
+            .unwrap()
+            .1,
+        Validity::Invalid
+    );
+    assert_eq!(
+        keeper.get_value_by_id(&other_height, &value_id).unwrap().1,
+        Validity::Invalid
+    );
+}
+
 struct Case {
     /// Human-readable label (printed while the test runs).
     name: &'static str,
