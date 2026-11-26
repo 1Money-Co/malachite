@@ -46,7 +46,7 @@ fn recovers_interrupted_append_after_a_confirmed_flush() -> io::Result<()> {
                 })
                 .map(|entry| fs::read(entry.path()))
                 .collect::<io::Result<Vec<_>>>()?;
-            assert_eq!(evidence, [tail.clone()]);
+            assert_eq!(evidence, std::slice::from_ref(&tail));
         }
     }
     Ok(())

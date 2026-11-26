@@ -237,11 +237,11 @@ impl RecoveryLog {
         let mut digest = digest.clone();
         self.state = State::Failed;
         let end = self.log.size_bytes()?;
-        self.log.flush()?;
         if end == checkpoint.end {
             self.state = State::Ready(checkpoint, digest);
             return Ok(());
         }
+        self.log.flush()?;
         hash_range(&mut self.log.storage, checkpoint.end, end, &mut digest)?;
         let checkpoint = Checkpoint {
             end,
@@ -256,6 +256,9 @@ impl RecoveryLog {
     /// Begins an authorized height transition. A crash between the durable intent and the
     /// new checkpoint leaves a WAL that can only resume through host confirmation.
     pub fn reset(&mut self, sequence: u64) -> io::Result<()> {
+        // The intent must authenticate the entire pre-reset file, including any complete
+        // outstanding appends, so a stale intent cannot match by only proving an empty prefix.
+        self.flush()?;
         let checkpoint = *self.ready()?.0;
         if sequence < checkpoint.sequence {
             return Err(invalid(
@@ -302,8 +305,10 @@ impl RecoveryLog {
             let mut digest = Sha256::new();
             digest.update(version.to_be_bytes());
             digest.update(old_sequence);
-            if size < checkpoint.end {
-                return Err(invalid("WAL was shortened outside the reset protocol"));
+            if size != checkpoint.end {
+                return Err(invalid(
+                    "WAL length does not match the pending reset intent",
+                ));
             }
             hash_range(file, HEADER_SIZE, checkpoint.end, &mut digest)?;
             if finish_digest(&digest) != checkpoint.digest {
@@ -560,6 +565,26 @@ mod tests {
         let mut reopened = RecoveryLog::open(&path, |_| Ok(()))?;
         assert!(reopened.confirm_pending_reset(7).is_err());
         assert_eq!(fs::read(&path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_reset_intent_cannot_truncate_target_height_votes() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("consensus.wal");
+        let mut wal = RecoveryLog::open(&path, |_| Ok(()))?;
+        wal.reset(7)?;
+        let old = *wal.ready()?.0;
+        wal.reset(8)?;
+        wal.append(b"already published at the target height")?;
+        wal.flush()?;
+        drop(wal);
+
+        let original = fs::read(&path)?;
+        save_checkpoint(&path, old, Some(8))?;
+        let mut reopened = RecoveryLog::open(&path, |_| Ok(()))?;
+        assert!(reopened.confirm_pending_reset(8).is_err());
+        assert_eq!(fs::read(&path)?, original);
         Ok(())
     }
 }
