@@ -11,7 +11,7 @@ use malachitebft_core_types::{Context, Height};
 use malachitebft_wal as wal;
 
 use super::entry::{decode_entry, encode_entry, WalCodec, WalEntry};
-use super::iter::log_entries;
+use super::WalAhead;
 
 pub type ReplyTo<T> = oneshot::Sender<Result<T>>;
 
@@ -27,7 +27,7 @@ pub enum WalMsg<Ctx: Context> {
 
 pub fn spawn<Ctx, Codec>(
     span: tracing::Span,
-    mut log: wal::Log,
+    mut log: wal::RecoveryLog,
     codec: Codec,
     mut rx: mpsc::Receiver<WalMsg<Ctx>>,
 ) -> JoinHandle<()>
@@ -66,7 +66,7 @@ where
 fn process_msg<Ctx, Codec>(
     msg: WalMsg<Ctx>,
     span: &tracing::Span,
-    log: &mut wal::Log,
+    log: &mut wal::RecoveryLog,
     codec: &Codec,
 ) -> Result<ControlFlow<()>>
 where
@@ -77,31 +77,31 @@ where
         WalMsg::StartedHeight(height, reply) => {
             let sequence = height.as_u64();
 
-            if sequence == log.sequence() {
-                // WAL is already at that sequence
-                // Let's check if there are any entries to replay
-                let entries = fetch_entries(log, codec);
-
-                if reply.send(entries).is_err() {
-                    error!("Failed to send WAL replay reply");
-                }
-            } else {
-                // WAL is at different sequence, restart it
-                // No entries to replay
-                let result = log.reset(sequence).map(|_| Vec::new()).map_err(Into::into);
-
-                debug!(%height, "Reset WAL");
-
-                if reply.send(result).is_err() {
-                    error!("Failed to send WAL reset reply");
-                }
+            let result = match log.confirm_pending_reset(sequence) {
+                Ok(true) => Ok(Vec::new()),
+                Ok(false) if sequence == log.sequence() => fetch_entries(log, codec),
+                Ok(false) if sequence < log.sequence() => Err(WalAhead(log.sequence()).into()),
+                Ok(false) => log.reset(sequence).map(|_| Vec::new()).map_err(Into::into),
+                Err(error) => Err(error.into()),
+            };
+            if reply.send(result).is_err() {
+                error!("Failed to send WAL StartedHeight reply");
             }
         }
 
         WalMsg::Reset(height, reply) => {
             let sequence = height.as_u64();
 
-            let result = log.reset(sequence).map_err(Into::into);
+            let result = log
+                .confirm_pending_reset(sequence)
+                .and_then(|completed| {
+                    if completed {
+                        Ok(())
+                    } else {
+                        log.reset(sequence)
+                    }
+                })
+                .map_err(Into::into);
 
             debug!(%height, "Reset WAL");
 
@@ -180,7 +180,7 @@ where
 }
 
 fn fetch_entries<Ctx, Codec>(
-    log: &mut wal::Log,
+    log: &mut wal::RecoveryLog,
     codec: &Codec,
 ) -> Result<Vec<io::Result<WalEntry<Ctx>>>>
 where
@@ -235,7 +235,7 @@ where
         })
 }
 
-fn dump_entries<'a, Ctx, Codec>(log: &'a mut wal::Log, codec: &'a Codec) -> Result<()>
+fn dump_entries<Ctx, Codec>(log: &mut wal::RecoveryLog, codec: &Codec) -> Result<()>
 where
     Ctx: Context,
     Codec: WalCodec<Ctx>,
@@ -248,10 +248,10 @@ where
     info!("- Size:    {} bytes", log.size_bytes().unwrap_or(0));
     info!("Entries:");
 
-    for (idx, entry) in log_entries(log, codec)?.enumerate() {
+    for (idx, entry) in log.iter()?.enumerate() {
         count += 1;
 
-        match entry {
+        match decode_result(idx, entry, codec) {
             Ok(entry) => {
                 info!("- #{idx}: {entry:?}");
             }

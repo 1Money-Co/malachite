@@ -2,7 +2,7 @@ use crate::handle::driver::apply_driver_input;
 use crate::prelude::*;
 
 use super::signature::{verify_polka_certificate, verify_round_certificate};
-use crate::types::WalEntry;
+use crate::types::{SignedConsensusMsg, WalEntry};
 
 /// Handles the processing of a polka certificate.
 ///
@@ -211,6 +211,30 @@ where
             SignedVote::new(vote_msg, signature.signature)
         };
 
+        if state
+            .driver
+            .votes()
+            .per_round(vote.round())
+            .is_some_and(|round| {
+                round
+                    .get_vote(vote.vote_type(), vote.validator_address())
+                    .is_some_and(|known| known.value() == vote.value())
+            })
+        {
+            // Round-certificate reconstruction omits vote extensions. This is still the
+            // same consensus choice and reapplying it would add no durable history.
+            continue;
+        }
+        // A round transition can produce our own signed vote. Recovery needs the verified
+        // votes that caused the transition, in the existing v0.7 WAL vote encoding.
+        perform!(
+            co,
+            Effect::WalAppend(
+                certificate.height,
+                WalEntry::ConsensusMsg(SignedConsensusMsg::Vote(vote.clone())),
+                Default::default()
+            )
+        );
         apply_driver_input(co, state, metrics, DriverInput::Vote(vote)).await?;
     }
 

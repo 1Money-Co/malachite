@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- The file-backed engine WAL seals each advancing flush with a durable checkpoint. On restart it preserves and
+  repairs a short frame only beyond the validated committed prefix. Existing valid WAL records retain their
+  encoding. Keep the WAL and its checkpoint/activation files together and roll forward after activation.
+- Replay checks the full input batch before processing, reuses recorded local signatures, and seals new signing
+  choices before publication. Startup or buffered height-reset failures remain visible to the supervisor.
+
 ## 0.7.0
 
 *June 22nd, 2026*

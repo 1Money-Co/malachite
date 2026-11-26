@@ -328,6 +328,12 @@ where
                 .is_some()
     }
 
+    /// Temporarily disable signing when the application is catching up to a later WAL height.
+    /// The engine must re-evaluate this on each height transition.
+    pub fn set_signing_enabled(&mut self, enabled: bool) {
+        self.params.enabled = enabled;
+    }
+
     pub fn round_certificate(&self) -> Option<&EnterRoundCertificate<Ctx>> {
         self.driver.round_certificate.as_ref()
     }

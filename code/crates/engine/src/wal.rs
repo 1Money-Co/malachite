@@ -7,7 +7,7 @@ use ractor::{async_trait, Actor, ActorProcessingErr, ActorRef, RpcReplyPort, Spa
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
-use malachitebft_core_types::{Context, Height};
+use malachitebft_core_types::Context;
 use malachitebft_metrics::SharedRegistry;
 use malachitebft_wal as wal;
 
@@ -53,6 +53,17 @@ where
 
 pub type WalReply<T> = RpcReplyPort<eyre::Result<T>>;
 
+#[derive(Debug)]
+pub(crate) struct WalAhead(pub u64);
+
+impl std::fmt::Display for WalAhead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WAL already contains signing state at height {}", self.0)
+    }
+}
+
+impl std::error::Error for WalAhead {}
+
 pub enum Msg<Ctx: Context> {
     StartedHeight(Ctx::Height, WalReply<Vec<io::Result<WalEntry<Ctx>>>>),
     Reset(Ctx::Height, WalReply<()>),
@@ -68,7 +79,7 @@ pub struct Args<Codec> {
 }
 
 pub struct State<Ctx: Context> {
-    height: Ctx::Height,
+    height: Option<Ctx::Height>,
     wal_sender: mpsc::Sender<self::thread::WalMsg<Ctx>>,
     thread_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -86,7 +97,7 @@ where
     ) -> Result<(), ActorProcessingErr> {
         match msg {
             Msg::StartedHeight(height, reply_to) => {
-                if state.height == height {
+                if state.height == Some(height) {
                     debug!(%height, "WAL already at height, returning empty entries");
                     reply_to
                         .send(Ok(Vec::new()))
@@ -94,26 +105,24 @@ where
                     return Ok(());
                 }
 
-                state.height = height;
-
                 self.started_height(state, height, reply_to).await?;
             }
 
             Msg::Reset(height, reply_to) => {
-                state.height = height;
-
                 self.reset(state, height, reply_to).await?;
             }
 
             Msg::Append(height, entry, reply_to) => {
-                if height != state.height {
+                if Some(height) != state.height {
                     warn!(
-                        wal.height = %state.height, entry.height = %height,
-                        "Ignoring append, mismatched height: {entry:?}"
+                        wal.height = ?state.height, entry.height = %height,
+                        "Rejecting WAL append for an unconfirmed height"
                     );
 
                     reply_to
-                        .send(Ok(()))
+                        .send(Err(eyre!(
+                            "WAL append requested at unconfirmed height {height}"
+                        )))
                         .map_err(|e| eyre!("Failed to send reply: {e}"))?;
                 } else {
                     self.write_log(state, entry, reply_to).await?;
@@ -156,6 +165,7 @@ where
             .await?;
 
         let result = rx.await?;
+        state.height = result.is_ok().then_some(height);
 
         reply_to
             .send(result)
@@ -178,6 +188,7 @@ where
             .await?;
 
         let to_replay = rx.await?;
+        state.height = to_replay.is_ok().then_some(height);
 
         reply_to
             .send(to_replay)
@@ -251,16 +262,25 @@ where
         _myself: WalRef<Ctx>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        let log = wal::Log::open(&args.path)?;
-        info!("Opened WAL at {}", args.path.display());
+        let (log, codec) = tokio::task::spawn_blocking(move || {
+            let log = wal::RecoveryLog::open(&args.path, |bytes| {
+                decode_entry::<Ctx, _, _>(&args.codec, io::Cursor::new(bytes)).map(|_| ())
+            })?;
+            if let Some(archive) = log.recovered_tail() {
+                warn!(archive = %archive.display(), "Recovered incomplete uncommitted WAL frame");
+            }
+            info!("Opened WAL at {}", args.path.display());
+            Ok::<_, io::Error>((log, args.codec))
+        })
+        .await??;
 
         let (tx, rx) = mpsc::channel(100);
 
         // Spawn a system thread to perform blocking WAL operations.
-        let handle = self::thread::spawn(self.span.clone(), log, args.codec, rx);
+        let handle = self::thread::spawn(self.span.clone(), log, codec, rx);
 
         Ok(State {
-            height: Ctx::Height::ZERO,
+            height: None,
             wal_sender: tx,
             thread_handle: Some(handle),
         })
@@ -270,7 +290,7 @@ where
         name = "wal",
         parent = &self.span,
         skip_all,
-        fields(height = %span_height(state.height, &msg)),
+        fields(height = ?span_height(state.height, &msg)),
     )]
     async fn handle(
         &self,
@@ -289,7 +309,7 @@ where
         name = "wal.post_stop",
         parent = &self.span,
         skip_all,
-        fields(height = %state.height),
+        fields(height = ?state.height),
     )]
     async fn post_stop(
         &self,
@@ -313,9 +333,9 @@ where
 
 /// Use the height we are about to start instead of the current height
 /// for the tracing span of the WAL actor when starting a new height.
-fn span_height<Ctx: Context>(height: Ctx::Height, msg: &Msg<Ctx>) -> Ctx::Height {
+fn span_height<Ctx: Context>(height: Option<Ctx::Height>, msg: &Msg<Ctx>) -> Option<Ctx::Height> {
     if let Msg::StartedHeight(h, _) = msg {
-        *h
+        Some(*h)
     } else {
         height
     }

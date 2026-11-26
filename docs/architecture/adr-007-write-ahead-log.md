@@ -571,27 +571,33 @@ Normal shutdown stops consensus and sync before the WAL, continues cleanup after
 and joins the blocking WAL worker before the WAL actor returns. `EngineHandle::shutdown` deliberately has no internal
 deadline: a worker stuck inside `fsync` can therefore block it. Deployments must configure a service-manager stop
 timeout and use forced process termination as the final backstop after preserving diagnostics.
+Keep servicing application requests while awaiting engine shutdown so in-flight consensus handlers can finish.
 
-A second source of errors occurs during WAL replay and requires special
-attention: an error at a given entry implies that all subsequent WAL entries
-are corrupted.
-Notice that crashes can happen at any time of the execution, including the
-instant at which a WAL entry is being persisted to stable storage.
-A crash at this point will likely render a suffix of the WAL corrupted.
-This, however, is not a threat for safety because the outputs produced by the
-associated state-machine transition are only emitted after the WAL is
-[persisted](#persistence-1).
-Since the append operation has not been concluded with success, the output was
-not emitted, therefore it is just like it has never been produced.
+### Recovering an interrupted append
 
-Opening validates every frame header and declared payload boundary. A partial header, oversized length, arithmetic
-overflow, payload extending past EOF, bad CRC, decompression error, or decode error is never repaired by truncation.
-The original file bytes are preserved across repeated attempts.
+The file-backed engine WAL keeps an activation record (`.managed`) and a `.checkpoint` beside the WAL. Before
+acknowledging an advancing flush, it syncs the WAL, writes and syncs a checkpoint for the sequence and exact
+committed prefix, atomically replaces the checkpoint, and syncs the directory. The checkpoint includes a digest of
+the raw committed bytes. Keep the WAL and both metadata files together. A managed WAL is roll-forward only, since
+an older binary does not keep the checkpoint current. Keep the same restorable generation across all files.
 
-For a bad final frame, stop the node and retain a byte-for-byte copy of the WAL and its storage diagnostics. Do not
-remove the frame, replace the file, reset the height, or restore an older copy. Escalate the artifact for a compatible
-roll-forward recovery binary or a safety analysis that accounts for every recorded vote and certificate. A fresh
-database or stale backup does not prove that signing again is safe.
+On reopen, validate the complete committed prefix, then inspect the uncommitted suffix. Keep and seal complete
+valid frames before replay. When an incomplete final frame starts after the committed boundary, write and sync a
+`.torn-*` diagnostic copy and its directory before trimming and syncing the WAL. Restart can repeat this repair.
+An oversized length, complete bad CRC, decompression or decode failure, committed-prefix mismatch, or missing
+managed checkpoint blocks startup. A complete legacy WAL activates without rewriting its records. An incomplete
+legacy WAL remains untouched because it has no committed boundary.
+
+A pending forward reset requires fresh confirmation of the target from the application's durable height before
+the WAL completes it. Interrupted same-height resets and mismatched heights require investigation. Before replay,
+validate the entire input batch and index recorded local votes and proposals. Reuse their signatures, safety-hang
+on divergent signing choices, and seal newly signed replay outputs before publication or application restream.
+Keep the signing index through the height. A node whose application is behind an intact, settled WAL can catch
+up with signing disabled below the WAL height. Normal full-node startup at the WAL height preserves its records.
+
+If startup still fails, stop the node and preserve the WAL, its companion files, application state and storage
+diagnostics. Escalate for analysis that accounts for all recorded votes and certificates. Never remove bytes by
+hand, replace or reset the WAL, or restore stale signing state to force a restart.
 
 In summary, this version fails closed at the first corrupt or unknown replay entry and does not transition consensus
 to normal operation. Phase 1 is different: an unknown `0x08` produces a replay error but consensus continues with an
