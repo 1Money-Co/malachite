@@ -58,8 +58,8 @@ that release.
 
 | Improvement | Circle v0.8.2 | Phase-3 action | Retirement gate |
 | --- | --- | --- | --- |
-| Durable WAL recovery boundary | No equivalent checkpoint | Carry the shared WAL patch and adapt the worker | Tagged release; crash, reset and WAL matrix |
-| Replay signing guard | Recorded-message indexing already present | Reuse upstream indexing and carry the durable output gate | Recorded signatures survive a repeated crash |
+| Durable WAL boundary | No checkpoint | Carry WAL patch and adapt worker | Crash and reset tests on a Circle release |
+| Replay signing guard | Signing index | Reuse Circle's index | Recorded signatures survive a second crash |
 | Visible replay safety halt | Different policy | Contribute remaining delta | Tagged release; fault tests |
 | Nth-flush tests | Not complete | Contribute actor tests | Deletion mutations fail |
 | Producer-before-WAL stop | Not complete | Contribute ordered shutdown | Actor-order tests pass |

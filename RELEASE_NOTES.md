@@ -7,6 +7,7 @@
   encoding. Keep the WAL and its checkpoint/activation files together and roll forward after activation.
 - Replay checks the full input batch before processing, reuses recorded local signatures, and seals new signing
   choices before publication. Startup or buffered height-reset failures remain visible to the supervisor.
+- Emerald's durable recovery candidate pins `352e39662889c3881c1d2e587d1cf66bd0201ddb`.
 
 ## 0.7.0
 
@@ -17,7 +18,7 @@
 
 - Reconcile the 1Money fork with Circle's v0.7 implementation while retaining downstream ECDSA, value-sync, WAL,
   and actor-lifecycle compatibility behavior. Production qualification remains tracked separately.
-- The exact Malachite code candidate for Emerald is
+- The earlier safety-remediation candidate for Emerald was
   `9828de163970f79be4ac0096fdca245bc683583a`. It contains Circle implementation `5cd137fb` and release
   `32abf3cf` in ancestry, uses `arc-malachitebft-*` package version `0.7.0`, and removes delayed WAL replay.
 - Development validation passed the focused ECDSA, request, validator-proof, sync, and WAL suites. The unrestricted
@@ -26,7 +27,7 @@
   denied, and nightly formatting check passed.
 - Builder startup is transactional: if a later default actor fails to spawn, every default actor already created is
   stopped and awaited in reverse dependency order, while caller-owned custom actors remain untouched.
-- WAL opening rejects malformed or incomplete frames without mutating the file. Runtime append, flush, and replay
+- That candidate rejected malformed or incomplete frames without mutating the file. Runtime append, flush, and replay
   uncertainty enters an operator-visible safety hang; reset and fetch transport failures stop the node visibly.
 - Fault tests exercise the flushes immediately before publish and decide. Normal shutdown stops consensus and sync
   before the WAL and continues cleanup after an individual child-stop failure.
