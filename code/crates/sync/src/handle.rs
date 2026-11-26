@@ -789,19 +789,14 @@ where
         );
     };
 
-    // Capture the range start before `range` is shadowed by the peer-selected sub-range,
-    // so we can roll sync_height back if no peer can serve it.
-    let range_start = *range.start();
+    // This range was already counted by the original request. Rewind before selecting a peer
+    // so that tracking a shorter prefix leaves the remaining heights available for scheduling.
+    set_sync_height(state, min(state.sync_height, *range.start()));
 
     // Get a random peer that can provide the values in the range.
     let Some((peer, range)) = state.random_peer_with(&range) else {
         // No connected peer reached this height yet, we can stop syncing here.
         debug!(range = %DisplayRange(&range), "No peer to request sync from");
-        // Roll sync_height back towards the range start so this range is
-        // picked up again once a peer advances past it. The original request
-        // has already advanced sync_height past the range, so without this
-        // rollback the missing segment would stall until an external event.
-        set_sync_height(state, min(state.sync_height, range_start));
         return Ok(());
     };
 
@@ -942,6 +937,10 @@ where
         return Ok(());
     };
 
+    // The old request no longer covers these heights. Rewind to its start so that tracking
+    // the replacement leaves the cursor at or before any suffix the peer cannot serve.
+    set_sync_height(state, min(state.sync_height, *entry.range.start()));
+
     match except_peer_id {
         Some(peer_id) if entry.peer == peer_id => {
             entry.excluded_peers.insert(peer_id);
@@ -969,9 +968,6 @@ where
             excluded_peers = entry.excluded_peers.len(),
             "No peer to re-request sync from, all eligible peers exhausted"
         );
-        // Reset sync_height towards the start of the failed range so it can be retried
-        // when conditions change (new status update, consensus advance, peer reconnect).
-        set_sync_height(state, min(state.sync_height, *entry.range.start()));
         return Ok(());
     };
 
@@ -2134,6 +2130,129 @@ mod tests {
         effects
             .iter()
             .any(|e| matches!(e, crate::Effect::ProcessValueResponse(..)))
+    }
+
+    #[test]
+    fn timeout_retry_to_shorter_peer_preserves_unserved_suffix() {
+        let (mut state, metrics, peer_a) = setup_response_test(11, 15);
+        let peer_b = PeerId::random();
+        state.started = true;
+        state.config.parallel_requests = 1;
+        state.tip_height = Height::new(10);
+        state.sync_height = Height::new(16);
+        state.update_status(Status {
+            peer_id: peer_b,
+            tip_height: Height::new(12),
+            history_min_height: Height::new(1),
+        });
+
+        let effects = drive_input_with_retries(
+            &mut state,
+            &metrics,
+            Input::SyncRequestTimedOut(
+                OutboundRequestId::new("req1"),
+                peer_a,
+                Request::ValueRequest(ValueRequest::new(Height::new(11)..=Height::new(15))),
+            ),
+        )
+        .unwrap();
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendValueRequest(peer, request, _)
+                if *peer == peer_b && request.range == (Height::new(11)..=Height::new(12))
+        )));
+
+        let response = ValueResponse::new(
+            Height::new(11),
+            vec![make_raw_value(11), make_raw_value(12)],
+        );
+        let effects = drive_input(
+            &mut state,
+            &metrics,
+            Input::ValueResponse(OutboundRequestId::new("retry_req1"), peer_b, Some(response)),
+        )
+        .unwrap();
+        assert!(has_process_value_response(&effects));
+        drive_input(&mut state, &metrics, Input::Decided(Height::new(12))).unwrap();
+
+        drive_input_with_retries(
+            &mut state,
+            &metrics,
+            Input::StartedHeight(Height::new(13), HeightStartType::Start),
+        )
+        .unwrap();
+        let healthy_status = state.peers[&peer_a].clone();
+        drive_input_with_retries(&mut state, &metrics, Input::Status(healthy_status)).unwrap();
+
+        let entry = state.pending_requests.values().next().unwrap();
+        assert_eq!(entry.peer, peer_a);
+        assert_eq!(*entry.range.start(), Height::new(13));
+    }
+
+    #[test]
+    fn partial_response_retry_to_shorter_peer_preserves_unserved_suffix() {
+        let (mut state, metrics, peer_a) = setup_response_test(11, 15);
+        let peer_b = PeerId::random();
+        state.started = true;
+        state.config.parallel_requests = 1;
+        state.tip_height = Height::new(10);
+        state.sync_height = Height::new(16);
+        state.peers.get_mut(&peer_a).unwrap().tip_height = Height::new(12);
+        state.update_status(Status {
+            peer_id: peer_b,
+            tip_height: Height::new(14),
+            history_min_height: Height::new(1),
+        });
+
+        let prefix = ValueResponse::new(
+            Height::new(11),
+            vec![make_raw_value(11), make_raw_value(12)],
+        );
+        let effects = drive_input_with_retries(
+            &mut state,
+            &metrics,
+            Input::ValueResponse(OutboundRequestId::new("req1"), peer_a, Some(prefix)),
+        )
+        .unwrap();
+        assert!(has_process_value_response(&effects));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendValueRequest(peer, request, _)
+                if *peer == peer_b && request.range == (Height::new(13)..=Height::new(14))
+        )));
+
+        let response = ValueResponse::new(
+            Height::new(13),
+            vec![make_raw_value(13), make_raw_value(14)],
+        );
+        drive_input(
+            &mut state,
+            &metrics,
+            Input::ValueResponse(OutboundRequestId::new("retry_req1"), peer_b, Some(response)),
+        )
+        .unwrap();
+        drive_input(&mut state, &metrics, Input::Decided(Height::new(14))).unwrap();
+        drive_input(
+            &mut state,
+            &metrics,
+            Input::StartedHeight(Height::new(15), HeightStartType::Start),
+        )
+        .unwrap();
+        let effects = drive_input_with_retries(
+            &mut state,
+            &metrics,
+            Input::Status(Status {
+                peer_id: peer_a,
+                tip_height: Height::new(20),
+                history_min_height: Height::new(1),
+            }),
+        )
+        .unwrap();
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SendValueRequest(peer, request, _)
+                if *peer == peer_a && *request.range.start() == Height::new(15)
+        )));
     }
 
     #[test]
