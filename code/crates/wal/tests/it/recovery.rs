@@ -160,6 +160,29 @@ fn refuses_a_full_bad_frame_even_after_the_checkpoint() -> io::Result<()> {
 }
 
 #[test]
+fn refuses_an_oversized_length_beyond_the_checkpoint() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("consensus.wal");
+    let mut wal = open(&path)?;
+    wal.append(b"saved vote")?;
+    wal.flush()?;
+    drop(wal);
+
+    // An in-range u64 that exceeds the 1 GiB frame limit must not count as a torn append.
+    let mut writer = OpenOptions::new().append(true).open(&path)?;
+    writer.write_all(&[0])?;
+    writer.write_all(&((1_u64 << 30) + 1).to_be_bytes())?;
+    writer.write_all(&[0; 4])?;
+    drop(writer);
+    let before = fs::read(&path)?;
+
+    assert_eq!(open(&path).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    assert_eq!(fs::read(&path)?, before);
+    assert_eq!(fs::read_dir(dir.path())?.count(), 3);
+    Ok(())
+}
+
+#[test]
 fn failed_checkpoint_update_cannot_acknowledge_flush() -> io::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("consensus.wal");
