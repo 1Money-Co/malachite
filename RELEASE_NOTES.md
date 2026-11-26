@@ -18,6 +18,7 @@
   network events. This preserves announcements that reach the engine before the sync actor starts.
 - Apply a value's updated validity across all rounds at its height. A verified sync certificate can advance
   a node when the application accepts a value it previously rejected and replayed from the WAL.
+- Release discovery connection records on close, including connections that were never admitted as active.
 
 ## 0.7.0
 

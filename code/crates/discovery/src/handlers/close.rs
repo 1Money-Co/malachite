@@ -44,14 +44,15 @@ where
         peer_id: PeerId,
         connection_id: ConnectionId,
     ) {
+        // Transport connections are tracked before Identify admits them as active.
+        self.connections.remove(&connection_id);
+
         let mut was_last_connection = false;
 
         if let Some(connection_ids) = self.active_connections.get_mut(&peer_id) {
             if connection_ids.contains(&connection_id) {
                 warn!("Removing active connection {connection_id} to peer {peer_id}");
                 connection_ids.retain(|id| id != &connection_id);
-
-                self.connections.remove(&connection_id);
 
                 if connection_ids.is_empty() {
                     self.active_connections.remove(&peer_id);
@@ -129,5 +130,160 @@ where
             let addrs = peer_info.map(|info| info.listen_addrs).unwrap_or_default();
             self.controller.dial_clear_done_for_peer(peer_id, &addrs);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use libp2p::core::{
+        transport::dummy::DummyTransport, transport::PortUse, ConnectedPoint, Endpoint,
+    };
+    use libp2p::identity::Keypair;
+    use libp2p::kad::{Addresses, KBucketKey, KBucketRef, RoutingUpdate};
+    use libp2p::request_response::{OutboundRequestId, ResponseChannel};
+    use libp2p::swarm::{dummy, Config as SwarmConfig};
+    use libp2p::{identify, Multiaddr, Transport};
+    use malachitebft_metrics::Registry;
+
+    use super::*;
+    use crate::{Config, DialData, Request, Response};
+
+    // These tests drive the discovery handlers directly, without networking.
+    impl DiscoveryClient for dummy::Behaviour {
+        fn add_address(&mut self, _: &PeerId, _: Multiaddr) -> RoutingUpdate {
+            unreachable!()
+        }
+
+        fn kbuckets(
+            &mut self,
+        ) -> impl Iterator<Item = KBucketRef<'_, KBucketKey<PeerId>, Addresses>> {
+            std::iter::empty()
+        }
+
+        fn send_request(&mut self, _: &PeerId, _: Request) -> OutboundRequestId {
+            unreachable!()
+        }
+
+        fn send_response(
+            &mut self,
+            _: ResponseChannel<Response>,
+            _: Response,
+        ) -> Result<(), Response> {
+            unreachable!()
+        }
+    }
+
+    fn fixture(config: Config) -> (Discovery<dummy::Behaviour>, Swarm<dummy::Behaviour>) {
+        let local_key = Keypair::ed25519_from_bytes([1; 32]).unwrap();
+        let swarm = Swarm::new(
+            DummyTransport::new().boxed(),
+            dummy::Behaviour,
+            local_key.public().to_peer_id(),
+            SwarmConfig::without_executor(),
+        );
+        let discovery = Discovery::new(config, vec![], &mut Registry::default());
+        (discovery, swarm)
+    }
+
+    fn peer_info() -> (PeerId, identify::Info) {
+        let public_key = Keypair::ed25519_from_bytes([2; 32]).unwrap().public();
+        let peer_id = public_key.to_peer_id();
+        let info = identify::Info {
+            public_key,
+            protocol_version: "/consensus/test".to_owned(),
+            agent_version: "discovery-test".to_owned(),
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/10001".parse().unwrap()],
+            protocols: vec![],
+            observed_addr: "/ip4/127.0.0.1/tcp/10000".parse().unwrap(),
+            signed_peer_record: None,
+        };
+        (peer_id, info)
+    }
+
+    fn inbound_endpoint(info: &identify::Info) -> ConnectedPoint {
+        ConnectedPoint::Listener {
+            local_addr: info.observed_addr.clone(),
+            send_back_addr: info.listen_addrs[0].clone(),
+        }
+    }
+
+    #[test]
+    fn closing_before_identify_cleans_up_transport_and_pending_dial() {
+        let (mut discovery, mut swarm) = fixture(Config::new(false));
+        let (peer_id, info) = peer_info();
+        let connection_id = ConnectionId::new_unchecked(1);
+        discovery.controller.dial.register_in_progress(
+            connection_id,
+            DialData::new(Some(peer_id), info.listen_addrs.clone()),
+        );
+        discovery.handle_connection(
+            &mut swarm,
+            peer_id,
+            connection_id,
+            ConnectedPoint::Dialer {
+                address: info.listen_addrs[0].clone(),
+                role_override: Endpoint::Dialer,
+                port_use: PortUse::Reuse,
+            },
+        );
+        assert!(discovery.connections.contains_key(&connection_id));
+        assert!(discovery.controller.dial.is_in_progress(&connection_id));
+
+        discovery.handle_closed_connection(&mut swarm, peer_id, connection_id);
+
+        assert!(!discovery.connections.contains_key(&connection_id));
+        assert!(!discovery.controller.dial.is_in_progress(&connection_id));
+        assert!(!discovery.active_connections.contains_key(&peer_id));
+        assert!(!discovery.discovered_peers.contains_key(&peer_id));
+    }
+
+    #[test]
+    fn closing_peer_rejected_at_identify_cleans_up_transport() {
+        let mut config = Config::new(false);
+        config.set_persistent_peers_only(true);
+        let (mut discovery, mut swarm) = fixture(config);
+        let (peer_id, info) = peer_info();
+        let connection_id = ConnectionId::new_unchecked(1);
+        discovery.handle_connection(&mut swarm, peer_id, connection_id, inbound_endpoint(&info));
+        assert!(discovery.handle_new_peer(&mut swarm, connection_id, peer_id, info));
+        assert!(discovery.connections.contains_key(&connection_id));
+        assert!(!discovery.active_connections.contains_key(&peer_id));
+
+        discovery.handle_closed_connection(&mut swarm, peer_id, connection_id);
+
+        assert!(!discovery.connections.contains_key(&connection_id));
+        assert!(!discovery.is_inbound_peer(&peer_id));
+        assert!(!discovery.discovered_peers.contains_key(&peer_id));
+    }
+
+    #[test]
+    fn closing_connection_above_peer_limit_preserves_active_peer() {
+        let mut config = Config::new(false);
+        config.set_max_connections_per_peer(1);
+        let (mut discovery, mut swarm) = fixture(config);
+        let (peer_id, info) = peer_info();
+        let active_id = ConnectionId::new_unchecked(1);
+        let excess_id = ConnectionId::new_unchecked(2);
+        discovery.handle_connection(&mut swarm, peer_id, active_id, inbound_endpoint(&info));
+        assert!(!discovery.handle_new_peer(&mut swarm, active_id, peer_id, info.clone()));
+        discovery.handle_connection(&mut swarm, peer_id, excess_id, inbound_endpoint(&info));
+        assert!(discovery.handle_new_peer(&mut swarm, excess_id, peer_id, info));
+        assert_eq!(discovery.active_connections[&peer_id], [active_id]);
+        assert!(discovery.connections.contains_key(&excess_id));
+
+        discovery.handle_closed_connection(&mut swarm, peer_id, excess_id);
+
+        assert!(!discovery.connections.contains_key(&excess_id));
+        assert!(discovery.connections.contains_key(&active_id));
+        assert_eq!(discovery.active_connections[&peer_id], [active_id]);
+        assert!(discovery.is_inbound_peer(&peer_id));
+        assert!(discovery.discovered_peers.contains_key(&peer_id));
+
+        discovery.handle_closed_connection(&mut swarm, peer_id, active_id);
+
+        assert!(discovery.connections.is_empty());
+        assert!(!discovery.active_connections.contains_key(&peer_id));
+        assert!(!discovery.is_inbound_peer(&peer_id));
+        assert!(!discovery.discovered_peers.contains_key(&peer_id));
     }
 }
