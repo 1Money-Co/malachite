@@ -551,6 +551,14 @@ where
                     .await?;
             }
 
+            Msg::NetworkEvent(NetworkEvent::PeerSyncSubscribed(peer_id)) => {
+                // Identify can complete before Scatter starts sending to the joining peer.
+                debug!(%peer_id, "Peer subscribed to sync channel, broadcasting status");
+
+                self.process_input(&myself, state, sync::Input::SendStatusUpdate)
+                    .await?;
+            }
+
             Msg::NetworkEvent(_) => {
                 // Ignore other gossip events
             }

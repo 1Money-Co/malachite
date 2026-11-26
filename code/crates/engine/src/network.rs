@@ -107,6 +107,7 @@ pub enum NetworkEvent<Ctx: Context> {
 
     PeerConnected(PeerId),
     PeerDisconnected(PeerId),
+    PeerSyncSubscribed(PeerId),
 
     Vote(PeerId, SignedVote<Ctx>),
 
@@ -134,6 +135,7 @@ pub enum State<Ctx: Context> {
     Running {
         listen_addrs: Vec<Multiaddr>,
         peers: BTreeSet<PeerId>,
+        sync_subscriptions: BTreeSet<PeerId>,
         output_port: OutputPort<NetworkEvent<Ctx>>,
         ctrl_handle: Box<CtrlHandle>,
         recv_task: JoinHandle<()>,
@@ -241,6 +243,7 @@ where
         Ok(State::Running {
             listen_addrs: Vec::new(),
             peers: BTreeSet::new(),
+            sync_subscriptions: BTreeSet::new(),
             output_port: OutputPort::with_capacity(128),
             ctrl_handle: Box::new(ctrl_handle),
             recv_task,
@@ -277,6 +280,7 @@ where
         let State::Running {
             listen_addrs,
             peers,
+            sync_subscriptions,
             output_port,
             ctrl_handle,
             inbound_requests,
@@ -294,6 +298,10 @@ where
 
                 for peer in peers.iter() {
                     subscriber.send(NetworkEvent::PeerConnected(*peer));
+                }
+
+                for peer in sync_subscriptions.iter() {
+                    subscriber.send(NetworkEvent::PeerSyncSubscribed(*peer));
                 }
 
                 subscriber.subscribe_to_port(output_port);
@@ -386,7 +394,14 @@ where
 
             Msg::NewEvent(Event::PeerDisconnected(peer_id)) => {
                 peers.remove(&peer_id);
+                sync_subscriptions.remove(&peer_id);
                 output_port.send(NetworkEvent::PeerDisconnected(peer_id));
+            }
+
+            Msg::NewEvent(Event::PeerSyncSubscribed(peer_id)) => {
+                if sync_subscriptions.insert(peer_id) {
+                    output_port.send(NetworkEvent::PeerSyncSubscribed(peer_id));
+                }
             }
 
             Msg::NewEvent(Event::LivenessMessage(Channel::Liveness, from, data)) => {

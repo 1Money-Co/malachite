@@ -7,7 +7,8 @@
   encoding. Keep the WAL and its checkpoint/activation files together and roll forward after activation.
 - Replay checks the full input batch before processing, reuses recorded local signatures, and seals new signing
   choices before publication. Startup or buffered height-reset failures remain visible to the supervisor.
-- Emerald's durable recovery candidate pins `352e39662889c3881c1d2e587d1cf66bd0201ddb`.
+- Broadcast sync status when a peer subscribes to the sync topic. This backports the Circle v0.8 behavior in
+  `72143f6c` so a restarting node can catch up even when Identify completes before its subscription.
 
 ## 0.7.0
 

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- The network and engine network event enums now include `PeerSyncSubscribed`. Update exhaustive matches.
+
 ## 0.7.0
 
 *June 22nd, 2026*

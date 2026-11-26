@@ -298,6 +298,7 @@ pub enum Event {
     Listening(Multiaddr),
     PeerConnected(PeerId),
     PeerDisconnected(PeerId),
+    PeerSyncSubscribed(PeerId),
     ConsensusMessage(Channel, PeerId, Bytes),
     LivenessMessage(Channel, PeerId, Bytes),
     Sync(sync::RawMessage),
@@ -957,7 +958,13 @@ async fn handle_swarm_event(
         }
 
         SwarmEvent::Behaviour(NetworkEvent::Broadcast(event)) => {
-            return handle_broadcast_event(event, config, metrics, swarm, state, tx_event).await;
+            return handle_broadcast_event(
+                event,
+                config.channel_names,
+                config.enable_sync,
+                tx_event,
+            )
+            .await;
         }
 
         SwarmEvent::Behaviour(NetworkEvent::Sync(event)) => {
@@ -1066,24 +1073,30 @@ async fn handle_gossipsub_event(
 
 async fn handle_broadcast_event(
     event: broadcast::Event,
-    config: &Config,
-    _metrics: &Metrics,
-    _swarm: &mut swarm::Swarm<Behaviour>,
-    _state: &mut State,
+    channel_names: ChannelNames,
+    enable_sync: bool,
     tx_event: &mpsc::Sender<Event>,
 ) -> ControlFlow<()> {
     match event {
         broadcast::Event::Subscribed(peer_id, topic) => {
-            if !Channel::has_broadcast_topic(&topic, config.channel_names) {
+            let Some(channel) = Channel::from_broadcast_topic(&topic, channel_names) else {
                 trace!("Peer {peer_id} tried to subscribe to unknown topic: {topic:?}");
                 return ControlFlow::Continue(());
-            }
+            };
 
             trace!("Peer {peer_id} subscribed to {topic:?}");
+
+            if channel == Channel::Sync && enable_sync {
+                let peer_id = PeerId::from_libp2p(&peer_id);
+                if let Err(error) = tx_event.send(Event::PeerSyncSubscribed(peer_id)).await {
+                    error!(%error, "Error sending sync subscription event to handle");
+                    return ControlFlow::Break(());
+                }
+            }
         }
 
         broadcast::Event::Unsubscribed(peer_id, topic) => {
-            if !Channel::has_broadcast_topic(&topic, config.channel_names) {
+            if !Channel::has_broadcast_topic(&topic, channel_names) {
                 trace!("Peer {peer_id} tried to unsubscribe from unknown topic: {topic:?}");
                 return ControlFlow::Continue(());
             }
@@ -1092,7 +1105,7 @@ async fn handle_broadcast_event(
         }
 
         broadcast::Event::Received(peer_id, topic, message) => {
-            let Some(channel) = Channel::from_broadcast_topic(&topic, config.channel_names) else {
+            let Some(channel) = Channel::from_broadcast_topic(&topic, channel_names) else {
                 trace!("Received message from {peer_id} on different channel: {topic:?}");
                 return ControlFlow::Continue(());
             };
@@ -1245,6 +1258,40 @@ impl PeerIdExt for PeerId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sync_subscription_notifies_the_engine_without_identify() {
+        let (tx_event, mut rx_event) = mpsc::channel::<Event>(1);
+        let peer = libp2p::PeerId::random();
+        let channel_names = ChannelNames::default();
+        let topic = Channel::Sync.to_broadcast_topic(channel_names);
+
+        let disabled = handle_broadcast_event(
+            broadcast::Event::Subscribed(peer, topic),
+            channel_names,
+            false,
+            &tx_event,
+        )
+        .await;
+        assert!(matches!(disabled, ControlFlow::Continue(())));
+        assert!(matches!(
+            rx_event.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let enabled = handle_broadcast_event(
+            broadcast::Event::Subscribed(peer, topic),
+            channel_names,
+            true,
+            &tx_event,
+        )
+        .await;
+        assert!(matches!(enabled, ControlFlow::Continue(())));
+        assert!(matches!(
+            rx_event.try_recv(),
+            Ok(Event::PeerSyncSubscribed(peer_id)) if peer_id == PeerId::from_libp2p(&peer)
+        ));
+    }
 
     #[tokio::test]
     async fn handle_validator_proof_event_breaks_when_event_receiver_dropped() {
