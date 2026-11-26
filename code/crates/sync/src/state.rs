@@ -53,7 +53,7 @@ where
     pub tip_height: Ctx::Height,
 
     /// Next height to send a sync request.
-    /// Invariant: `sync_height > tip_height`
+    /// Invariant after start: `sync_height > tip_height` and no pending range covers it.
     pub sync_height: Ctx::Height,
 
     /// The requested range of heights, the peer handling the request, and
@@ -104,6 +104,25 @@ where
     /// If the configuration is set to 0, it defaults to 1.
     pub fn max_parallel_requests(&self) -> usize {
         max(1, self.config.parallel_requests)
+    }
+
+    pub(crate) fn has_request_slot(&self) -> bool {
+        self.pending_requests.len() < self.max_parallel_requests()
+            // Later responses cannot leave the window until consensus can decide the leading
+            // gap. Allow one request for that gap once the later work is all off the wire.
+            || (self.sync_height == self.tip_height.increment()
+                && self.pending_requests.len() == self.pending_consensus_ranges.len())
+    }
+
+    /// Whether cached peer status and the request window permit a new batch at the sync cursor.
+    pub fn has_requestable_values(&self) -> bool {
+        self.config.enabled
+            && self.started
+            && self.has_request_slot()
+            && self.peers.values().any(|status| {
+                status.history_min_height <= self.sync_height
+                    && self.sync_height <= status.tip_height
+            })
     }
 
     pub fn update_status(&mut self, status: Status<Ctx>) {

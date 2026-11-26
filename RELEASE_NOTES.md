@@ -20,6 +20,7 @@
   a node when the application accepts a value it previously rejected and replayed from the WAL.
 - Release discovery connection records on close, including connections that were never admitted as active.
 - Keep the unserved heights eligible for synchronization when a retry peer can supply only a prefix of the range.
+- Use a one-second retry timer to recover missed sync requests from cached peer status independently of broadcasts.
 
 ## 0.7.0
 

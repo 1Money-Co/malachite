@@ -59,9 +59,12 @@ where
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Timeout {
     Request(OutboundRequestId),
+    Retry,
 }
 
 type Timers = TimerScheduler<Timeout>;
+
+const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub type SyncRef<Ctx> = ActorRef<Msg<Ctx>>;
 pub type SyncMsg<Ctx> = Msg<Ctx>;
@@ -559,9 +562,7 @@ where
                     .await?;
             }
 
-            Msg::NetworkEvent(_) => {
-                // Ignore other gossip events
-            }
+            Msg::NetworkEvent(_) => return Ok(()),
 
             // (Re)Started a new height
             Msg::StartedHeight(height, restart) => {
@@ -672,6 +673,10 @@ where
                 info!(?timeout, "Timeout elapsed");
 
                 match timeout {
+                    Timeout::Retry => {
+                        self.process_input(&myself, state, sync::Input::Retry)
+                            .await?;
+                    }
                     Timeout::Request(request_id) => {
                         if let Some(inflight) = state.inflight.remove(&request_id) {
                             self.process_input(
@@ -690,6 +695,14 @@ where
                     }
                 }
             }
+        }
+
+        // Keep one independent retry timer while an uncovered height can be requested.
+        // Regular traffic must not postpone an already scheduled retry.
+        if !state.sync.has_requestable_values() {
+            state.timers.cancel(&Timeout::Retry);
+        } else if !state.timers.is_timer_active(&Timeout::Retry) {
+            state.timers.start_timer(Timeout::Retry, RETRY_DELAY);
         }
 
         Ok(())

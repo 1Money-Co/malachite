@@ -37,6 +37,7 @@ malachitebft-signing.workspace = true
 workspace = true
 
 [dev-dependencies]
+malachitebft-sync.workspace = true
 malachitebft-test.workspace = true
 rand.workspace = true
 tempfile.workspace = true

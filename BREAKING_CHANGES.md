@@ -3,6 +3,7 @@
 ## Unreleased
 
 - The network and engine network event enums now include `PeerSyncSubscribed`. Update exhaustive matches.
+- The sync `Input` and engine sync `Timeout` enums now include `Retry`. Update exhaustive matches.
 
 ### WAL behavior
 

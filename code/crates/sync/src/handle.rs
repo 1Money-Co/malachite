@@ -26,6 +26,9 @@ pub enum Input<Ctx: Context> {
     /// Periodical event triggering the broadcast of a status update
     SendStatusUpdate,
 
+    /// Retry uncovered heights using cached peer status.
+    Retry,
+
     /// A status update has been received from a peer
     Status(Status<Ctx>),
 
@@ -70,6 +73,9 @@ where
 {
     match input {
         Input::SendStatusUpdate => on_send_status_update(co, state, metrics).await,
+
+        Input::Retry if state.has_requestable_values() => request_values(co, state, metrics).await,
+        Input::Retry => Ok(()),
 
         Input::Status(status) => on_status(co, state, metrics, status).await,
 
@@ -722,9 +728,8 @@ async fn request_values<Ctx>(
 where
     Ctx: Context,
 {
-    let max_parallel_requests = state.max_parallel_requests();
-
-    if state.pending_requests.len() >= max_parallel_requests {
+    if !state.has_request_slot() {
+        let max_parallel_requests = state.max_parallel_requests();
         let snapshot = crate::height_allowance_snapshot(state);
         info!(
             max_parallel_requests,
@@ -740,7 +745,7 @@ where
         return Ok(());
     };
 
-    while state.pending_requests.len() < max_parallel_requests {
+    while state.has_request_slot() {
         // Find the next uncovered range starting from current sync_height
         let initial_height = state.sync_height;
         let covered_ranges = state.covered_ranges();
@@ -757,7 +762,13 @@ where
             break;
         };
 
-        send_and_track_request_to_peer(&co, state, metrics, peer, range, BTreeSet::new()).await?;
+        if !send_and_track_request_to_peer(&co, state, metrics, peer, range, BTreeSet::new())
+            .await?
+        {
+            // The cursor did not advance. Yield to the retry timer instead of sending again
+            // in this loop.
+            break;
+        }
     }
 
     Ok(())
@@ -812,7 +823,7 @@ async fn send_and_track_request_to_peer<Ctx>(
     peer: PeerId,
     range: RangeInclusive<<Ctx as Context>::Height>,
     excluded_peers: BTreeSet<PeerId>,
-) -> Result<(), Error<Ctx>>
+) -> Result<bool, Error<Ctx>>
 where
     Ctx: Context,
 {
@@ -824,28 +835,10 @@ where
     let Some((request_id, final_range)) =
         send_request_to_peer(co, state, metrics, range, peer).await?
     else {
-        // Request was skipped. `send_request_to_peer` returns `Ok(None)` in
-        // three cases:
-        //   1. The input range was empty (shouldn't happen from any known
-        //      caller — all callers derive `range` from a pending entry or
-        //      `find_next_uncovered_range_from`, both of which produce
-        //      non-empty ranges).
-        //   2. The range was trimmed empty because all heights in it have
-        //      already been validated by consensus (tip advanced past the
-        //      range mid-flight). The rollback is effectively a no-op here:
-        //      `set_sync_height` raises the candidate back above
-        //      `tip_height + 1`.
-        //   3. The `SendValueRequest` effect yielded `None` (transport-level
-        //      failure). This is the failure mode the rollback actually
-        //      targets.
-        //
-        // Roll sync_height back towards the range start so the range can be
-        // picked up again by `find_next_uncovered_range_from` on the next
-        // request cycle. Without this, a retry path that popped the pending
-        // entry before calling us would leave sync_height past an untracked
-        // range and stall sync for that segment until an external event.
+        // Keep missing heights eligible if the attempt did not send a request.
+        // set_sync_height skips heights already decided or covered elsewhere.
         set_sync_height(state, min(state.sync_height, range_start));
-        return Ok(());
+        return Ok(false);
     };
 
     // Store the pending request
@@ -859,7 +852,7 @@ where
         set_sync_height(state, final_range.end().increment());
     }
 
-    Ok(())
+    Ok(true)
 }
 
 /// Send a value request to a peer. Returns the request_id and final range if successful.
@@ -914,9 +907,8 @@ where
 ///
 /// If `except_peer_id` is `Some`, the failed peer is added to the set of
 /// excluded peers accumulated across retries. Once every eligible peer has
-/// been tried and failed, no further retry is attempted and sync_height is
-/// reset so a future event (status update, consensus advance) can restart
-/// the request cycle with a clean slate.
+/// been tried and failed, leave the range eligible for a later retry
+/// with a fresh exclusion set.
 ///
 /// If `except_peer_id` is `None` (internal processing error), no peer is
 /// added to the exclusion set because the failure was not the peer's fault.
@@ -972,7 +964,7 @@ where
     };
 
     // NOTE: `entry.excluded_peers` is moved into `send_and_track_request_to_peer`
-    // and is dropped if the send fails (`Ok(None)` branch). This is
+    // and is dropped if the send fails. This is
     // intentional — the next request cycle starts with a clean exclusion
     // set, and convergence away from unhealthy peers is left to the peer
     // scorer, which biases `random_peer_with_except`'s selection (timeouts
@@ -2498,6 +2490,103 @@ mod tests {
     }
 
     // -- sync_height rollback on retry send failure / missing peer --
+
+    #[test]
+    fn request_scheduler_yields_after_failed_send() {
+        let mut state = make_test_state();
+        state.started = true;
+        state.tip_height = Height::new(10);
+        state.sync_height = Height::new(11);
+        let metrics = crate::Metrics::new(std::time::Duration::from_secs(10));
+        let mut sends = 0;
+
+        drive_input_with(
+            &mut state,
+            &metrics,
+            Input::Status(Status {
+                peer_id: PeerId::random(),
+                tip_height: Height::new(15),
+                history_min_height: Height::new(1),
+            }),
+            |effect| match effect {
+                Effect::SendValueRequest(..) => {
+                    sends += 1;
+                    assert_eq!(sends, 1, "a failed send must yield to the retry timer");
+                    Resume::ValueRequestId(None)
+                }
+                _ => Resume::default(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(sends, 1);
+        assert!(state.pending_requests.is_empty());
+        assert_eq!(state.sync_height, Height::new(11));
+    }
+
+    #[test]
+    fn retry_fills_leading_gap_when_later_responses_fill_the_window() {
+        let (mut state, metrics, peer) = setup_response_test(11, 15);
+        state.started = true;
+        state.config.parallel_requests = 2;
+        state.tip_height = Height::new(10);
+        state.sync_height = Height::new(21);
+        let later_request = OutboundRequestId::new("later");
+        state.update_request(
+            later_request.clone(),
+            peer,
+            Height::new(16)..=Height::new(20),
+            BTreeSet::new(),
+        );
+
+        // The second batch is split into two responses waiting for consensus at later heights.
+        let prefix = ValueResponse::new(
+            Height::new(16),
+            vec![make_raw_value(16), make_raw_value(17)],
+        );
+        drive_input_with_retries(
+            &mut state,
+            &metrics,
+            Input::ValueResponse(later_request, peer, Some(prefix)),
+        )
+        .unwrap();
+        let suffix = ValueResponse::new(Height::new(18), (18..=20).map(make_raw_value).collect());
+        drive_input(
+            &mut state,
+            &metrics,
+            Input::ValueResponse(OutboundRequestId::new("retry_req1"), peer, Some(suffix)),
+        )
+        .unwrap();
+
+        let effects = drive_input(
+            &mut state,
+            &metrics,
+            Input::SyncRequestTimedOut(
+                OutboundRequestId::new("req1"),
+                peer,
+                Request::ValueRequest(ValueRequest::new(Height::new(11)..=Height::new(15))),
+            ),
+        )
+        .unwrap();
+        assert!(effects.is_empty());
+        assert_eq!(state.sync_height, Height::new(11));
+        assert_eq!(state.pending_requests.len(), 2);
+
+        let recovered = OutboundRequestId::new("leading-gap");
+        let effects = drive_input_with(&mut state, &metrics, Input::Retry, |effect| match effect {
+            Effect::SendValueRequest(..) => Resume::ValueRequestId(Some(recovered.clone())),
+            _ => Resume::default(),
+        })
+        .unwrap();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SendValueRequest(actual_peer, request, _)]
+                if *actual_peer == peer && request.range == (Height::new(11)..=Height::new(15))
+        ));
+        assert_eq!(state.pending_requests.len(), 3);
+        assert_eq!(state.sync_height, Height::new(21));
+        assert!(!state.has_requestable_values());
+    }
 
     /// Like [`drive_input_with_retries`] but resumes every `SendValueRequest`
     /// effect with `None`, simulating the case where the underlying send
