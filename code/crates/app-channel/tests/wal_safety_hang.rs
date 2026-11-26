@@ -1,6 +1,6 @@
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_malachitebft_app_channel::app::config::NodeConfig;
@@ -8,7 +8,7 @@ use arc_malachitebft_app_channel::app::consensus::{
     LocallyProposedValue, ProposedValue, SignedConsensusMsg,
 };
 use arc_malachitebft_app_channel::app::engine::consensus::Msg as ConsensusActorMsg;
-use arc_malachitebft_app_channel::app::engine::host::HeightParams;
+use arc_malachitebft_app_channel::app::engine::host::{HeightParams, HostMsg};
 use arc_malachitebft_app_channel::app::engine::network::{Msg as EngineNetworkMsg, NetworkEvent};
 use arc_malachitebft_app_channel::app::engine::util::events::Event;
 use arc_malachitebft_app_channel::app::engine::wal::{
@@ -16,8 +16,10 @@ use arc_malachitebft_app_channel::app::engine::wal::{
 };
 use arc_malachitebft_app_channel::app::metrics;
 use arc_malachitebft_app_channel::app::types::core::{
-    Context, NilOrVal, Round, SignedMessage, Timeout, ValidatorProof, Validity,
+    Context, NilOrVal, Round, RoundCertificate, RoundCertificateType, SignedMessage,
+    SignedProposal, SignedVote, Timeout, ValidatorProof, Validity, ValueOrigin, VoteType,
 };
+use arc_malachitebft_app_channel::app::types::PeerId;
 use arc_malachitebft_app_channel::app::wal::Log;
 use arc_malachitebft_app_channel::{
     AppMsg, ConsensusContext, EngineBuilder, NetworkMsg, RequestContext, WalContext,
@@ -31,7 +33,7 @@ use malachitebft_test::{
     TestContext, ValidatorSet, Value, ValueId, Vote,
 };
 use ractor::{Actor, ActorProcessingErr, ActorRef};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fault {
@@ -39,10 +41,28 @@ enum Fault {
     AppendCall,
     Fetch,
     Flush(usize),
+    FlushBeforeFinalize,
+    FlushBeforeRestream,
+    Observe,
     Replay,
     Reset,
     BufferedReset,
     Registration,
+}
+
+struct RecordedAppend {
+    entry: WalEntry<TestContext>,
+    prior_flushes: usize,
+}
+
+impl RecordedAppend {
+    fn is_reproposal(&self) -> bool {
+        matches!(
+            &self.entry,
+            WalEntry::ConsensusMsg(SignedConsensusMsg::Proposal(proposal))
+                if proposal.message.pol_round.is_defined()
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -51,6 +71,7 @@ struct FaultProbe {
     append_calls: Arc<AtomicUsize>,
     flush_calls: Arc<AtomicUsize>,
     reached: Arc<Notify>,
+    appends: Arc<Mutex<Vec<RecordedAppend>>>,
 }
 
 impl FaultProbe {
@@ -60,6 +81,7 @@ impl FaultProbe {
             append_calls: Arc::new(AtomicUsize::new(0)),
             flush_calls: Arc::new(AtomicUsize::new(0)),
             reached: Arc::new(Notify::new()),
+            appends: Arc::default(),
         }
     }
 }
@@ -118,7 +140,7 @@ impl Actor for FaultingWal {
                     let _ = reply.send(Ok(()));
                 }
             }
-            WalMsg::Append(_, _, reply) => {
+            WalMsg::Append(_, entry, reply) => {
                 probe.append_calls.fetch_add(1, Ordering::SeqCst);
                 match probe.fault {
                     Fault::Append => {
@@ -129,8 +151,16 @@ impl Actor for FaultingWal {
                         probe.reached.notify_one();
                         myself.stop(Some("injected WAL actor loss".to_owned()));
                     }
+                    Fault::Observe | Fault::FlushBeforeRestream => {
+                        probe.appends.lock().unwrap().push(RecordedAppend {
+                            entry,
+                            prior_flushes: probe.flush_calls.load(Ordering::SeqCst),
+                        });
+                        let _ = reply.send(Ok(()));
+                    }
                     Fault::Fetch
                     | Fault::Flush(_)
+                    | Fault::FlushBeforeFinalize
                     | Fault::Replay
                     | Fault::Reset
                     | Fault::BufferedReset
@@ -143,6 +173,18 @@ impl Actor for FaultingWal {
                 let call = probe.flush_calls.fetch_add(1, Ordering::SeqCst) + 1;
                 let fail_at = match probe.fault {
                     Fault::Flush(fail_at) => Some(fail_at),
+                    // In the single-validator proposal path the first two flushes precede
+                    // publication and Decide. The next one gates immediate Finalize.
+                    Fault::FlushBeforeFinalize => Some(3),
+                    // SignProposal flushes the new entry. Fail the next flush, which
+                    // should be the barrier before delivering Restream to the host.
+                    Fault::FlushBeforeRestream => probe
+                        .appends
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|append| append.is_reproposal())
+                        .map(|append| append.prior_flushes + 2),
                     _ => None,
                 };
                 if fail_at == Some(call) {
@@ -229,8 +271,20 @@ impl NodeConfig for Config {
     }
 }
 
-async fn drive_application(mut rx: mpsc::Receiver<AppMsg<TestContext>>, validators: ValidatorSet) {
+fn reject_decisions(msg: &AppMsg<TestContext>) {
+    assert!(
+        !matches!(msg, AppMsg::Decided { .. } | AppMsg::Finalized { .. }),
+        "consensus decided after injected WAL failure"
+    );
+}
+
+async fn drive_application(
+    mut rx: mpsc::Receiver<AppMsg<TestContext>>,
+    validators: ValidatorSet,
+    mut inspect: impl FnMut(&AppMsg<TestContext>),
+) {
     while let Some(msg) = rx.recv().await {
+        inspect(&msg);
         match msg {
             AppMsg::ConsensusReady { reply } => {
                 let params = HeightParams::new(validators.clone(), LinearTimeouts::default(), None);
@@ -253,8 +307,11 @@ async fn drive_application(mut rx: mpsc::Receiver<AppMsg<TestContext>>, validato
             AppMsg::VerifyVoteExtension { reply, .. } => {
                 let _ = reply.send(Ok(()));
             }
-            AppMsg::Decided { .. } | AppMsg::Finalized { .. } => {
-                panic!("consensus decided after injected WAL failure");
+            AppMsg::Decided { reply, .. } => {
+                let _ = reply.send(());
+            }
+            AppMsg::GetHistoryMinHeight { reply } => {
+                let _ = reply.send(Height::new(1));
             }
             _ => {}
         }
@@ -313,7 +370,16 @@ async fn run_fault_scenario_with_quorum(
         .await
         .expect("build engine");
     let mut events = channels.events.subscribe();
-    let mut app = tokio::spawn(drive_application(channels.consensus, validators));
+    let expect_decision = fault == Fault::FlushBeforeFinalize;
+    let mut app = tokio::spawn(drive_application(
+        channels.consensus,
+        validators,
+        move |msg| {
+            if !expect_decision || !matches!(msg, AppMsg::Decided { .. }) {
+                reject_decisions(msg);
+            }
+        },
+    ));
 
     tokio::time::timeout(Duration::from_secs(2), probe.reached.notified())
         .await
@@ -332,11 +398,19 @@ async fn run_fault_scenario_with_quorum(
         "application connector stopped and exposed the safety hang as a process failure"
     );
 
+    let mut decisions = 0;
     while let Ok(event) = events.try_recv() {
+        if expect_decision && matches!(event, Event::Decided { .. }) {
+            decisions += 1;
+            continue;
+        }
         assert!(
             !matches!(
                 event,
-                Event::Published(_) | Event::Decided { .. } | Event::WalReplayEntry(_)
+                Event::Published(_)
+                    | Event::Decided { .. }
+                    | Event::Finalized { .. }
+                    | Event::WalReplayEntry(_)
             ),
             "consensus effect escaped after WAL fault: {event}"
         );
@@ -345,6 +419,7 @@ async fn run_fault_scenario_with_quorum(
             "runtime WAL fault must not request process exit"
         );
     }
+    assert_eq!(decisions, usize::from(expect_decision));
 
     let mut exported = String::new();
     metrics::export(&mut exported);
@@ -366,11 +441,15 @@ async fn run_fault_scenario_with_quorum(
         Fault::Flush(fail_at) => {
             assert_eq!(probe.flush_calls.load(Ordering::SeqCst), fail_at)
         }
+        Fault::FlushBeforeFinalize => assert_eq!(probe.flush_calls.load(Ordering::SeqCst), 3),
         Fault::Replay => {}
         Fault::Fetch | Fault::Reset | Fault::BufferedReset => {
             unreachable!("startup failure uses its own scenario")
         }
         Fault::Registration => unreachable!("registration failure uses its own scenario"),
+        Fault::Observe | Fault::FlushBeforeRestream => {
+            unreachable!("reproposal uses its own scenario")
+        }
     }
     if let Some(expected_appends) = expected_appends {
         assert_eq!(probe.append_calls.load(Ordering::SeqCst), expected_appends);
@@ -413,8 +492,304 @@ async fn second_flush_failure_stops_before_decide() {
 }
 
 #[tokio::test]
+async fn flush_failure_after_decide_stops_before_finalize() {
+    run_fault_scenario_with_quorum(Fault::FlushBeforeFinalize, true, Some(4)).await;
+}
+
+#[tokio::test]
 async fn corrupt_replay_enters_supervisor_safety_hang() {
     run_fault_scenario(Fault::Replay).await;
+}
+
+struct ReproposalRun {
+    appends: Vec<RecordedAppend>,
+    certificate_votes: Vec<SignedVote<TestContext>>,
+    expected_reproposal: SignedProposal<TestContext>,
+}
+
+async fn run_reproposal(fault: Fault, rebuilt_vote_type: VoteType) -> eyre::Result<ReproposalRun> {
+    let height = Height::new(1);
+    let locked_round = Round::new(0);
+    let reproposal_round = Round::new(1);
+    let value = Value::new(17);
+    let value_id = value.id();
+    let ctx = TestContext::default();
+    let keys = make_validators([1; 4]);
+    let validators = ValidatorSet::new(keys.iter().map(|(validator, _)| validator.clone()));
+    let proposer = ctx
+        .select_proposer(&validators, height, locked_round)
+        .address;
+    let local = ctx
+        .select_proposer(&validators, height, reproposal_round)
+        .address;
+    let (_, private_key) = keys
+        .iter()
+        .find(|(validator, _)| validator.address == local)
+        .unwrap();
+    let expected_reproposal = Ed25519Signer::new(private_key.clone())
+        .sign_proposal(Proposal::new(
+            height,
+            reproposal_round,
+            value.clone(),
+            locked_round,
+            local,
+        ))
+        .await?;
+
+    let probe = FaultProbe::new(fault);
+    let (wal, _) = Actor::spawn(None, FaultingWal, probe.clone()).await?;
+    let (network, _) = Actor::spawn(None, NetworkSink, ()).await?;
+    let (tx_network, _rx_network) = mpsc::channel::<NetworkMsg<TestContext>>(1);
+    let config = Config {
+        moniker: format!("wal-reproposal-{fault:?}").to_lowercase(),
+        consensus: ConsensusConfig {
+            // Ordinary proposals in PartsOnly mode have no signed proposal WAL entry.
+            value_payload: ValuePayload::PartsOnly,
+            ..ConsensusConfig::default()
+        },
+        value_sync: ValueSyncConfig::default(),
+    };
+    let (channels, engine) = EngineBuilder::new(ctx, config)
+        .with_custom_wal(wal.clone())
+        .with_custom_network(network, tx_network)
+        .with_no_sync()
+        .with_default_consensus(ConsensusContext::new_validator(
+            local,
+            Box::new(Ed25519Verifier),
+            Box::new(Ed25519Signer::new(private_key.clone())),
+        ))
+        .with_default_request(RequestContext::new(1))
+        .build()
+        .await?;
+    let children = engine.actor.get_cell().get_children();
+    let consensus: ActorRef<ConsensusActorMsg<TestContext>> = children
+        .iter()
+        .find(|child| child.is_message_type_of::<ConsensusActorMsg<TestContext>>() == Some(true))
+        .expect("engine supervises consensus")
+        .clone()
+        .into();
+    let mut events = channels.events.subscribe();
+    let (restream_tx, mut restream_rx) = oneshot::channel();
+    let mut restream_tx = Some(restream_tx);
+    let app = tokio::spawn(drive_application(
+        channels.consensus,
+        validators,
+        move |msg| {
+            reject_decisions(msg);
+            if let AppMsg::RestreamProposal {
+                height: h,
+                round,
+                valid_round,
+                address,
+                value_id: id,
+            } = msg
+            {
+                assert_eq!(
+                    (*h, *round, *valid_round, *address, *id),
+                    (height, reproposal_round, locked_round, local, value_id)
+                );
+                restream_tx
+                    .take()
+                    .expect("one restream")
+                    .send(())
+                    .expect("restream observer");
+            }
+        },
+    ));
+
+    let wait = Duration::from_secs(3);
+    tokio::time::timeout(wait, async {
+        loop {
+            if matches!(events.recv().await.unwrap(), Event::StartedRound(h, r, _, _) if h == height && r == locked_round)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("start the round with the original proposal");
+    consensus
+        .cast(ConsensusActorMsg::ReceivedProposedValue(
+            ProposedValue {
+                height,
+                round: locked_round,
+                valid_round: Round::Nil,
+                proposer,
+                value,
+                validity: Validity::Valid,
+            },
+            ValueOrigin::Consensus,
+        ))
+        .expect("deliver the original proposal");
+
+    let mut certificate_votes = Vec::new();
+    let peer = PeerId::random();
+    for ((validator, key), vote_type) in keys
+        .iter()
+        .filter(|(validator, _)| validator.address != local)
+        .zip([VoteType::Prevote, rebuilt_vote_type])
+    {
+        let signer = Ed25519Signer::new(key.clone());
+        let vote = signer
+            .sign_vote(Vote::new_prevote(
+                height,
+                locked_round,
+                NilOrVal::Val(value_id),
+                validator.address,
+            ))
+            .await?;
+        consensus
+            .cast(ConsensusActorMsg::NetworkEvent(NetworkEvent::Vote(
+                peer, vote,
+            )))
+            .expect("deliver a peer prevote for the original value");
+        let make_vote = match vote_type {
+            VoteType::Prevote => Vote::new_prevote,
+            VoteType::Precommit => Vote::new_precommit,
+        };
+        certificate_votes.push(
+            signer
+                .sign_vote(make_vote(
+                    height,
+                    reproposal_round,
+                    NilOrVal::Nil,
+                    validator.address,
+                ))
+                .await?,
+        );
+    }
+    tokio::time::timeout(wait, async {
+        loop {
+            if let Event::Published(SignedConsensusMsg::Vote(vote)) = events.recv().await.unwrap() {
+                if vote.message.typ == VoteType::Precommit
+                    && vote.message.value == NilOrVal::Val(value_id)
+                {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the validator locks the original value");
+
+    // The first future-round vote arrives as ordinary gossip. The second arrives only in
+    // the verified certificate and triggers the round change that re-proposes the value.
+    consensus
+        .cast(ConsensusActorMsg::NetworkEvent(NetworkEvent::Vote(
+            peer,
+            certificate_votes[0].clone(),
+        )))
+        .expect("deliver the already known certificate vote");
+    let certificate = RoundCertificate::new_from_votes(
+        height,
+        reproposal_round,
+        RoundCertificateType::Skip,
+        certificate_votes.clone(),
+    );
+    consensus
+        .cast(ConsensusActorMsg::NetworkEvent(
+            NetworkEvent::RoundCertificate(peer, certificate),
+        ))
+        .expect("deliver the signed round certificate");
+
+    if fault == Fault::FlushBeforeRestream {
+        tokio::time::timeout(wait, async {
+            tokio::select! {
+                _ = probe.reached.notified() => {}
+                result = &mut restream_rx => {
+                    panic!("restream escaped before the WAL flush failure: {result:?}");
+                }
+            }
+        })
+        .await
+        .expect("reach the flush immediately before Restream");
+        wal.wait(Some(wait))
+            .await
+            .expect("safety hang stops the WAL actor");
+        let host: ActorRef<HostMsg<TestContext>> = children
+            .into_iter()
+            .find(|child| child.is_message_type_of::<HostMsg<TestContext>>() == Some(true))
+            .expect("engine supervises the application connector")
+            .into();
+        // The connector survives the safety hang. Its reply is a mailbox barrier for
+        // any Restream message that consensus could have queued before the WAL error.
+        tokio::time::timeout(wait, async {
+            ractor::call!(host, |reply_to| HostMsg::GetHistoryMinHeight { reply_to })
+        })
+        .await
+        .expect("application connector answers after the safety hang")
+        .expect("query application connector");
+        assert!(
+            matches!(
+                restream_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "restream escaped after the WAL flush failure"
+        );
+    } else {
+        tokio::time::timeout(wait, restream_rx)
+            .await
+            .expect("re-proposal reaches Restream")
+            .expect("receive Restream");
+    }
+
+    tokio::time::timeout(wait, engine.shutdown(None)).await??;
+    engine.handle.await?;
+    app.await?;
+    let appends = std::mem::take(&mut *probe.appends.lock().unwrap());
+    Ok(ReproposalRun {
+        appends,
+        certificate_votes,
+        expected_reproposal,
+    })
+}
+
+#[tokio::test]
+async fn parts_only_reproposal_persists_the_signed_proposal() -> eyre::Result<()> {
+    let run = run_reproposal(Fault::Observe, VoteType::Prevote).await?;
+    let proposals: Vec<_> = run
+        .appends
+        .iter()
+        .filter_map(|append| match &append.entry {
+            WalEntry::ConsensusMsg(SignedConsensusMsg::Proposal(proposal)) => Some(proposal),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        proposals,
+        [&run.expected_reproposal],
+        "PartsOnly re-proposal must persist its signed proposal"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_reproposal_flush_stops_before_restream() -> eyre::Result<()> {
+    run_reproposal(Fault::FlushBeforeRestream, VoteType::Prevote).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn round_certificate_persists_rebuilt_votes_before_the_reproposal() -> eyre::Result<()> {
+    for vote_type in [VoteType::Prevote, VoteType::Precommit] {
+        let run = run_reproposal(Fault::Observe, vote_type).await?;
+        let before_reproposal: Vec<_> = run
+            .appends
+            .iter()
+            .take_while(|append| !append.is_reproposal())
+            .filter_map(|append| match &append.entry {
+                WalEntry::ConsensusMsg(SignedConsensusMsg::Vote(vote))
+                    if vote.message.round == Round::new(1) =>
+                {
+                    Some(vote)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(before_reproposal, run.certificate_votes.iter().collect::<Vec<_>>(),
+            "persist the reconstructed {vote_type:?} before the round transition and retain the known vote only once");
+    }
+    Ok(())
 }
 
 struct CountingSigner {
@@ -736,7 +1111,7 @@ async fn run_startup_liveness_scenario(fault: Fault) {
             .send((Height::new(1), params))
             .expect("start consensus after enqueueing restart");
     }
-    let app = tokio::spawn(drive_application(requests, validators));
+    let app = tokio::spawn(drive_application(requests, validators, reject_decisions));
 
     tokio::time::timeout(Duration::from_secs(2), probe.reached.notified())
         .await
