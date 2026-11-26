@@ -581,6 +581,21 @@ committed prefix, atomically replaces the checkpoint, and syncs the directory. T
 the raw committed bytes. Keep the WAL and both metadata files together. A managed WAL is roll-forward only, since
 an older binary does not keep the checkpoint current. Keep the same restorable generation across all files.
 
+#### If an older binary opens a managed WAL
+
+Stop the node and prevent automatic restart. Preserve the node home, application store, WAL, `.managed`,
+`.checkpoint`, diagnostic archives, and logs. An older writer can advance the WAL sequence or replace its
+contents without updating the checkpoint. A later upgrade can then fail with
+`WAL does not match the committed checkpoint` or `Committed WAL prefix digest mismatch`.
+
+Keep both metadata files in place. Removing them would make the engine adopt the remaining bytes as a legacy WAL.
+Strict decoding can validate those bytes but cannot establish that all prior signing history survived. Escalate for
+assessment of the node's recorded votes and certificates against the application's durable height and the
+network's finalized state. Resume signing with a compatible binary only after that assessment establishes a safe
+recovery path. A successful open by itself is insufficient.
+
+#### Short final frames and diagnostic retention
+
 On reopen, validate the complete committed prefix, then inspect the uncommitted suffix. Keep and seal complete
 valid frames before replay. When an incomplete final frame starts after the committed boundary, write and sync a
 `.torn-*` diagnostic copy and its directory before trimming and syncing the WAL. Restart can repeat this repair.
@@ -588,12 +603,23 @@ An oversized length, complete bad CRC, decompression or decode failure, committe
 managed checkpoint blocks startup. A complete legacy WAL activates without rewriting its records. An incomplete
 legacy WAL remains untouched because it has no committed boundary.
 
-A pending forward reset requires fresh confirmation of the target from the application's durable height before
-the WAL completes it. Interrupted same-height resets and mismatched heights require investigation. Before replay,
-validate the entire input batch and index recorded local votes and proposals. Reuse their signatures, safety-hang
-on divergent signing choices, and seal newly signed replay outputs before publication or application restream.
+The `.torn-*` files are diagnostic copies and replay reads only the active WAL. Retain the copies during an
+investigation. Once the incident is closed and its retention requirements are met, remove only the diagnostic
+copies in accordance with the incident retention policy. Keep the active WAL, `.managed`, and `.checkpoint` together.
+
+#### Interrupted height resets
+
+A pending forward reset requires the application to confirm the target from durable state before the WAL completes
+it. An interrupted same-height reset or a mismatch between the confirmed height and the target blocks progress.
+This includes an application that is behind the target. Keep the node stopped and preserve the WAL and pending
+reset intent for investigation.
+
+Before replay, validate the entire input batch and index recorded local votes and proposals. Reuse their signatures,
+safety-hang on divergent signing choices, and seal newly signed replay outputs before publication or application
+restream.
 Keep the signing index through the height. A node whose application is behind an intact, settled WAL can catch
 up with signing disabled below the WAL height. Normal full-node startup at the WAL height preserves its records.
+An authorized forward height change still resets the WAL to the new height.
 
 If startup still fails, stop the node and preserve the WAL, its companion files, application state and storage
 diagnostics. Escalate for analysis that accounts for all recorded votes and certificates. Never remove bytes by

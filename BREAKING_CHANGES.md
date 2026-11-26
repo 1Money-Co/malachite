@@ -4,6 +4,14 @@
 
 - The network and engine network event enums now include `PeerSyncSubscribed`. Update exhaustive matches.
 
+### WAL behavior
+
+- An `Append` at an unconfirmed height returns an error. A consensus append failure enters the runtime safety hang.
+- Full-node startup at the current WAL height preserves the WAL. An authorized forward height change still resets it.
+- `RestartHeight` below the current WAL height fails and stops the node.
+- Managed recovery creates `.managed` and `.checkpoint` alongside the WAL and saves recovered short tails as
+  `.torn-*` diagnostic files. Keep the active WAL and its metadata together and roll forward after activation.
+
 ## 0.7.0
 
 *June 22nd, 2026*

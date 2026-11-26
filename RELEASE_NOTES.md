@@ -4,7 +4,12 @@
 
 - The file-backed engine WAL seals each advancing flush with a durable checkpoint. On restart it preserves and
   repairs a short frame only beyond the validated committed prefix. Existing valid WAL records retain their
-  encoding. Keep the WAL and its checkpoint/activation files together and roll forward after activation.
+  encoding. Keep the WAL, `.managed`, and `.checkpoint` together and roll forward after activation. Recovered tails
+  are saved in `.torn-*` diagnostic files. See the accidental rollback, interrupted reset, and archive retention
+  guidance in [ADR-007](docs/architecture/adr-007-write-ahead-log.md#recovering-an-interrupted-append).
+- An append at an unconfirmed WAL height now fails and triggers a safety hang when issued by consensus.
+  Full-node startup at the WAL's current height preserves its records. An authorized forward height change still
+  resets the WAL. A `RestartHeight` below the current WAL height stops the node.
 - Replay checks the full input batch before processing, reuses recorded local signatures, and seals new signing
   choices before publication. Startup or buffered height-reset failures remain visible to the supervisor.
 - Broadcast sync status when a peer subscribes to the sync topic. This backports the Circle v0.8 behavior in
