@@ -1,5 +1,5 @@
 [package]
-name = "informalsystems-malachitebft-app"
+name = "arc-malachitebft-app"
 description = "High-level interface for building applications on top of the Malachite BFT consensus engine"
 version.workspace = true
 edition.workspace = true
@@ -37,6 +37,7 @@ rand = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+libp2p = { workspace = true }
 
 [lints]
 workspace = true

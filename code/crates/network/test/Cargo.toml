@@ -1,5 +1,5 @@
 [package]
-name = "informalsystems-malachitebft-discovery-test"
+name = "arc-malachitebft-discovery-test"
 publish = false
 
 version.workspace = true
@@ -11,7 +11,7 @@ rust-version.workspace = true
 [dependencies]
 malachitebft-network.workspace = true
 malachitebft-config.workspace = true
-malachitebft-starknet-host.workspace = true
+malachitebft-signing-ed25519 = { workspace = true, features = ["rand"] }
 malachitebft-metrics.workspace = true
 
 futures.workspace = true
@@ -23,6 +23,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 malachitebft-discovery-test = { workspace = true }
+netstat2 = "0.11"
 
 [lints]
 workspace = true

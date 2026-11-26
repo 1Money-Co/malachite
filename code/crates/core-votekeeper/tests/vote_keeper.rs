@@ -1,6 +1,6 @@
 use malachitebft_core_types::{NilOrVal, Round, SignedVote};
 
-use informalsystems_malachitebft_core_votekeeper::keeper::{Output, VoteKeeper};
+use arc_malachitebft_core_votekeeper::keeper::{Output, VoteKeeper};
 
 use malachitebft_test::{
     Address, Height, PrivateKey, Signature, TestContext, Validator, ValidatorSet, ValueId, Vote,
@@ -121,6 +121,16 @@ fn precommit_apply_single_value() {
     let msg = keeper.apply_vote(vote.clone(), round);
     assert_eq!(msg, None);
 
+    // Duplicated
+    let vote = new_signed_precommit(height, Round::new(0), val, addr1);
+    let msg = keeper.apply_vote(vote.clone(), round);
+    assert_eq!(msg, None);
+
+    let vote = new_signed_precommit(height, Round::new(0), val, addr2);
+    let msg = keeper.apply_vote(vote.clone(), round);
+    assert_eq!(msg, None);
+
+    // Duplicated
     let vote = new_signed_precommit(height, Round::new(0), val, addr2);
     let msg = keeper.apply_vote(vote.clone(), round);
     assert_eq!(msg, None);
@@ -132,6 +142,17 @@ fn precommit_apply_single_value() {
     let vote = new_signed_precommit(height, Round::new(0), val, addr4);
     let msg = keeper.apply_vote(vote, round);
     assert_eq!(msg, Some(Output::PrecommitValue(id)));
+
+    let per_round = keeper.per_round(round);
+
+    match per_round {
+        Some(per_round) => {
+            // Build a commit certificate for (round, val)
+            let cert = per_round.precommits_for_value(&id);
+            assert_eq!(cert.len(), 3);
+        }
+        None => panic!("Per round not found"),
+    }
 }
 
 #[test]
@@ -247,6 +268,25 @@ fn no_skip_round_full_quorum_with_same_val() {
     let vote = new_signed_precommit(height, fut_round, val, addr2);
     let msg = keeper.apply_vote(vote, cur_round);
     assert_eq!(msg, None);
+}
+
+#[test]
+fn skip_round_and_precommit_value_future_round() {
+    let ([addr1, addr2, ..], mut keeper) = setup([2, 3, 2]);
+
+    let id = ValueId::new(1);
+    let val = NilOrVal::Val(id);
+    let height = Height::new(1);
+    let cur_round = Round::new(0);
+    let fut_round = Round::new(1);
+
+    let vote = new_signed_precommit(height, fut_round, val, addr1);
+    let msg = keeper.apply_vote(vote, cur_round);
+    assert_eq!(msg, None);
+
+    let vote = new_signed_precommit(height, fut_round, val, addr2);
+    let msg = keeper.apply_vote(vote, cur_round);
+    assert_eq!(msg, Some(Output::PrecommitValue(id)));
 }
 
 #[test]

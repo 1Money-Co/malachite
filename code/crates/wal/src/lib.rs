@@ -9,9 +9,14 @@ mod version;
 pub mod log;
 
 pub use file::{Log, LogEntry, LogIter};
+pub use log::RecoveryLog;
 pub use storage::Storage;
 pub use version::Version;
 
 // For use in tests
 #[doc(hidden)]
 pub mod ext;
+
+// For use in tests
+#[doc(hidden)]
+pub use log::constants;

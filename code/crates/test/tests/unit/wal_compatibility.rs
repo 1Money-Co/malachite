@@ -1,14 +1,14 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use arc_malachitebft_test::codec::proto::ProtobufCodec;
+use arc_malachitebft_test::utils::validators::make_validators;
+use arc_malachitebft_test::{Address, Height, Signature, TestContext, ValidatorSet, ValueId, Vote};
 use bytes::Bytes;
 use eyre::{bail, eyre, Result};
-use informalsystems_malachitebft_test::codec::proto::ProtobufCodec;
-use informalsystems_malachitebft_test::utils::validators::make_validators;
-use informalsystems_malachitebft_test::{
-    Address, Height, Signature, TestContext, ValidatorSet, ValueId, Vote,
-};
+use malachitebft_app::engine::node::{ChildRegistration, Node, NodeMsg};
 use malachitebft_app::engine::wal::{log_entries, Msg, Wal, WalEntry};
 use malachitebft_app::metrics::{Metrics, SharedRegistry};
 use malachitebft_app::wal::Log;
@@ -46,6 +46,26 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+fn corrupt_second_entry_crc(bytes: &mut [u8]) {
+    const WAL_HEADER_SIZE: usize = 12;
+    const ENTRY_FLAG_SIZE: usize = 1;
+    const ENTRY_LENGTH_SIZE: usize = 8;
+    const ENTRY_CRC_SIZE: usize = 4;
+
+    let first_length_start = WAL_HEADER_SIZE + ENTRY_FLAG_SIZE;
+    let first_length_end = first_length_start + ENTRY_LENGTH_SIZE;
+    let first_length = u64::from_be_bytes(
+        bytes[first_length_start..first_length_end]
+            .try_into()
+            .expect("first entry length field"),
+    ) as usize;
+    let second_entry_start =
+        WAL_HEADER_SIZE + ENTRY_FLAG_SIZE + ENTRY_LENGTH_SIZE + ENTRY_CRC_SIZE + first_length;
+    let second_crc_start = second_entry_start + ENTRY_FLAG_SIZE + ENTRY_LENGTH_SIZE;
+
+    bytes[second_crc_start] ^= 1;
+}
+
 fn materialize_fixture(directory: &Path, bytes: &[u8], name: &str) -> Result<PathBuf> {
     let path = directory.join(name);
     fs::write(&path, bytes)?;
@@ -60,7 +80,9 @@ fn read_fixture(path: &Path) -> Result<Vec<WalEntry<TestContext>>> {
         bail!("opening the WAL discarded an invalid suffix");
     }
 
-    log_entries(&mut log, &ProtobufCodec)?.collect()
+    log_entries(&mut log, &ProtobufCodec)?
+        .map(|entry| entry.map_err(Into::into))
+        .collect()
 }
 
 async fn rewrite_fixture(path: PathBuf, entries: Vec<WalEntry<TestContext>>) -> Result<()> {
@@ -160,8 +182,7 @@ fn process_replay_input(
                 | Effect::VerifyRoundCertificate(_, _, _, resume) => {
                     Ok(resume.resume_with(Ok(())))
                 }
-                Effect::ResetTimeouts(resume)
-                | Effect::CancelAllTimeouts(resume)
+                Effect::CancelAllTimeouts(resume)
                 | Effect::PublishConsensusMsg(_, resume)
                 | Effect::PublishLivenessMsg(_, resume)
                 | Effect::RepublishVote(_, resume)
@@ -200,20 +221,25 @@ fn production_wal_fixture_restores_historical_vote() -> Result<()> {
     validator.address = historical_vote.validator_address;
     let validator_set = ValidatorSet::new([validator]);
     let params = Params {
-        initial_height: Height::new(historical_vote.height.as_u64() - 1),
-        initial_validator_set: validator_set.clone(),
         address: historical_vote.validator_address,
         threshold_params: Default::default(),
         value_payload: ValuePayload::ProposalAndParts,
         enabled: true,
     };
-    let mut state = State::new(TestContext::new(), params, 32);
+    let mut state = State::new(
+        TestContext::new(),
+        historical_vote.height,
+        validator_set.clone(),
+        params,
+        32,
+        32,
+    );
     let metrics = Metrics::default();
     let mut signed_votes = Vec::new();
 
     process_replay_input(
         &mut state,
-        Input::StartHeight(historical_vote.height, validator_set, false),
+        Input::StartHeight(historical_vote.height, validator_set, false, None),
         &metrics,
         &mut signed_votes,
     );
@@ -223,6 +249,7 @@ fn production_wal_fixture_restores_historical_vote() -> Result<()> {
             WalEntry::ConsensusMsg(SignedConsensusMsg::Proposal(proposal)) => {
                 Input::Proposal(proposal)
             }
+            WalEntry::PolkaCertificate(certificate) => Input::PolkaCertificate(certificate),
             WalEntry::Timeout(timeout) => Input::TimeoutElapsed(timeout),
             WalEntry::ProposedValue(value) => Input::ProposedValue(value, ValueOrigin::Consensus),
         };
@@ -271,8 +298,20 @@ async fn assert_fixture(bytes: &[u8], manifest_json: &str, expected_source: &str
 
     let rewritten_path = directory.path().join("rewritten.log");
     rewrite_fixture(rewritten_path.clone(), entries).await?;
-    let rewritten = fs::read(rewritten_path)?;
-    assert_eq!(sha256(&rewritten), manifest.sha256);
+    let rewritten = fs::read(&rewritten_path)?;
+    if cfg!(feature = "wal-force-compression") {
+        assert_ne!(sha256(&rewritten), manifest.sha256);
+        assert_eq!(
+            rewritten.get(12),
+            Some(&1),
+            "first WAL entry must be compressed"
+        );
+
+        let rewritten_entries = read_fixture(&rewritten_path)?;
+        assert_entries(&rewritten_entries);
+    } else {
+        assert_eq!(sha256(&rewritten), manifest.sha256);
+    }
 
     Ok(())
 }
@@ -303,7 +342,7 @@ async fn repeated_started_height_returns_no_replay_entries() -> Result<()> {
         .call(|reply| Msg::StartedHeight(Height::new(7), reply), None)
         .await?
         .success_or(eyre!("first WAL StartedHeight call failed"))??;
-    assert!(first.is_none());
+    assert!(first.is_empty());
 
     let fixture_path = materialize_fixture(directory.path(), PRODUCTION_WAL, "fixture.log")?;
     let entry = read_fixture(&fixture_path)?
@@ -324,14 +363,77 @@ async fn repeated_started_height_returns_no_replay_entries() -> Result<()> {
         )
         .await?
         .success_or(eyre!("repeated WAL StartedHeight call failed"))??;
-    assert!(repeated.is_none());
+    assert!(repeated.is_empty());
 
     wal.stop_and_wait(None, None).await?;
     Ok(())
 }
 
+#[tokio::test]
+async fn stopping_wal_releases_file_lock_before_returning() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("wal.log");
+
+    for _ in 0..64 {
+        let wal = Wal::spawn(
+            &TestContext::new(),
+            ProtobufCodec,
+            path.clone(),
+            SharedRegistry::global().clone(),
+            tracing::Span::none(),
+        )
+        .await?;
+
+        wal.stop_and_wait(None, None).await?;
+
+        let log = Log::open(&path)?;
+        drop(log);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stopping_node_releases_child_wal_lock_before_returning() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("node-child.wal");
+
+    for _ in 0..64 {
+        let wal = Wal::spawn(
+            &TestContext::new(),
+            ProtobufCodec,
+            path.clone(),
+            SharedRegistry::global().clone(),
+            tracing::Span::none(),
+        )
+        .await?;
+        let metrics = Metrics::register(SharedRegistry::global());
+        let (node, node_handle) = Node::new(metrics, tracing::Span::none()).spawn().await?;
+        node.call(
+            |reply| {
+                NodeMsg::CommitChildren(
+                    vec![ChildRegistration::safety_critical("WAL", wal.get_cell())],
+                    reply,
+                )
+            },
+            None,
+        )
+        .await?
+        .success_or(eyre!("node child commit call failed"))?
+        .map_err(|error| eyre!(error))?;
+
+        node.stop_and_wait(None, None).await?;
+        node_handle.await?;
+
+        let log = Log::open(&path)?;
+        drop(log);
+    }
+
+    Ok(())
+}
+
 #[test]
-fn truncated_production_wal_fails_without_returning_a_prefix() -> Result<()> {
+fn truncated_fixture_helper_rejects_open_time_mutation() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let mut truncated = PRODUCTION_WAL.to_vec();
     truncated.pop().expect("production fixture is not empty");
@@ -341,12 +443,86 @@ fn truncated_production_wal_fails_without_returning_a_prefix() -> Result<()> {
 }
 
 #[test]
-fn corrupt_production_wal_fails_without_returning_a_prefix() -> Result<()> {
+fn corrupt_fixture_helper_reports_crc_without_mutation() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let mut corrupt = PRODUCTION_WAL.to_vec();
     let last = corrupt.len() - 1;
     corrupt[last] ^= 1;
     let path = materialize_fixture(directory.path(), &corrupt, "corrupt.log")?;
+    let hash_before = sha256(&std::fs::read(&path)?);
     assert!(read_fixture(&path).is_err());
+    assert_eq!(sha256(&std::fs::read(&path)?), hash_before);
+    Ok(())
+}
+
+async fn open_corrupt_wal_once(path: PathBuf) {
+    let error = Wal::spawn(
+        &TestContext::new(),
+        ProtobufCodec,
+        path,
+        SharedRegistry::global().clone(),
+        tracing::Span::none(),
+    )
+    .await
+    .expect_err("a corrupt committed frame must prevent WAL startup");
+    assert!(error.to_string().contains("CRC mismatch"), "{error}");
+}
+
+#[tokio::test]
+async fn corrupt_actor_startup_preserves_wal_across_restart() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let mut corrupt = PRODUCTION_WAL.to_vec();
+    corrupt_second_entry_crc(&mut corrupt);
+    let path = materialize_fixture(directory.path(), &corrupt, "corrupt-middle.log")?;
+    let expected_bytes = fs::read(&path)?;
+
+    open_corrupt_wal_once(path.clone()).await;
+    assert_eq!(
+        fs::read(&path)?,
+        expected_bytes,
+        "first replay mutated the WAL"
+    );
+
+    open_corrupt_wal_once(path.clone()).await;
+    assert_eq!(fs::read(&path)?, expected_bytes, "restart mutated the WAL");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn wal_actor_restarts_with_its_committed_prefix_after_torn_append() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = materialize_fixture(directory.path(), PRODUCTION_WAL, "recover.log")?;
+    let context = TestContext::new();
+    let start = || {
+        Wal::spawn(
+            &context,
+            ProtobufCodec,
+            path.clone(),
+            SharedRegistry::global().clone(),
+            tracing::Span::none(),
+        )
+    };
+    let before = fs::read(&path)?;
+    let wal = start().await?;
+    wal.stop_and_wait(None, None).await?;
+
+    let mut writer = fs::OpenOptions::new().append(true).open(&path)?;
+    writer.write_all(&[0, 0, 0])?;
+    writer.sync_all()?;
+    drop(writer);
+
+    let reopened = start().await?;
+    let entries = reopened
+        .call(
+            |reply| Msg::StartedHeight(Height::new(7), reply),
+            Some(Duration::from_secs(1)),
+        )
+        .await?
+        .success_or(eyre!("no WAL replay response after restart"))??;
+    assert_eq!(entries.len(), 3);
+    assert!(entries.iter().all(|entry| entry.is_ok()));
+    reopened.stop_and_wait(None, None).await?;
+    assert_eq!(fs::read(&path)?, before);
     Ok(())
 }

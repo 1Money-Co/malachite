@@ -3,13 +3,16 @@
 //! # Warning
 //! Not for regular use, use [`crate::Log`] instead.
 
-use std::io::{self, SeekFrom, Write};
+use std::io::{self, Read, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use cfg_if::cfg_if;
 
 use crate::ext::{read_u32, read_u64, read_u8, write_u32, write_u64, write_u8};
 use crate::{Storage, Version};
+
+mod recovery;
+pub use recovery::RecoveryLog;
 
 /// The maximum size of a single log entry in bytes. (1 GiB)
 const MAX_ENTRY_SIZE: usize = 1024 * 1024 * 1024;
@@ -60,43 +63,9 @@ where
     /// * `Err` - If an I/O error occurs or the CRC check fails
     pub fn read_to_next<W: Write>(mut self, writer: &mut W) -> io::Result<Option<Self>> {
         let is_compressed = self.read_compression_flag()?;
-        let length = self.read_length()? as usize;
+        let length = self.read_length()?;
         let expected_crc = self.read_crc()?;
-
-        if length > MAX_ENTRY_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Entry size {length} exceeds maximum of {MAX_ENTRY_SIZE}"),
-            ));
-        }
-
-        let mut data = vec![0; length];
-        self.log.storage.read_exact(&mut data)?;
-
-        #[cfg(not(feature = "compression"))]
-        if is_compressed {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Entry is compressed but compression is disabled",
-            ));
-        }
-
-        #[cfg(feature = "compression")]
-        if is_compressed {
-            data = lz4_flex::decompress_size_prepended(&data).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Failed to decompress entry: {e}"),
-                )
-            })?;
-        }
-
-        let actual_crc = compute_crc(&data);
-
-        if expected_crc != actual_crc {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "CRC mismatch"));
-        }
-
+        let data = read_payload(&mut self.log.storage, is_compressed, length, expected_crc)?;
         writer.write_all(&data)?;
 
         let pos = self.log.storage.stream_position()?;
@@ -108,6 +77,54 @@ where
             Ok(None)
         }
     }
+}
+
+fn read_payload(
+    mut reader: impl Read,
+    is_compressed: bool,
+    length: u64,
+    expected_crc: u32,
+) -> io::Result<Vec<u8>> {
+    if length > MAX_ENTRY_SIZE as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Entry size {length} exceeds maximum of {MAX_ENTRY_SIZE}"),
+        ));
+    }
+
+    let mut data = vec![0; length as usize];
+    reader.read_exact(&mut data)?;
+
+    #[cfg(not(feature = "compression"))]
+    if is_compressed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Entry is compressed but compression is disabled",
+        ));
+    }
+
+    #[cfg(feature = "compression")]
+    if is_compressed {
+        // The frame length bounds the compressed bytes, not the size asserted by the LZ4 payload.
+        let uncompressed_size = data
+            .get(..4)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map(u32::from_le_bytes)
+            .filter(|size| *size as usize <= MAX_ENTRY_SIZE)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid LZ4 entry size"))?;
+        data =
+            lz4_flex::block::decompress(&data[4..], uncompressed_size as usize).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Failed to decompress entry: {e}"),
+                )
+            })?;
+    }
+
+    if expected_crc != compute_crc(&data) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "CRC mismatch"));
+    }
+    Ok(data)
 }
 
 /// Write-Ahead Log (WAL)
@@ -132,18 +149,25 @@ pub struct Log<S> {
     len: usize,
 }
 
-const VERSION_SIZE: u64 = size_of::<Version>() as u64;
-const SEQUENCE_SIZE: u64 = size_of::<u64>() as u64;
-const HEADER_SIZE: u64 = VERSION_SIZE + SEQUENCE_SIZE;
+pub mod constants {
+    use super::Version;
 
-const VERSION_OFFSET: u64 = 0;
-const SEQUENCE_OFFSET: u64 = VERSION_OFFSET + VERSION_SIZE;
-const FIRST_ENTRY_OFFSET: u64 = HEADER_SIZE;
+    pub const VERSION_SIZE: u64 = size_of::<Version>() as u64;
+    pub const SEQUENCE_SIZE: u64 = size_of::<u64>() as u64;
+    pub const HEADER_SIZE: u64 = VERSION_SIZE + SEQUENCE_SIZE;
 
-const ENTRY_LENGTH_SIZE: u64 = size_of::<u64>() as u64;
-const ENTRY_CRC_SIZE: u64 = size_of::<u32>() as u64;
-const ENTRY_COMPRESSION_FLAG_SIZE: u64 = size_of::<u8>() as u64;
-const ENTRY_HEADER_SIZE: u64 = ENTRY_COMPRESSION_FLAG_SIZE + ENTRY_LENGTH_SIZE + ENTRY_CRC_SIZE;
+    pub const VERSION_OFFSET: u64 = 0;
+    pub const SEQUENCE_OFFSET: u64 = VERSION_OFFSET + VERSION_SIZE;
+    pub const FIRST_ENTRY_OFFSET: u64 = HEADER_SIZE;
+
+    pub const ENTRY_CRC_SIZE: u64 = size_of::<u32>() as u64;
+    pub const ENTRY_LENGTH_SIZE: u64 = size_of::<u64>() as u64;
+    pub const ENTRY_COMPRESSION_FLAG_SIZE: u64 = size_of::<u8>() as u64;
+    pub const ENTRY_HEADER_SIZE: u64 =
+        ENTRY_COMPRESSION_FLAG_SIZE + ENTRY_LENGTH_SIZE + ENTRY_CRC_SIZE;
+}
+
+use constants::*;
 
 enum WriteEntry<'a> {
     Raw(&'a [u8]),
@@ -254,30 +278,65 @@ where
             let mut pos = FIRST_ENTRY_OFFSET; // Start after header
             let mut len = 0;
 
-            // Scan through entries to validate and count them
+            // Scan through entries to validate and count them. Opening a WAL is deliberately
+            // non-mutating: an incomplete frame can also be the result of corruption in a
+            // previously valid length field, so it is not safe to repair it automatically.
+            while pos < size {
+                let remaining = size - pos;
 
-            // Check if there's enough space for the fixed part of the header.
-            while size.saturating_sub(pos) >= ENTRY_COMPRESSION_FLAG_SIZE + ENTRY_LENGTH_SIZE {
+                if remaining < ENTRY_HEADER_SIZE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "Incomplete WAL entry header at offset {pos}: \
+                             {remaining} bytes remain, {ENTRY_HEADER_SIZE} required"
+                        ),
+                    ));
+                }
+
                 // Skip over compression flag
                 read_u8(&mut storage)?;
 
                 // Read entry length
                 let data_length = read_u64(&mut storage)?;
 
+                if data_length > MAX_ENTRY_SIZE as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "WAL entry at offset {pos} declares {data_length} bytes, \
+                             exceeding the maximum of {MAX_ENTRY_SIZE}"
+                        ),
+                    ));
+                }
+
                 // Calculate the full size required for this entry (header + data).
-                let Some(full_entry_size) = data_length.checked_add(ENTRY_HEADER_SIZE) else {
-                    break; // Corrupt, entry length overflows u64
-                };
+                let full_entry_size =
+                    data_length.checked_add(ENTRY_HEADER_SIZE).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("WAL entry length overflows at offset {pos}"),
+                        )
+                    })?;
 
                 // Check if enough bytes remain for full entry
-                if size.saturating_sub(pos) < full_entry_size {
-                    break; // Partial/corrupt entry
+                if remaining < full_entry_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "Incomplete WAL entry at offset {pos}: frame declares \
+                             {full_entry_size} bytes, {remaining} remain"
+                        ),
+                    ));
                 }
 
                 // Calculate just the payload size for seeking past it.
-                let Some(payload_size) = data_length.checked_add(ENTRY_CRC_SIZE) else {
-                    break; // Integer overflow, file is corrupt
-                };
+                let payload_size = data_length.checked_add(ENTRY_CRC_SIZE).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("WAL entry payload length overflows at offset {pos}"),
+                    )
+                })?;
 
                 // Skip to next entry
                 let seek_offset = i64::try_from(payload_size).map_err(|_| {
@@ -290,10 +349,6 @@ where
                 pos = storage.seek(SeekFrom::Current(seek_offset))?;
                 len += 1;
             }
-
-            // Truncate any partial entries at the end
-            storage.truncate_to(pos)?;
-            storage.sync_all()?;
 
             return Ok(Self {
                 version,
@@ -462,7 +517,7 @@ where
         })
     }
 
-    /// Restarts the WAL with a new sequence number.
+    /// Reset the WAL with a new sequence number.
     ///
     /// This truncates all existing entries and resets the WAL to an empty state
     /// with the specified sequence number.
@@ -473,7 +528,7 @@ where
     /// # Returns
     /// * `Ok(())` - WAL was successfully restarted
     /// * `Err` - If file operations fail
-    pub fn restart(&mut self, sequence: u64) -> io::Result<()> {
+    pub fn reset(&mut self, sequence: u64) -> io::Result<()> {
         // Reset sequence number and entry count
         self.sequence = sequence;
         self.len = 0;
@@ -489,6 +544,70 @@ where
 
         // Sync changes to disk
         self.storage.sync_all()?;
+
+        Ok(())
+    }
+
+    /// Truncates the WAL to the specified entry index.
+    ///
+    /// All entries from `from_entry` onwards will be removed.
+    /// If `from_entry` is greater than or equal to the current length,
+    /// no action is taken.
+    ///
+    /// # Arguments
+    /// * `from_entry` - The entry index to truncate from
+    ///
+    /// # Returns
+    /// * `Ok(())` - WAL was successfully truncated
+    /// * `Err` - If file operations fail
+    pub fn truncate(&mut self, from_entry: u64) -> io::Result<()> {
+        if from_entry >= self.len as u64 {
+            return Ok(());
+        }
+
+        let mut pos = FIRST_ENTRY_OFFSET;
+
+        self.storage.seek(SeekFrom::Start(pos))?;
+
+        for _ in 0..from_entry {
+            // Skip compression flag
+            let _ = read_u8(&mut self.storage)?;
+            pos += ENTRY_COMPRESSION_FLAG_SIZE;
+
+            // Read entry length
+            let data_length = read_u64(&mut self.storage)?;
+            pos += ENTRY_LENGTH_SIZE;
+
+            // Skip CRC
+            let _ = read_u32(&mut self.storage)?;
+            pos += ENTRY_CRC_SIZE;
+
+            // Compute seek offset to skip over data
+            let seek_offset = i64::try_from(data_length).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Entry length too large for seeking",
+                )
+            })?;
+
+            // Skip to next entry
+            let new_pos = self.storage.seek(SeekFrom::Current(seek_offset))?;
+
+            // Check consistency
+            assert_eq!(new_pos, pos + data_length);
+
+            // Update position
+            pos = new_pos;
+        }
+
+        // Truncate the storage to the computed position
+        self.storage.truncate_to(pos)?;
+
+        // Sync changes to disk
+        self.storage.sync_all()?;
+
+        // Update entry count
+        self.len = from_entry as usize;
 
         Ok(())
     }

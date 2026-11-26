@@ -1,16 +1,18 @@
 use bytes::Bytes;
+use std::ops::RangeInclusive;
 use std::time::Duration;
 
 use derive_where::derive_where;
 use ractor::{ActorRef, RpcReplyPort};
 
-use malachitebft_core_consensus::{Role, VoteExtensionError};
+use malachitebft_core_consensus::{MisbehaviorEvidence, Role, VoteExtensionError};
 use malachitebft_core_types::{CommitCertificate, Context, Round, ValueId, VoteExtensions};
 use malachitebft_sync::{PeerId, RawDecidedValue};
 
 use crate::util::streaming::StreamMessage;
 
 pub use malachitebft_core_consensus::{LocallyProposedValue, ProposedValue};
+pub use malachitebft_core_types::HeightParams;
 
 /// A reference to the host actor.
 pub type HostRef<Ctx> = ActorRef<HostMsg<Ctx>>;
@@ -18,11 +20,11 @@ pub type HostRef<Ctx> = ActorRef<HostMsg<Ctx>>;
 /// What to do next after a decision.
 #[derive_where(Debug)]
 pub enum Next<Ctx: Context> {
-    /// Start at the given height with the given validator set.
-    Start(Ctx::Height, Ctx::ValidatorSet),
+    /// Start at the given height with the provided parameters.
+    Start(Ctx::Height, HeightParams<Ctx>),
 
-    /// Restart at the given height with the given validator set.
-    Restart(Ctx::Height, Ctx::ValidatorSet),
+    /// Restart at the given height with the provided parameters.
+    Restart(Ctx::Height, HeightParams<Ctx>),
 }
 
 /// Messages that need to be handled by the host actor.
@@ -34,7 +36,7 @@ pub enum HostMsg<Ctx: Context> {
     /// consensus to start at a given height.
     ConsensusReady {
         /// Use this reply port to instruct consensus to start the first height.
-        reply_to: RpcReplyPort<(Ctx::Height, Ctx::ValidatorSet)>,
+        reply_to: RpcReplyPort<(Ctx::Height, HeightParams<Ctx>)>,
     },
 
     /// Consensus has started a new round.
@@ -143,12 +145,12 @@ pub enum HostMsg<Ctx: Context> {
     /// and the aggregated signatures of the validators that committed to it.
     /// It also includes to the vote extensions received for that height.
     ///
-    /// In response to this message, the application MUST send a [`Next`]
-    /// message back to consensus, instructing it to either start the next height if
-    /// the application was able to commit the decided value, or to restart the current height
-    /// otherwise.
+    /// The application MUST commit the decision and then reply to
+    /// acknowledge that the commit is complete. The sync actor will only be notified
+    /// of the decided height after the application replies.
     ///
-    /// If the application does not reply, consensus will stall.
+    /// If the application does not reply, the sync actor will never learn about
+    /// the decided height and peers will not be able to sync from this node.
     Decided {
         /// The commit certificate containing the ID of the value that was decided on,
         /// the the height and round at which it was decided, and the aggregated signatures
@@ -158,18 +160,49 @@ pub enum HostMsg<Ctx: Context> {
         /// Vote extensions that were received for this height.
         extensions: VoteExtensions<Ctx>,
 
+        /// Use this reply port to acknowledge that the decision has been committed.
+        reply_to: RpcReplyPort<()>,
+    },
+
+    /// Notifies the application that consensus has finalized a height after collecting additional precommits.
+    ///
+    /// This message is sent when the target time for the height has been reached,
+    /// which may include a delay between `Decided` and `Finalized` messages.
+    /// During this delay, additional precommits may have been collected. The certificate may contain more
+    /// signatures than the one sent in the initial Decided message.
+    ///
+    /// In response to this message, the application MUST send a [`Next`]
+    /// message back to consensus, instructing it to either start the next height if
+    /// the application was able to commit the decided value, or to restart the current height
+    /// otherwise.
+    ///
+    /// If the application does not reply, consensus will stall.
+    Finalized {
+        /// The commit certificate with extended signatures collected during finalization period.
+        certificate: CommitCertificate<Ctx>,
+
+        /// Vote extensions that were received for this height (including additional ones).
+        extensions: VoteExtensions<Ctx>,
+
+        /// Misbehavior evidence collected since last height was decided.
+        evidence: MisbehaviorEvidence<Ctx>,
+
         /// Use this reply port to instruct consensus to start the next height.
         reply_to: RpcReplyPort<Next<Ctx>>,
     },
 
-    /// Requests a previously decided value from the application's storage.
+    /// Requests a range of previously decided values from the application's storage.
     ///
-    /// The application MUST respond with that value if available, or `None` otherwise.
-    GetDecidedValue {
-        /// Height of the decided value to retrieve
-        height: Ctx::Height,
+    /// The application MUST respond with those values if available, or `None` otherwise.
+    ///
+    /// ## Important
+    /// The range is NOT checked for validity by consensus. It is the application's responsibility
+    /// to ensure that the the range is within valid bounds.
+    GetDecidedValues {
+        /// Range of decided values to retrieve
+        range: RangeInclusive<Ctx::Height>,
         /// Channel for sending back the decided value
-        reply_to: RpcReplyPort<Option<RawDecidedValue<Ctx>>>,
+        reply_to: RpcReplyPort<Vec<RawDecidedValue<Ctx>>>,
     },
 
     /// Notifies the application that a value has been synced from the network.
@@ -188,6 +221,6 @@ pub enum HostMsg<Ctx: Context> {
         value_bytes: Bytes,
         /// Channel for sending back the proposed value, if successfully decoded
         /// or `None` if the value could not be decoded
-        reply_to: RpcReplyPort<ProposedValue<Ctx>>,
+        reply_to: RpcReplyPort<Option<ProposedValue<Ctx>>>,
     },
 }

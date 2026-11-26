@@ -1,26 +1,31 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::marker::PhantomData;
+
 use async_trait::async_trait;
 use derive_where::derive_where;
-use eyre::eyre;
-use libp2p::identity::Keypair;
 use libp2p::request_response;
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
-use std::collections::{BTreeSet, HashMap};
-use std::marker::PhantomData;
 use tokio::task::JoinHandle;
-use tracing::{error, trace};
-
-use malachitebft_sync::{
-    self as sync, InboundRequestId, OutboundRequestId, RawMessage, Request, Response,
-};
+use tracing::{debug, error, info, trace, warn};
 
 use malachitebft_codec as codec;
 use malachitebft_core_consensus::{LivenessMsg, SignedConsensusMsg};
 use malachitebft_core_types::{
-    Context, PolkaCertificate, RoundCertificate, SignedProposal, SignedVote,
+    Context, PolkaCertificate, RoundCertificate, SignedProposal, SignedVote, SigningScheme,
+    Validator, ValidatorProof, ValidatorSet,
 };
 use malachitebft_metrics::SharedRegistry;
 use malachitebft_network::handle::CtrlHandle;
-use malachitebft_network::{Channel, Config, Event, Multiaddr, PeerId};
+use malachitebft_network::validator_proof::ProofVerificationResult;
+use malachitebft_network::{Channel, Config, Event, PeerId};
+
+pub use malachitebft_network::{
+    Multiaddr, NetworkIdentity, NetworkStateDump, PersistentPeerError, PersistentPeersOp,
+};
+
+use malachitebft_sync::{
+    self as sync, InboundRequestId, OutboundRequestId, RawMessage, Request, Response,
+};
 
 use crate::consensus::ConsensusCodec;
 use crate::sync::SyncCodec;
@@ -73,14 +78,14 @@ where
     Codec: codec::HasEncodedLen<sync::Response<Ctx>>,
 {
     pub async fn spawn(
-        keypair: Keypair,
+        identity: NetworkIdentity,
         config: Config,
         metrics: SharedRegistry,
         codec: Codec,
         span: tracing::Span,
     ) -> Result<ActorRef<Msg<Ctx>>, ractor::SpawnErr> {
         let args = Args {
-            keypair,
+            identity,
             config: config.clone(),
             metrics,
         };
@@ -91,7 +96,7 @@ where
 }
 
 pub struct Args {
-    pub keypair: Keypair,
+    pub identity: NetworkIdentity,
     pub config: Config,
     pub metrics: SharedRegistry,
 }
@@ -102,6 +107,7 @@ pub enum NetworkEvent<Ctx: Context> {
 
     PeerConnected(PeerId),
     PeerDisconnected(PeerId),
+    PeerSyncSubscribed(PeerId),
 
     Vote(PeerId, SignedVote<Ctx>),
 
@@ -111,6 +117,12 @@ pub enum NetworkEvent<Ctx: Context> {
     PolkaCertificate(PeerId, PolkaCertificate<Ctx>),
 
     RoundCertificate(PeerId, RoundCertificate<Ctx>),
+
+    /// A validator proof received from a peer (one-way, no response expected).
+    ValidatorProofReceived {
+        peer_id: PeerId,
+        proof: ValidatorProof<Ctx>,
+    },
 
     Status(PeerId, Status<Ctx>),
 
@@ -123,6 +135,8 @@ pub enum State<Ctx: Context> {
     Running {
         listen_addrs: Vec<Multiaddr>,
         peers: BTreeSet<PeerId>,
+        sync_subscriptions: BTreeSet<PeerId>,
+        peer_statuses: Box<BTreeMap<PeerId, Status<Ctx>>>,
         output_port: OutputPort<NetworkEvent<Ctx>>,
         ctrl_handle: Box<CtrlHandle>,
         recv_task: JoinHandle<()>,
@@ -167,11 +181,26 @@ pub enum Msg<Ctx: Context> {
     /// Send a response for a request to a peer
     OutgoingResponse(InboundRequestId, Response<Ctx>),
 
-    /// Request the total number of bytes that are to be transmitted for this response
-    GetResponseSize(Response<Ctx>, RpcReplyPort<usize>),
+    /// Request to dump the current network state
+    DumpState(RpcReplyPort<Option<NetworkStateDump>>),
 
-    /// Request for number of peers from gossip
-    GetState { reply: RpcReplyPort<usize> },
+    /// Add or remove a persistent peer at runtime
+    UpdatePersistentPeers(
+        PersistentPeersOp,
+        RpcReplyPort<Result<(), PersistentPeerError>>,
+    ),
+
+    /// Update the validator set for the current height
+    UpdateValidatorSet(Ctx::ValidatorSet),
+
+    /// Send a validator proof verification result.
+    /// If result is Valid and public_key is Some, stores the proof for this peer.
+    ValidatorProofVerified {
+        peer_id: PeerId,
+        result: ProofVerificationResult,
+        /// Public key bytes from verified proof (only set on Valid)
+        public_key: Option<Vec<u8>>,
+    },
 
     // Event emitted by the gossip layer
     #[doc(hidden)]
@@ -186,11 +215,9 @@ where
     Codec: codec::Codec<Ctx::ProposalPart>,
     Codec: codec::Codec<SignedConsensusMsg<Ctx>>,
     Codec: codec::Codec<StreamMessage<Ctx::ProposalPart>>,
-    Codec: codec::Codec<sync::Status<Ctx>>,
-    Codec: codec::Codec<sync::Request<Ctx>>,
-    Codec: codec::Codec<sync::Response<Ctx>>,
     Codec: codec::Codec<LivenessMsg<Ctx>>,
-    Codec: codec::HasEncodedLen<sync::Response<Ctx>>,
+    Codec: codec::Codec<ValidatorProof<Ctx>>,
+    Codec: SyncCodec<Ctx>,
 {
     type Msg = Msg<Ctx>;
     type State = State<Ctx>;
@@ -201,7 +228,7 @@ where
         myself: ActorRef<Msg<Ctx>>,
         args: Args,
     ) -> Result<Self::State, ActorProcessingErr> {
-        let handle = malachitebft_network::spawn(args.keypair, args.config, args.metrics).await?;
+        let handle = malachitebft_network::spawn(args.identity, args.config, args.metrics).await?;
 
         let (mut recv_handle, ctrl_handle) = handle.split();
 
@@ -217,6 +244,8 @@ where
         Ok(State::Running {
             listen_addrs: Vec::new(),
             peers: BTreeSet::new(),
+            sync_subscriptions: BTreeSet::new(),
+            peer_statuses: Box::default(),
             output_port: OutputPort::with_capacity(128),
             ctrl_handle: Box::new(ctrl_handle),
             recv_task,
@@ -239,9 +268,22 @@ where
         msg: Msg<Ctx>,
         state: &mut State<Ctx>,
     ) -> Result<(), ActorProcessingErr> {
+        // We need to handle before deconstructing `state` to always reply.
+        if let Msg::DumpState(reply_to) = msg {
+            handle_dump_state(state, reply_to).await;
+            return Ok(());
+        }
+
+        if let Msg::UpdatePersistentPeers(op, reply_to) = msg {
+            handle_update_persistent_peers(state, op, reply_to).await;
+            return Ok(());
+        }
+
         let State::Running {
             listen_addrs,
             peers,
+            sync_subscriptions,
+            peer_statuses,
             output_port,
             ctrl_handle,
             inbound_requests,
@@ -259,6 +301,17 @@ where
 
                 for peer in peers.iter() {
                     subscriber.send(NetworkEvent::PeerConnected(*peer));
+                }
+
+                for peer in sync_subscriptions.iter() {
+                    subscriber.send(NetworkEvent::PeerSyncSubscribed(*peer));
+                }
+
+                // An eager status can arrive while the engine is still spawning its sync actor.
+                // Give late subscribers the latest status from each connected peer.
+                for (peer, status) in peer_statuses.iter() {
+                    debug!(%peer, tip_height = %status.tip_height, "Delivering earlier peer status to subscriber");
+                    subscriber.send(NetworkEvent::Status(*peer, status.clone()));
                 }
 
                 subscriber.subscribe_to_port(output_port);
@@ -308,7 +361,11 @@ where
                 match request {
                     Ok(data) => {
                         let p2p_request_id = ctrl_handle.sync_request(peer_id, data).await?;
-                        reply_to.send(OutboundRequestId::new(p2p_request_id))?;
+                        // The requester may have dropped its reply receiver; that is benign,
+                        // so do not fail the actor (which would stop the node).
+                        if let Err(e) = reply_to.send(OutboundRequestId::new(p2p_request_id)) {
+                            error!("Failed to send outbound request ID to requester: {e:?}");
+                        }
                     }
                     Err(e) => error!("Failed to encode request message: {e:?}"),
                 }
@@ -319,28 +376,17 @@ where
 
                 match response {
                     Ok(data) => {
-                        let request_id = inbound_requests
-                            .remove(&request_id)
-                            .ok_or_else(|| eyre!("Unknown inbound request ID: {request_id}"))?;
+                        // The request may already have timed out and been removed. Dropping
+                        // this late response is benign and must not stop the node.
+                        let Some(request_id) = inbound_requests.remove(&request_id) else {
+                            error!(%request_id, "Unknown inbound request ID, dropping response");
+                            return Ok(());
+                        };
 
                         ctrl_handle.sync_reply(request_id, data).await?
                     }
                     Err(e) => {
                         error!(%request_id, "Failed to encode response message: {e:?}");
-                        return Ok(());
-                    }
-                };
-            }
-
-            Msg::GetResponseSize(response, reply_to) => {
-                let encoded_len = self.codec.encoded_len(&response);
-
-                match encoded_len {
-                    Ok(size) => {
-                        reply_to.send(size)?;
-                    }
-                    Err(e) => {
-                        error!(?response, "Failed to encode response message: {e:?}");
                         return Ok(());
                     }
                 };
@@ -358,7 +404,15 @@ where
 
             Msg::NewEvent(Event::PeerDisconnected(peer_id)) => {
                 peers.remove(&peer_id);
+                sync_subscriptions.remove(&peer_id);
+                peer_statuses.remove(&peer_id);
                 output_port.send(NetworkEvent::PeerDisconnected(peer_id));
+            }
+
+            Msg::NewEvent(Event::PeerSyncSubscribed(peer_id)) => {
+                if sync_subscriptions.insert(peer_id) {
+                    output_port.send(NetworkEvent::PeerSyncSubscribed(peer_id));
+                }
             }
 
             Msg::NewEvent(Event::LivenessMessage(Channel::Liveness, from, data)) => {
@@ -442,15 +496,44 @@ where
 
                 trace!(%from, tip_height = %status.tip_height, "Received status");
 
-                output_port.send(NetworkEvent::Status(
-                    status.peer_id,
-                    Status::new(status.tip_height, status.history_min_height),
-                ));
+                let status = Status::new(status.tip_height, status.history_min_height);
+                peer_statuses.insert(from, status.clone());
+                output_port.send(NetworkEvent::Status(from, status));
             }
 
             Msg::NewEvent(Event::ConsensusMessage(channel, from, _)) => {
                 error!(%from, "Unexpected consensus message on {channel} channel");
                 return Ok(());
+            }
+
+            Msg::NewEvent(Event::ValidatorProofReceived {
+                peer_id,
+                proof_bytes,
+            }) => {
+                let proof: ValidatorProof<Ctx> = match self.codec.decode(proof_bytes) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(%peer_id, "Failed to decode validator proof: {e:?}, ignoring");
+                        return Ok(());
+                    }
+                };
+
+                // Verify peer_id in proof matches sender
+                let sender_peer_id_bytes = peer_id.to_bytes();
+                if proof.peer_id != sender_peer_id_bytes {
+                    warn!(
+                        %peer_id,
+                        proof_peer_id = %hex::encode(&proof.peer_id),
+                        "Validator proof peer_id does not match sender, rejecting"
+                    );
+                    ctrl_handle
+                        .validator_proof_verified(peer_id, ProofVerificationResult::Invalid, None)
+                        .await?;
+                    return Ok(());
+                }
+
+                debug!(%peer_id, public_key = %hex::encode(&proof.public_key), "Received validator proof");
+                output_port.send(NetworkEvent::ValidatorProofReceived { peer_id, proof });
             }
 
             Msg::NewEvent(Event::Sync(raw_msg)) => match raw_msg {
@@ -497,12 +580,39 @@ where
                 }
             },
 
-            Msg::GetState { reply } => {
-                let number_peers = match state {
-                    State::Stopped => 0,
-                    State::Running { peers, .. } => peers.len(),
-                };
-                reply.send(number_peers)?;
+            Msg::UpdateValidatorSet(validator_set) => {
+                info!(
+                    "Updating validator set: {} validators",
+                    validator_set.count()
+                );
+
+                // Convert ValidatorSet to Vec<ValidatorInfo>
+                // Note: We encode public keys to bytes for network layer matching
+                let validators: Vec<_> = validator_set
+                    .iter()
+                    .map(|v| malachitebft_network::ValidatorInfo {
+                        address: v.address().to_string(),
+                        public_key: Ctx::SigningScheme::encode_public_key(v.public_key()),
+                        voting_power: v.voting_power(),
+                    })
+                    .collect();
+                ctrl_handle.update_validator_set(validators).await?;
+            }
+
+            Msg::ValidatorProofVerified {
+                peer_id,
+                result,
+                public_key,
+            } => {
+                debug!(%peer_id, ?result, public_key = ?public_key.as_ref().map(hex::encode), "Sending validator proof verification result");
+                ctrl_handle
+                    .validator_proof_verified(peer_id, result, public_key)
+                    .await?;
+            }
+
+            Msg::DumpState(_) => unreachable!("DumpState handled above to ensure a reply"),
+            Msg::UpdatePersistentPeers(_, _) => {
+                unreachable!("UpdatePersistentPeers handled above to ensure a reply")
             }
         }
 
@@ -527,5 +637,80 @@ where
         }
 
         Ok(())
+    }
+}
+
+async fn handle_dump_state<Ctx>(
+    state: &mut State<Ctx>,
+    reply_to: RpcReplyPort<Option<NetworkStateDump>>,
+) where
+    Ctx: Context,
+{
+    let dump = match state {
+        State::Stopped => {
+            info!("Dumping network state: not started");
+            None
+        }
+        State::Running { ctrl_handle, .. } => match ctrl_handle.dump_state().await {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                error!(%error, "Failed to obtain network dump");
+                None
+            }
+        },
+    };
+
+    if let Err(error) = reply_to.send(dump) {
+        error!(%error, "Failed to reply with network state dump");
+    }
+}
+
+async fn handle_update_persistent_peers<Ctx>(
+    state: &mut State<Ctx>,
+    op: PersistentPeersOp,
+    reply_to: RpcReplyPort<Result<(), PersistentPeerError>>,
+) where
+    Ctx: Context,
+{
+    fn log_result(result: &Result<(), PersistentPeerError>, op: &PersistentPeersOp) {
+        match result {
+            Ok(_) => match op {
+                PersistentPeersOp::Add(addr) => {
+                    info!("Successfully added persistent peer: {addr}");
+                }
+                PersistentPeersOp::Remove(addr) => {
+                    info!("Successfully removed persistent peer: {addr}");
+                }
+            },
+            Err(error) => {
+                error!(%error, "Failed to update persistent peers");
+            }
+        }
+    }
+
+    let result = match state {
+        State::Stopped => {
+            warn!("Cannot update persistent peers: network not started");
+            Err(PersistentPeerError::NetworkStopped)
+        }
+        State::Running { ctrl_handle, .. } => {
+            let op_result = match &op {
+                PersistentPeersOp::Add(addr) => ctrl_handle.add_persistent_peer(addr.clone()).await,
+                PersistentPeersOp::Remove(addr) => {
+                    ctrl_handle.remove_persistent_peer(addr.clone()).await
+                }
+            };
+
+            op_result
+                .inspect(|res| log_result(res, &op))
+                .unwrap_or_else(|error| {
+                    error!(%error, "Internal error: failed to update persistent peers");
+                    Err(PersistentPeerError::InternalError(error.to_string()))
+                })
+        }
+    };
+
+    if let Err(error) = reply_to.send(result) {
+        error!(%error, "Failed to reply to UpdatePersistentPeers");
     }
 }

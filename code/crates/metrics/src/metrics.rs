@@ -87,14 +87,20 @@ pub struct Inner {
     /// Number of heights in the consensus input queue
     pub queue_heights: Gauge,
 
-    /// Number of heights in the consensus sync input queue
-    pub sync_queue_heights: Gauge,
-
     /// Number of inputs in the consensus input queue across all heights
     pub queue_size: Gauge,
 
-    /// Number of sync inputs in the consensus input queue across all heights
-    pub sync_queue_size: Gauge,
+    /// Number of equivocating votes
+    pub equivocation_votes: Counter,
+
+    /// Number of equivocating proposals
+    pub equivocation_proposals: Counter,
+
+    /// Number of additional precommits received during finalization period
+    pub additional_precommits: Counter,
+
+    /// Whether the node has entered the safety-hang state.
+    pub node_safety_failure: Gauge,
 
     /// Internal state for measuring time taken for consensus
     instant_consensus_started: Arc<AtomicInstant>,
@@ -123,9 +129,11 @@ impl Metrics {
             signature_signing_time: Histogram::new(exponential_buckets(0.001, 2.0, 10)),
             signature_verification_time: Histogram::new(exponential_buckets(0.001, 2.0, 10)),
             queue_heights: Gauge::default(),
-            sync_queue_heights: Gauge::default(),
             queue_size: Gauge::default(),
-            sync_queue_size: Gauge::default(),
+            equivocation_votes: Counter::default(),
+            equivocation_proposals: Counter::default(),
+            additional_precommits: Counter::default(),
+            node_safety_failure: Gauge::default(),
             instant_consensus_started: Arc::new(AtomicInstant::empty()),
             instant_block_started: Arc::new(AtomicInstant::empty()),
             instant_step_started: Arc::new(Mutex::new((Step::Unstarted, Instant::now()))),
@@ -215,15 +223,27 @@ impl Metrics {
             );
 
             registry.register(
-                "sync_queue_heights",
-                "Number of heights in the sync input queue",
-                metrics.sync_queue_heights.clone(),
+                "equivocation_votes",
+                "Number of equivocating votes",
+                metrics.equivocation_votes.clone(),
             );
 
             registry.register(
-                "sync_queue_size",
-                "Number of inputs in the consensus sync input queue across all heights",
-                metrics.sync_queue_size.clone(),
+                "equivocation_proposals",
+                "Number of equivocating proposals",
+                metrics.equivocation_proposals.clone(),
+            );
+
+            registry.register(
+                "additional_precommits",
+                "Number of additional precommits received during finalization period",
+                metrics.additional_precommits.clone(),
+            );
+
+            registry.register(
+                "node_safety_failure",
+                "1 while the node is safety-hung after a safety-critical failure",
+                metrics.node_safety_failure.clone(),
             );
         });
 
@@ -259,6 +279,10 @@ impl Metrics {
     pub fn step_start(&self, step: Step) {
         let mut guard = self.instant_step_started.lock().expect("poisoned mutex");
         *guard = (step, Instant::now());
+    }
+
+    pub fn set_safety_failure(&self) {
+        self.node_safety_failure.set(1);
     }
 
     pub fn step_end(&self, step: Step) {

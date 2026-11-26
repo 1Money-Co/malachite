@@ -34,9 +34,8 @@ const VOTEKEEPER_TRACE_TEST_NAMES: [&str; 10] = [
 
 #[test]
 fn test_itf() {
-    let temp_dir =
-        tempfile::TempDir::with_prefix("informalsystems-malachitebft-core-votekeeperkeeper-")
-            .expect("Failed to create temp dir");
+    let temp_dir = tempfile::TempDir::with_prefix("arc-malachitebft-core-votekeeperkeeper-")
+        .expect("Failed to create temp dir");
     let temp_path = temp_dir.path().to_owned();
 
     if std::env::var("KEEP_TEMP").is_ok() {

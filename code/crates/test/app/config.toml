@@ -104,10 +104,6 @@ persistent_peers = []
 # Override with MALACHITE__CONSENSUS__P2P__TRANSPORT env variable
 transport = "tcp"
 
-# Enable the discovery protocol to find more peers
-# Override with MALACHITE__CONSENSUS__P2P__DISCOVERY__ENABLED env variable
-discovery = { enabled = true }
-
 # The maximum size of messages to send over pub-sub
 # Must be larger than the maximum block part size.
 # Override with MALACHITE__CONSENSUS__P2P__PUBSUB_MAX_SIZE env variable
@@ -117,6 +113,26 @@ pubsub_max_size = "4 MiB"
 # Must be larger than the maximum block size.
 # Override with MALACHITE__CONSENSUS__P2P__RPC_MAX_SIZE env variable
 rpc_max_size = "10 MiB"
+
+#######################################################
+###  Consensus P2P Discovery Configuration Options  ###
+#######################################################
+[consensus.p2p.discovery]
+
+# Enable the discovery protocol to find more peers
+# Override with MALACHITE__CONSENSUS__P2P__DISCOVERY__ENABLED env variable
+enabled = true
+
+# Maximum number of connections per peer
+# Override with MALACHITE__CONSENSUS__P2P__DISCOVERY__MAX_CONNECTIONS_PER_PEER env variable
+# max_connections_per_peer = 5
+
+# Maximum connections allowed per IP address.
+# Limits inbound connections from the same IP to prevent DoS attacks
+# where an attacker generates many PeerIds from the same IP.
+# Defaults to num_inbound_peers (effectively disabled).
+# Override with MALACHITE__CONSENSUS__P2P__DISCOVERY__MAX_CONNECTIONS_PER_IP env variable
+# max_connections_per_ip = 20
 
 #######################################################
 ###  Consensus P2P Protocol Configuration Options   ###
@@ -142,6 +158,28 @@ mesh_n_low = 4
 # it will be calculated as `max(1, min(mesh_n / 2, mesh_n_low - 1))`
 mesh_outbound_min = 2
 
+# GossipSub only. Enable peer scoring to prioritize persistent peers in mesh formation.
+# When enabled, persistent peers receive higher scores and are preferred for grafting into the mesh.
+# Full nodes receive lower scores and can be opportunistically replaced by persistent peers over time.
+# Override with MALACHITE__CONSENSUS__P2P__PROTOCOL__ENABLE_PEER_SCORING env variable
+enable_peer_scoring = false
+
+# GossipSub only. Enable explicit peering for persistent peers.
+# When enabled, persistent peers are added as explicit peers in GossipSub,
+# meaning a node always sends and forwards messages to its explicit peers,
+# regardless of mesh membership.
+# Note: explicit peering should ideally be reciprocal (both sides have each other as persistent peers).
+# If only one side adds the other as explicit, that side will reject GRAFTs from the other with PRUNE,
+# preventing the other from including it in its mesh.
+# Override with MALACHITE__CONSENSUS__P2P__PROTOCOL__ENABLE_EXPLICIT_PEERING env variable
+enable_explicit_peering = false
+
+# GossipSub only. Enable flood publishing.
+# When enabled, published messages are sent to all known peers, not just mesh peers.
+# Can be enabled together with explicit peering.
+# Override with MALACHITE__CONSENSUS__P2P__PROTOCOL__ENABLE_FLOOD_PUBLISH env variable
+enable_flood_publish = true
+
 #######################################################
 ###         ValueSync Configuration Options         ###
 #######################################################
@@ -151,6 +189,7 @@ mesh_outbound_min = 2
 enabled = true
 
 # Interval at which to update other peers of our status
+# If set to 0s, status updates are sent eagerly right after each decision.
 # Override with MALACHITE__VALUE_SYNC__STATUS_UPDATE_INTERVAL env variable
 status_update_interval = "10s"
 
@@ -230,22 +269,6 @@ rpc_max_size = "10 MiB"
 # Broadcast is an experimental protocol with no additional configuration options.
 type = "gossipsub"
 
-
-#######################################################
-###         Sync Configuration Options         ###
-#######################################################
-[sync]
-# Enable the synchronization protocol
-# Override with MALACHITE__SYNC__ENABLED env variable
-enabled = true
-
-# Interval at which to update other peers of our status
-# Override with MALACHITE__SYNC__STATUS_UPDATE_INTERVAL env variable
-status_update_interval = "10s"
-
-# Timeout duration for sync requests
-# Override with MALACHITE__SYNC__REQUEST_TIMEOUT env variable
-request_timeout = "10s"
 
 #######################################################
 ###          Metrics Configuration Options          ###

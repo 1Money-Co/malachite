@@ -7,7 +7,7 @@ test:
 .PHONY: test
 
 verify:
-	npx @informalsystems/quint verify --max-steps 10 \
+	npx @informalsystems/quint@0.22.4 verify --max-steps 10 \
 		--main votekeeperModels --init=VK1::init --step=VK1::step \
 		--invariant VK1::Inv \
 		./tests/votekeeper/votekeeperModels.qnt
@@ -25,12 +25,12 @@ traces-sim:
 # Generate traces from `run` statements.
 traces-run-vk:
 	mkdir -p traces/votekeeper
-	npx @informalsystems/quint test --output traces/votekeeper/{}.itf.json ./tests/votekeeper/votekeeperTest.qnt
+	npx @informalsystems/quint@0.22.4 test --output traces/votekeeper/{}.itf.json ./tests/votekeeper/votekeeperTest.qnt
 .PHONY: traces-run-vk
 
 traces-run-con:
 	mkdir -p traces/consensus
-	npx @informalsystems/quint test --output traces/consensus/{}.itf.json ./tests/consensus/consensusTest.qnt
+	npx @informalsystems/quint@0.22.4 test --output traces/consensus/{}.itf.json ./tests/consensus/consensusTest.qnt
 .PHONY: traces-run-con
 
 traces-run: traces-run-vk traces-run-con

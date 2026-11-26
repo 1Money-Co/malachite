@@ -8,7 +8,7 @@ use std::{fs, io, str};
 
 use testdir::{NumberedDir, NumberedDirBuilder};
 
-use informalsystems_malachitebft_wal::{Log, Version};
+use arc_malachitebft_wal::{Log, Version};
 
 static TESTDIR: LazyLock<NumberedDir> =
     LazyLock::new(|| NumberedDirBuilder::new("wal".to_string()).create().unwrap());
@@ -118,7 +118,7 @@ fn restart() -> io::Result<()> {
 
     {
         let mut wal = setup_wal(&path, ENTRIES_1)?;
-        wal.restart(1)?;
+        wal.reset(1)?;
 
         assert_eq!(wal.sequence(), 1);
         assert_eq!(wal.len(), 0);
@@ -163,11 +163,16 @@ fn corrupted_wal() -> io::Result<()> {
         file.set_len(truncate_len)?;
     }
 
-    // Reopen and verify it handles corruption gracefully
-    let wal = Log::open(&path)?;
-
-    // Should have fewer entries due to corruption
-    assert!(wal.len() < 2);
+    let expected = fs::read(&path)?;
+    for attempt in 1..=2 {
+        let error = Log::open(&path).expect_err("truncated WAL must fail to open");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            fs::read(&path)?,
+            expected,
+            "failed open attempt {attempt} mutated WAL bytes"
+        );
+    }
 
     Ok(())
 }

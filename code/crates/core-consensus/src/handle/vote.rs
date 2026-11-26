@@ -27,6 +27,7 @@ where
             consensus.round = %consensus_round,
             vote.height = %vote_height,
             vote.round = %vote_round,
+            vote.msg = %PrettyVote::<Ctx>(&signed_vote.message),
             validator = %validator_address,
             "Received vote for lower height, dropping"
         );
@@ -41,6 +42,7 @@ where
             consensus.round = %consensus_round,
             vote.height = %vote_height,
             vote.round = %vote_round,
+            vote.msg = %PrettyVote::<Ctx>(&signed_vote.message),
             validator = %validator_address,
             "Received vote for higher height, queuing for later"
         );
@@ -59,6 +61,7 @@ where
             consensus.round = %consensus_round,
             vote.height = %vote_height,
             vote.round = %vote_round,
+            vote.msg = %PrettyVote::<Ctx>(&signed_vote.message),
             validator = %validator_address,
             "Received vote at round -1, queuing for later"
         );
@@ -69,6 +72,11 @@ where
     }
 
     debug_assert_eq!(consensus_height, vote_height);
+
+    // Only process this vote if we have not yet seen it.
+    if state.driver.votes().has_vote(&signed_vote) {
+        return Ok(());
+    }
 
     if !verify_signed_vote(co, state, &signed_vote).await? {
         return Ok(());
@@ -84,19 +92,16 @@ where
         "Received vote",
     );
 
-    // Only process this vote if we have not yet seen it.
-    if !state.driver.votes().has_vote(&signed_vote) {
-        perform!(
-            co,
-            Effect::WalAppend(
-                signed_vote.height(),
-                WalEntry::ConsensusMsg(SignedConsensusMsg::Vote(signed_vote.clone())),
-                Default::default()
-            )
-        );
+    perform!(
+        co,
+        Effect::WalAppend(
+            signed_vote.height(),
+            WalEntry::ConsensusMsg(SignedConsensusMsg::Vote(signed_vote.clone())),
+            Default::default()
+        )
+    );
 
-        apply_driver_input(co, state, metrics, DriverInput::Vote(signed_vote)).await?;
-    }
+    apply_driver_input(co, state, metrics, DriverInput::Vote(signed_vote)).await?;
 
     Ok(())
 }

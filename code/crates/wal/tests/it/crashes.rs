@@ -11,9 +11,9 @@ use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use testdir::{NumberedDir, NumberedDirBuilder};
 
-use informalsystems_malachitebft_wal::log::Log;
-use informalsystems_malachitebft_wal::Log as FileLog;
-use informalsystems_malachitebft_wal::*;
+use arc_malachitebft_wal::log::Log;
+use arc_malachitebft_wal::Log as FileLog;
+use arc_malachitebft_wal::*;
 
 static TESTDIR: LazyLock<NumberedDir> =
     LazyLock::new(|| NumberedDirBuilder::new("wal".to_string()).create().unwrap());
@@ -258,7 +258,8 @@ fn process_termination() -> io::Result<()> {
     let _ = child.wait_with_output();
 
     // Verify WAL integrity after process termination
-    let entries = verify_wal_integrity(&path)?;
+    let mut wal = arc_malachitebft_wal::RecoveryLog::open(&path, |_| Ok(()))?;
+    let entries = wal.iter()?.collect::<io::Result<Vec<_>>>()?;
 
     // The WAL should either be empty or contain complete entries
     for entry in entries {
@@ -273,7 +274,7 @@ fn process_termination() -> io::Result<()> {
 fn wal_write_test() {
     if std::env::args().any(|arg| arg == "--test") {
         if let Some(path) = std::env::args().nth(3) {
-            let mut wal = FileLog::open(path).unwrap();
+            let mut wal = arc_malachitebft_wal::RecoveryLog::open(path, |_| Ok(())).unwrap();
             loop {
                 // Continuously write entries until terminated
                 wal.append(b"test entry").unwrap();

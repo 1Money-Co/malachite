@@ -2,6 +2,7 @@
 
 use derive_where::derive_where;
 use thiserror::Error;
+use tracing::warn;
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
@@ -103,6 +104,8 @@ where
                     conflicting: vote,
                 });
             }
+            // Do not add duplicate vote
+            return Ok(());
         }
 
         // Tally this vote
@@ -137,6 +140,18 @@ where
     /// Return the votes for this round.
     pub fn received_votes(&self) -> &Vec<SignedVote<Ctx>> {
         &self.received_votes
+    }
+
+    /// Return precommits for the given value in this round.
+    pub fn precommits_for_value(&self, value_id: &ValueId<Ctx>) -> Vec<SignedVote<Ctx>> {
+        self.received_votes
+            .iter()
+            .filter(|v| {
+                v.vote_type() == VoteType::Precommit
+                    && v.value() == &NilOrVal::Val(value_id.clone())
+            })
+            .cloned()
+            .collect()
     }
 
     /// Return the addresses and their weights for this round.
@@ -219,6 +234,11 @@ where
         &self.evidence
     }
 
+    /// Remove and return all recorded evidence.
+    pub fn take_evidence(&mut self) -> EvidenceMap<Ctx> {
+        core::mem::take(&mut self.evidence)
+    }
+
     /// Check if we have already seen a vote.
     pub fn has_vote(&self, vote: &SignedVote<Ctx>) -> bool {
         self.per_round
@@ -252,24 +272,12 @@ where
                 conflicting,
             }) => {
                 // This is an equivocating vote
-                self.evidence.add(existing.clone(), conflicting);
-                //panic!("Equivocating vote {:?}, existing {:?}", &vote, &existing);
+                warn!(
+                    "Received equivocating vote {:?}, existing {:?}",
+                    conflicting, existing
+                );
+                self.evidence.add(existing, conflicting);
                 return None;
-            }
-        }
-
-        if vote.round() > round {
-            let combined_weight = per_round.addresses_weights.sum();
-
-            let skip_round = self
-                .threshold_params
-                .honest
-                .is_met(combined_weight, total_weight);
-
-            if skip_round {
-                let output = Output::SkipRound(vote.round());
-                per_round.emitted_outputs.insert(output.clone());
-                return Some(output);
             }
         }
 
@@ -281,7 +289,18 @@ where
             total_weight,
         );
 
-        let output = threshold_to_output(vote.vote_type(), threshold);
+        let skip_round = if vote.round() > round
+            && self
+                .threshold_params
+                .honest
+                .is_met(per_round.addresses_weights.sum(), total_weight)
+        {
+            Some(vote.round())
+        } else {
+            None
+        };
+
+        let output = threshold_to_output(vote.vote_type(), threshold, skip_round);
 
         match output {
             // Ensure we do not output the same message twice
@@ -350,16 +369,31 @@ where
 }
 
 /// Map a vote type and a threshold to a state machine output.
-fn threshold_to_output<Value>(typ: VoteType, threshold: Threshold<Value>) -> Option<Output<Value>> {
-    match (typ, threshold) {
-        (_, Threshold::Unreached) => None,
+/// Also considers an optional honest threshold for a future round.
+fn threshold_to_output<Value>(
+    typ: VoteType,
+    threshold: Threshold<Value>,
+    future_round: Option<Round>,
+) -> Option<Output<Value>> {
+    if let Some(future_round) = future_round {
+        // Only PrecommitValue(v) has larger priority than SkipRound(r)
+        match (typ, threshold) {
+            (VoteType::Precommit, Threshold::Value(v)) => Some(Output::PrecommitValue(v)),
 
-        (VoteType::Prevote, Threshold::Any) => Some(Output::PolkaAny),
-        (VoteType::Prevote, Threshold::Nil) => Some(Output::PolkaNil),
-        (VoteType::Prevote, Threshold::Value(v)) => Some(Output::PolkaValue(v)),
+            (_, _) => Some(Output::SkipRound(future_round)),
+        }
+    } else {
+        // Thresholds for the current round
+        match (typ, threshold) {
+            (_, Threshold::Unreached) => None,
 
-        (VoteType::Precommit, Threshold::Any) => Some(Output::PrecommitAny),
-        (VoteType::Precommit, Threshold::Nil) => Some(Output::PrecommitAny),
-        (VoteType::Precommit, Threshold::Value(v)) => Some(Output::PrecommitValue(v)),
+            (VoteType::Prevote, Threshold::Any) => Some(Output::PolkaAny),
+            (VoteType::Prevote, Threshold::Nil) => Some(Output::PolkaNil),
+            (VoteType::Prevote, Threshold::Value(v)) => Some(Output::PolkaValue(v)),
+
+            (VoteType::Precommit, Threshold::Any) => Some(Output::PrecommitAny),
+            (VoteType::Precommit, Threshold::Nil) => Some(Output::PrecommitAny),
+            (VoteType::Precommit, Threshold::Value(v)) => Some(Output::PrecommitValue(v)),
+        }
     }
 }

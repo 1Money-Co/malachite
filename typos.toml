@@ -2,6 +2,7 @@
 extend-ignore-identifiers-re = []
 
 [default.extend-identifiers]
+ba1e4217 = "ba1e4217"
 bd210ba = "bd210ba"
 eb2405ba = "eb2405ba"
 
@@ -13,6 +14,7 @@ ser = "ser"
 shs = "shs"
 widder = "widder"
 typ = "typ"
+Uiu = "Uiu"
 
 [files]
-extend-exclude = ["code/crates/starknet/p2p-proto/proto/*"]
+extend-exclude = []

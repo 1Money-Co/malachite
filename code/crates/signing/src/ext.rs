@@ -8,15 +8,15 @@ use malachitebft_core_types::{
     Validator, ValidatorSet, VoteType, VotingPower,
 };
 
-use crate::SigningProvider;
+use crate::Verifier;
 
-/// Extension trait providing additional certificate verification functionality for signing providers.
+/// Extension trait providing additional certificate verification functionality.
 ///
-/// This trait extends the base [`SigningProvider`] functionality with methods for verifying
-/// commit certificates against validator sets. It is automatically implemented for any type
-/// that implements [`SigningProvider`].
+/// This trait extends the base [`Verifier`] functionality with methods for verifying
+/// certificates against validator sets. It is automatically implemented for any type
+/// that implements [`Verifier`].
 #[async_trait]
-pub trait SigningProviderExt<Ctx>
+pub trait VerifierExt<Ctx>
 where
     Ctx: Context,
 {
@@ -59,8 +59,10 @@ where
     /// Verify the given certificate against the given validator set.
     ///
     /// - For each commit signature in the certificate:
-    ///   - Reconstruct the signed precommit and verify its signature
-    /// - Check that we have 2/3+ of voting power has signed the certificate
+    ///   - Reconstruct the signed precommit and verify its signature.
+    ///   - If the signature is invalid, the entire certificate is rejected and
+    ///     nothing is stored.
+    /// - Check that we have 2/3+ of voting power has signed the certificate.
     ///
     /// If any of those steps fail, return a [`CertificateError`].
     async fn verify_commit_certificate(
@@ -74,8 +76,10 @@ where
     /// Verify the polka certificate against the given validator set.
     ///
     /// - For each signature in the certificate:
-    ///   - Reconstruct the signed prevote and verify its signature
-    /// - Check that we have 2/3+ of voting power has signed the certificate
+    ///   - Reconstruct the signed prevote and verify its signature.
+    ///   - If the signature is invalid, the entire certificate is rejected and
+    ///     known-bad signatures must never be stored or re-broadcast.
+    /// - Check that we have 2/3+ of voting power has signed the certificate.
     ///
     /// If any of those steps fail, return a [`CertificateError`].
     async fn verify_polka_certificate(
@@ -90,10 +94,13 @@ where
     ///
     /// - For each signature in the certificate:
     ///   - Reconstruct the signed vote and verify its signature.
+    ///   - If the signature is invalid, the entire certificate is rejected and
+    ///     known-bad signatures must never be replayed into the vote keeper
+    ///     or re-broadcast in a locally-built certificate.
     /// - Check that the required voting power has signed the certificate:
     ///   - If `Precommit`, ensure that 2/3+ of the voting power is represented.
     ///   - If `Skip`, ensure that 1/3+ of the voting power is represented.
-    ///  
+    ///
     /// Returns a [`CertificateError`] if any verification step fails.
     async fn verify_round_certificate(
         &self,
@@ -105,15 +112,11 @@ where
 }
 
 #[async_trait]
-impl<Ctx, P> SigningProviderExt<Ctx> for P
+impl<Ctx, P> VerifierExt<Ctx> for P
 where
     Ctx: Context,
-    P: SigningProvider<Ctx>,
+    P: Verifier<Ctx>,
 {
-    /// Verify a commit signature in a commit certificate against the public key of its validator.
-    ///
-    /// ## Return
-    /// Return the voting power of that validator if the signature is valid.
     async fn verify_commit_signature(
         &self,
         ctx: &Ctx,
@@ -142,10 +145,6 @@ where
         Ok(validator.voting_power())
     }
 
-    /// Verify a polka signature in a polka certificate against the public key of its validator.
-    ///
-    /// ## Return
-    /// Return the voting power of that validator if the signature is valid.
     async fn verify_polka_signature(
         &self,
         ctx: &Ctx,
@@ -174,10 +173,6 @@ where
         Ok(validator.voting_power())
     }
 
-    /// Verify a round signature in a round certificate against the public key of its validator.
-    ///
-    /// ## Return
-    /// Return the voting power of that validator if the signature is valid.
     async fn verify_round_signature(
         &self,
         ctx: &Ctx,
@@ -214,13 +209,6 @@ where
         Ok(validator.voting_power())
     }
 
-    /// Verify the commit certificate against the given validator set.
-    ///
-    /// - For each commit signature in the certificate:
-    ///   - Reconstruct the signed precommit and verify its signature
-    /// - Check that we have 2/3+ of voting power has signed the certificate
-    ///
-    /// If any of those steps fail, return a [`CertificateError`].
     async fn verify_commit_certificate(
         &self,
         ctx: &Ctx,
@@ -231,7 +219,7 @@ where
         let mut signed_voting_power = 0;
         let mut seen_validators = Vec::new();
 
-        // For each commit signature, reconstruct the signed precommit and verify the signature
+        // For each commit signature, reconstruct the signed precommit and verify the signature.
         for commit_sig in &certificate.commit_signatures {
             let validator_address = &commit_sig.address;
 
@@ -246,12 +234,12 @@ where
                 .get_by_address(validator_address)
                 .ok_or_else(|| CertificateError::UnknownValidator(validator_address.clone()))?;
 
-            if let Ok(voting_power) = self
+            // Verify the signature and propagate the verification error.
+            let voting_power = self
                 .verify_commit_signature(ctx, certificate, commit_sig, validator)
-                .await
-            {
-                signed_voting_power += voting_power;
-            }
+                .await?;
+
+            signed_voting_power += voting_power;
         }
 
         let total_voting_power = validator_set.total_voting_power();
@@ -271,14 +259,6 @@ where
         }
     }
 
-    /// Verify the polka certificate against the given validator set.
-    ///
-    /// - For each signed prevote in the certificate:
-    ///   - Reconstruct the signed prevote and verify its signature
-    /// - Check that we have 2/3+ of voting power has signed the certificate
-    ///
-    /// If any of those steps fail, return a [`CertificateError`].
-    ///
     async fn verify_polka_certificate(
         &self,
         ctx: &Ctx,
@@ -297,7 +277,7 @@ where
                 return Err(CertificateError::DuplicateVote(validator_address.clone()));
             }
 
-            // Add the validator to the list of seenv validators
+            // Add the validator to the list of seen validators
             seen_validators.push(validator_address);
 
             // Abort if validator not in validator set
@@ -305,13 +285,12 @@ where
                 .get_by_address(validator_address)
                 .ok_or_else(|| CertificateError::UnknownValidator(validator_address.clone()))?;
 
-            // Check that the vote signature is valid. Do this last and lazily as it is expensive.
-            if let Ok(voting_power) = self
+            // Verify the signature and propagate the verification error.
+            let voting_power = self
                 .verify_polka_signature(ctx, certificate, signature, validator)
-                .await
-            {
-                signed_voting_power += voting_power;
-            }
+                .await?;
+
+            signed_voting_power += voting_power;
         }
 
         let total_voting_power = validator_set.total_voting_power();
@@ -331,15 +310,6 @@ where
         }
     }
 
-    /// Verify the round certificate against the given validator set.
-    ///
-    /// - For each signature in the certificate:
-    ///   - Reconstruct the signed vote and verify its signature.
-    /// - Check that the required voting power has signed the certificate:
-    ///   - If `Precommit`, ensure that 2/3+ of the voting power is represented.
-    ///   - If `Skip`, ensure that 1/3+ of the voting power is represented.
-    ///  
-    /// Returns a [`CertificateError`] if any verification step fails.
     async fn verify_round_certificate(
         &self,
         ctx: &Ctx,
@@ -358,7 +328,7 @@ where
                 return Err(CertificateError::DuplicateVote(validator_address.clone()));
             }
 
-            // Add the validator to the list of seenv validators
+            // Add the validator to the list of seen validators
             seen_validators.push(validator_address);
 
             // Abort if validator not in validator set
@@ -373,13 +343,12 @@ where
                 return Err(CertificateError::InvalidVoteType(validator_address.clone()));
             }
 
-            // Check that the vote signature is valid. Do this last and lazily as it is expensive.
-            if let Ok(voting_power) = self
+            // Verify the signature and propagate the verification error.
+            let voting_power = self
                 .verify_round_signature(ctx, certificate, signature, validator)
-                .await
-            {
-                signed_voting_power += voting_power;
-            }
+                .await?;
+
+            signed_voting_power += voting_power;
         }
 
         let total_voting_power = validator_set.total_voting_power();

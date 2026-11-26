@@ -1,4 +1,4 @@
-use informalsystems_malachitebft_app_channel::{ConsensusRequest, ConsensusRequestError};
+use arc_malachitebft_app_channel::{ConsensusRequest, ConsensusRequestError};
 use malachitebft_test::TestContext;
 use tokio::sync::{mpsc, oneshot};
 

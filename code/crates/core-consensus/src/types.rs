@@ -78,7 +78,15 @@ impl<Ctx: Context> LocallyProposedValue<Ctx> {
     }
 }
 
-/// A value proposed by a validator
+/// A value proposed by a validator (typically delivered from the application / value builder).
+///
+/// `round` and `valid_round` are **metadata** the app attaches for its own streaming and
+/// lock context (e.g. parts-only implicit proposals, WAL, sync). When matching a completed
+/// value to a signed gossip `Proposal` in **proposal-only** or **proposal-and-parts** mode,
+/// Malachite correlates primarily by **height** and **value** (`value` / `id(value)`):
+/// any stored payload at this height with the same id may form a full proposal with a proposal
+/// for that id, regardless of whether `round` / `valid_round` match the proposal’s `round` /
+/// `pol_round`. The signed proposal still carries the authoritative consensus rounds for the driver.
 #[derive_where(Clone, Debug, PartialEq, Eq)]
 pub struct ProposedValue<Ctx: Context> {
     pub height: Ctx::Height,
@@ -94,6 +102,7 @@ pub enum WalEntry<Ctx: Context> {
     ConsensusMsg(SignedConsensusMsg<Ctx>),
     Timeout(Timeout),
     ProposedValue(ProposedValue<Ctx>),
+    PolkaCertificate(PolkaCertificate<Ctx>),
 }
 
 impl<Ctx: Context> WalEntry<Ctx> {
@@ -132,4 +141,19 @@ pub enum LivenessMsg<Ctx: Context> {
     Vote(SignedVote<Ctx>),
     PolkaCertificate(PolkaCertificate<Ctx>),
     SkipRoundCertificate(RoundCertificate<Ctx>),
+}
+
+/// Misbehavior evidence collected during a height.
+///
+/// Contains both proposal and vote equivocation records indexed by validator addr.
+#[derive_where(Clone, Debug)]
+pub struct MisbehaviorEvidence<Ctx: Context> {
+    pub proposals: malachitebft_core_driver::proposal_keeper::EvidenceMap<Ctx>,
+    pub votes: malachitebft_core_votekeeper::EvidenceMap<Ctx>,
+}
+
+impl<Ctx: Context> MisbehaviorEvidence<Ctx> {
+    pub fn is_empty(&self) -> bool {
+        self.proposals.is_empty() && self.votes.is_empty()
+    }
 }

@@ -2,12 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use arc_malachitebft_test::codec::proto::ProtobufCodec;
+use arc_malachitebft_test::{Address, Height, Signature, TestContext, Value, ValueId, Vote};
 use bytes::Bytes;
 use eyre::{bail, eyre, Result};
-use informalsystems_malachitebft_test::codec::proto::ProtobufCodec;
-use informalsystems_malachitebft_test::{
-    Address, Height, Signature, TestContext, Value, ValueId, Vote,
-};
 use malachitebft_app::engine::wal::{Msg, Wal, WalEntry};
 use malachitebft_app::metrics::SharedRegistry;
 use malachitebft_core_consensus::{ProposedValue, SignedConsensusMsg};

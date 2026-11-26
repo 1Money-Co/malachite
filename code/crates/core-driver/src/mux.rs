@@ -70,10 +70,10 @@ where
     ///
     /// 4. If the proposal is for a different round than the current one, return `None`.
     ///
-    /// 5. If a polka is present for the current round and we are beyond the prevote step,
+    /// 5. If a matching polka is present for the proposal's value and (current) round and we are beyond the prevote step,
     ///    return `RoundInput::ProposalAndPolkaCurrent`, including the proposal.
     ///
-    /// 6. If we are at the propose step, and a polka exists for a the propopsal's POL round,
+    /// 6. If we are at the propose step, and a matching polka exists for the proposal's value and POL round,
     ///    return `RoundInput::ProposalAndPolkaPrevious`, including the proposal.
     ///
     /// 7. If none of the above conditions are met, simply wrap the proposal in
@@ -91,11 +91,9 @@ where
             return None;
         }
 
-        // Find the polka certificate for the pol_round
-        let polka_certificate_for_previous = self
-            .polka_certificates
-            .iter()
-            .find(|cert| cert.round == proposal.pol_round());
+        // Check if there is a polka certificate matching the proposal's value and pol_round
+        let polka_certificate_for_previous =
+            self.polka_certificate(proposal.pol_round(), &proposal.value().id());
 
         // Determine if there is a polka for a previous round, either from the vote keeper or from the polka certificate
         let polka_previous = proposal.pol_round().is_defined()
@@ -128,7 +126,7 @@ where
         // L49
         if self.round_state.decision.is_none()
             && self
-                .commit_certificate(proposal.round(), proposal.value().id())
+                .commit_certificate(proposal.round(), &proposal.value().id())
                 .is_some()
         {
             return Some(RoundInput::ProposalAndPrecommitValue(proposal));
@@ -150,11 +148,9 @@ where
             return None;
         }
 
-        // Find the polka certificate for the current round
-        let polka_certificate_for_current = self
-            .polka_certificates
-            .iter()
-            .find(|cert| cert.round == proposal.round());
+        // Check if there is a polka certificate matching the proposal's round and value
+        let polka_certificate_for_current =
+            self.polka_certificate(proposal.round(), &proposal.value().id());
 
         // Determine if there is a polka for the current round, either from the vote keeper or from the polka certificate
         let polka_for_current = polka_certificate_for_current.is_some()
@@ -208,7 +204,7 @@ where
     pub(crate) fn store_and_multiplex_commit_certificate(
         &mut self,
         certificate: CommitCertificate<Ctx>,
-    ) -> Option<RoundInput<Ctx>> {
+    ) -> RoundInput<Ctx> {
         // Should only receive proposals for our height.
         assert_eq!(self.height(), certificate.height);
 
@@ -218,17 +214,20 @@ where
         // Store the certificate
         self.commit_certificates.push(certificate);
 
+        // Check for associated Proposal: if found and valid, decide it
         if let Some((signed_proposal, validity)) =
             self.proposal_and_validity_for_round_and_value(certificate_round, certificate_value_id)
         {
             if validity.is_valid() {
-                return Some(RoundInput::ProposalAndPrecommitValue(
-                    signed_proposal.message.clone(),
-                ));
+                return RoundInput::ProposalAndPrecommitValue(signed_proposal.message.clone());
             }
         }
-
-        None
+        // Proposal not received or deemed invalid
+        if certificate_round > self.round() {
+            RoundInput::SkipRound(certificate_round)
+        } else {
+            RoundInput::PrecommitAny
+        }
     }
 
     /// Store the polka certificate and multiplex the proposal.
@@ -277,6 +276,11 @@ where
                 } else {
                     None
                 }
+            } else if proposal.pol_round() == certificate_round {
+                Some((
+                    proposal.round(),
+                    RoundInput::InvalidProposalAndPolkaPrevious(proposal.clone()),
+                ))
             } else {
                 None
             }
@@ -298,17 +302,14 @@ where
             VKOutput::PrecommitAny => (threshold_round, RoundInput::PrecommitAny),
             VKOutput::SkipRound(r) => (threshold_round, RoundInput::SkipRound(r)),
             VKOutput::PrecommitValue(v) => {
-                if let Some((proposal, validity)) =
-                    self.proposal_and_validity_for_round_and_value(threshold_round, v)
+                if let Some(proposal) = self.valid_proposal_for_round_and_value(threshold_round, v)
                 {
-                    if validity.is_valid() {
-                        (
-                            threshold_round,
-                            RoundInput::ProposalAndPrecommitValue(proposal.message.clone()),
-                        )
-                    } else {
-                        (threshold_round, RoundInput::PrecommitAny)
-                    }
+                    (
+                        threshold_round,
+                        RoundInput::ProposalAndPrecommitValue(proposal.message.clone()),
+                    )
+                } else if threshold_round > self.round() {
+                    (threshold_round, RoundInput::SkipRound(threshold_round))
                 } else {
                     (threshold_round, RoundInput::PrecommitAny)
                 }
@@ -319,15 +320,15 @@ where
                 {
                     let proposal = &proposal.message;
                     // We have a proposal for the same value as the threshold.
-                    // validity  proposal(v, roundp, pol_round)      threshold(v, threshold_round) Output Line
-                    // =================================================================================
-                    // invalid   (v, roundp, pol_round)              (v, pol_round)             ProposalAndPolkaPrevious L32
-                    // valid     (v, roundp, pol_round)              (v, pol_round)             InvalidProposalAndPolkaPrevious L30
+                    // validity proposal(v, roundp, pol_round)  threshold(v, threshold_round)   Output Line
+                    // ====================================================================================
+                    // invalid  (v, roundp, pol_round)          (v, pol_round)                  InvalidProposalAndPolkaPrevious L32
+                    // valid    (v, roundp, pol_round)          (v, pol_round)                  ProposalAndPolkaPrevious L30
                     //
-                    // valid     (v, roundp, pol_round)              (v, roundp)                ProposalAndPolkaCurrent L36
-                    // valid     (v, roundp, nil)                    (v, roundp)                ProposalAndPolkaCurrent L36
+                    // valid    (v, roundp, pol_round)          (v, roundp)                     ProposalAndPolkaCurrent L36
+                    // valid    (v, roundp, nil)                (v, roundp)                     ProposalAndPolkaCurrent L36
                     //
-                    // *         *                                   (v, threshold_round)       PolkaAny L34
+                    // *         *                              (v, threshold_round)            PolkaAny L34
                     let proposal_round = proposal.round();
                     let pol_round = proposal.pol_round();
                     let pol_round_match = pol_round == threshold_round;
@@ -376,20 +377,25 @@ where
                     }
                 }
 
-                Step::Prevote if has_polka_value(&self.vote_keeper, round, proposal) => result
-                    .push(self.multiplex_vote_threshold(
+                Step::Prevote
+                    if has_polka_value(&self.vote_keeper, round, proposal)
+                        || self
+                            .polka_certificate(round, &proposal.value().id())
+                            .is_some() =>
+                {
+                    result.push(self.multiplex_vote_threshold(
                         VKOutput::PolkaValue(proposal.value().id()),
                         round,
-                    )),
+                    ))
+                }
 
                 _ => {}
             }
         }
 
-        if let Some(threshold) = find_non_value_threshold(&self.vote_keeper, round) {
+        for threshold in find_non_value_threshold(&self.vote_keeper, round) {
             result.push(self.multiplex_vote_threshold(threshold, round))
         }
-
         result
     }
 }
@@ -397,19 +403,20 @@ where
 fn find_non_value_threshold<Ctx>(
     votekeeper: &VoteKeeper<Ctx>,
     round: Round,
-) -> Option<VKOutput<ValueId<Ctx>>>
+) -> Vec<VKOutput<ValueId<Ctx>>>
 where
     Ctx: Context,
 {
-    if has_precommit_any(votekeeper, round) {
-        Some(VKOutput::PrecommitAny)
-    } else if has_polka_nil(votekeeper, round) {
-        Some(VKOutput::PolkaNil)
+    let mut outputs = Vec::new();
+    if has_polka_nil(votekeeper, round) {
+        outputs.push(VKOutput::PolkaNil)
     } else if has_polka_any(votekeeper, round) {
-        Some(VKOutput::PolkaAny)
-    } else {
-        None
+        outputs.push(VKOutput::PolkaAny)
     }
+    if has_precommit_any(votekeeper, round) {
+        outputs.push(VKOutput::PrecommitAny)
+    }
+    outputs
 }
 
 /// Check if we have a polka for a value

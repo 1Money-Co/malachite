@@ -1,5 +1,5 @@
 [package]
-name = "informalsystems-malachitebft-test-mbt"
+name = "arc-malachitebft-test-mbt"
 description = "Library for model-based testing of the Malachite consensus engine"
 publish = false
 
@@ -14,7 +14,6 @@ malachitebft-core-types = { workspace = true }
 malachitebft-core-votekeeper = { workspace = true }
 malachitebft-core-state-machine = { workspace = true }
 malachitebft-test = { workspace = true }
-malachitebft-starknet-host = { workspace = true }
 malachitebft-engine = { workspace = true }
 malachitebft-peer = { workspace = true }
 
@@ -30,4 +29,4 @@ pretty_assertions = { workspace = true }
 multihash = { workspace = true }
 
 [dev-dependencies]
-tempfile = { version = "3.21.0" }
+tempfile = { version = "3.25.0" }

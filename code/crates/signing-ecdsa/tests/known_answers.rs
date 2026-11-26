@@ -1,4 +1,4 @@
-use informalsystems_malachitebft_signing_ecdsa::{
+use arc_malachitebft_signing_ecdsa::{
     CurveConfig, K256Config, P256Config, P384Config, PrivateKey, PublicKey, Signature,
 };
 use serde::Deserialize;

@@ -1,3 +1,4 @@
+use std::ops::RangeInclusive;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -10,10 +11,14 @@ use tracing::error;
 use malachitebft_app::consensus::Role;
 use malachitebft_app::consensus::VoteExtensionError;
 use malachitebft_app::types::core::ValueOrigin;
+use malachitebft_app::types::MisbehaviorEvidence;
 use malachitebft_engine::consensus::state_dump::StateDump;
 use malachitebft_engine::consensus::Msg as ConsensusActorMsg;
-use malachitebft_engine::host::Next;
+use malachitebft_engine::host::{HeightParams, Next};
 use malachitebft_engine::network::Msg as NetworkActorMsg;
+use malachitebft_engine::network::{
+    Multiaddr, NetworkStateDump, PersistentPeerError, PersistentPeersOp,
+};
 use malachitebft_engine::util::events::TxEvent;
 
 use crate::app::types::core::{CommitCertificate, Context, Round, ValueId, VoteExtensions};
@@ -96,7 +101,7 @@ impl From<oneshot::error::RecvError> for ConsensusRequestError {
 /// ```
 pub enum ConsensusRequest<Ctx: Context> {
     /// Request a state dump from consensus
-    DumpState(Reply<StateDump<Ctx>>),
+    DumpState(Reply<Option<StateDump<Ctx>>>),
 }
 
 impl<Ctx: Context> ConsensusRequest<Ctx> {
@@ -105,7 +110,7 @@ impl<Ctx: Context> ConsensusRequest<Ctx> {
     /// If the request fails, `None` is returned.
     pub async fn dump_state(
         tx_request: &mpsc::Sender<ConsensusRequest<Ctx>>,
-    ) -> Result<StateDump<Ctx>, ConsensusRequestError> {
+    ) -> Result<Option<StateDump<Ctx>>, ConsensusRequestError> {
         let (tx, rx) = oneshot::channel();
 
         tx_request
@@ -120,6 +125,79 @@ impl<Ctx: Context> ConsensusRequest<Ctx> {
     }
 }
 
+/// Represents requests that can be sent to the network layer by the application.
+pub enum NetworkRequest {
+    /// Request a state dump from the network
+    DumpState(Reply<Option<NetworkStateDump>>),
+    /// Add or remove a persistent peer at runtime
+    UpdatePersistentPeers(PersistentPeersOp, Reply<Result<(), PersistentPeerError>>),
+}
+
+impl NetworkRequest {
+    /// Request a state dump from the network.
+    pub async fn dump_state(
+        tx_request: &mpsc::Sender<NetworkRequest>,
+    ) -> Result<Option<NetworkStateDump>, ConsensusRequestError> {
+        let (tx, rx) = oneshot::channel();
+
+        tx_request
+            .try_send(Self::DumpState(tx))
+            .inspect_err(|error| error!(%error, "Failed to send DumpState request to network"))?;
+
+        let dump = rx.await.inspect_err(
+            |error| error!(%error, "Failed to receive DumpState response from network"),
+        )?;
+
+        Ok(dump)
+    }
+
+    /// Add a persistent peer at runtime.
+    pub async fn add_persistent_peer(
+        tx_request: &mpsc::Sender<NetworkRequest>,
+        addr: Multiaddr,
+    ) -> Result<Result<(), PersistentPeerError>, ConsensusRequestError> {
+        let (tx, rx) = oneshot::channel();
+
+        tx_request
+            .try_send(Self::UpdatePersistentPeers(
+                PersistentPeersOp::Add(addr),
+                tx,
+            ))
+            .inspect_err(
+                |error| error!(%error, "Failed to send AddPersistentPeer request to network"),
+            )?;
+
+        let result = rx.await.inspect_err(
+            |error| error!(%error, "Failed to receive AddPersistentPeer response from network"),
+        )?;
+
+        Ok(result)
+    }
+
+    /// Remove a persistent peer at runtime.
+    pub async fn remove_persistent_peer(
+        tx_request: &mpsc::Sender<NetworkRequest>,
+        addr: Multiaddr,
+    ) -> Result<Result<(), PersistentPeerError>, ConsensusRequestError> {
+        let (tx, rx) = oneshot::channel();
+
+        tx_request
+            .try_send(Self::UpdatePersistentPeers(
+                PersistentPeersOp::Remove(addr),
+                tx,
+            ))
+            .inspect_err(
+                |error| error!(%error, "Failed to send RemovePersistentPeer request to network"),
+            )?;
+
+        let result = rx.await.inspect_err(
+            |error| error!(%error, "Failed to receive RemovePersistentPeer response from network"),
+        )?;
+
+        Ok(result)
+    }
+}
+
 /// Channels created for application consumption
 pub struct Channels<Ctx: Context> {
     /// Channel for receiving messages from consensus
@@ -130,6 +208,8 @@ pub struct Channels<Ctx: Context> {
     pub events: TxEvent<Ctx>,
     /// Channel for sending requests to consensus
     pub requests: mpsc::Sender<ConsensusRequest<Ctx>>,
+    /// Channel for sending requests to the network
+    pub net_requests: mpsc::Sender<NetworkRequest>,
 }
 
 /// Messages sent from consensus to the application.
@@ -140,9 +220,8 @@ pub enum AppMsg<Ctx: Context> {
     /// The application MUST reply with a message to instruct
     /// consensus to start at a given height.
     ConsensusReady {
-        /// Channel for sending back the height to start at
-        /// and the validator set for that height
-        reply: Reply<(Ctx::Height, Ctx::ValidatorSet)>,
+        /// Channel for sending back the height to start and the associated parameters.
+        reply: Reply<(Ctx::Height, HeightParams<Ctx>)>,
     },
 
     /// Notifies the application that a new consensus round has begun.
@@ -250,12 +329,9 @@ pub enum AppMsg<Ctx: Context> {
     /// and the aggregated signatures of the validators that committed to it.
     /// It also includes to the vote extensions received for that height.
     ///
-    /// In response to this message, the application MUST send a [`Next`]
-    /// message back to consensus, instructing it to either start the next height if
-    /// the application was able to commit the decided value, or to restart the current height
-    /// otherwise.
-    ///
-    /// If the application does not reply, consensus will stall.
+    /// The application MUST commit the decision and then reply to
+    /// acknowledge that the commit is complete. The sync actor will only be notified
+    /// of the decided height after the application replies.
     Decided {
         /// The certificate for the decided value
         certificate: CommitCertificate<Ctx>,
@@ -263,18 +339,49 @@ pub enum AppMsg<Ctx: Context> {
         /// The vote extensions received for that height
         extensions: VoteExtensions<Ctx>,
 
+        /// Channel for acknowledging that the decision has been committed.
+        reply: Reply<()>,
+    },
+
+    /// Notifies the application that a height has been finalized after collecting additional precommits.
+    ///
+    /// This message is sent when the target time for the height has been reached,
+    /// which may include a delay between `Decided` and `Finalized` messages.
+    /// During this delay, additional precommits may have been collected. The certificate may contain more
+    /// signatures than the one sent in the previous Decided message.
+    ///
+    /// In response to this message, the application MUST send a [`Next`]
+    /// message back to consensus, instructing it to either start the next height if
+    /// the application was able to commit the decided value, or to restart the current height
+    /// otherwise.
+    ///
+    /// If the application does not reply, consensus will stall.
+    Finalized {
+        /// The certificate with extended signatures collected during finalization period
+        certificate: CommitCertificate<Ctx>,
+
+        /// The vote extensions received for that height (including additional ones)
+        extensions: VoteExtensions<Ctx>,
+
+        /// Misbehavior evidence observed since last decide
+        evidence: MisbehaviorEvidence<Ctx>,
+
         /// Channel for instructing consensus to start the next height, if desired
         reply: Reply<Next<Ctx>>,
     },
 
-    /// Requests a previously decided value from the application's storage.
+    /// Requests a range of previously decided values from the application's storage.
     ///
-    /// The application MUST respond with that value if available, or `None` otherwise.
-    GetDecidedValue {
-        /// Height of the decided value to retrieve
-        height: Ctx::Height,
+    /// The application MUST respond with those values if available, or `None` otherwise.
+    ///
+    /// ## Important
+    /// The range is NOT checked for validity by consensus. It is the application's responsibility
+    /// to ensure that the the range is within valid bounds.
+    GetDecidedValues {
+        /// Range of decided values to retrieve
+        range: RangeInclusive<Ctx::Height>,
         /// Channel for sending back the decided value
-        reply: Reply<Option<RawDecidedValue<Ctx>>>,
+        reply: Reply<Vec<RawDecidedValue<Ctx>>>,
     },
 
     /// Notifies the application that a value has been synced from the network.
@@ -300,27 +407,27 @@ pub enum AppMsg<Ctx: Context> {
 /// Messages sent from the application to consensus.
 #[derive_where(Debug)]
 pub enum ConsensusMsg<Ctx: Context> {
-    /// Instructs consensus to start a new height with the given validator set.
-    StartHeight(Ctx::Height, Ctx::ValidatorSet),
+    /// Instructs consensus to start a new height with the provided parameters.
+    StartHeight(Ctx::Height, HeightParams<Ctx>),
+
+    /// Instructs consensus to restart at a given height with the provided parameters.
+    RestartHeight(Ctx::Height, HeightParams<Ctx>),
 
     /// Previousuly received value proposed by a validator
     ReceivedProposedValue(ProposedValue<Ctx>, ValueOrigin),
-
-    /// Instructs consensus to restart at a given height with the given validator set.
-    RestartHeight(Ctx::Height, Ctx::ValidatorSet),
 }
 
 impl<Ctx: Context> From<ConsensusMsg<Ctx>> for ConsensusActorMsg<Ctx> {
     fn from(msg: ConsensusMsg<Ctx>) -> ConsensusActorMsg<Ctx> {
         match msg {
-            ConsensusMsg::StartHeight(height, validator_set) => {
-                ConsensusActorMsg::StartHeight(height, validator_set)
+            ConsensusMsg::StartHeight(height, updates) => {
+                ConsensusActorMsg::StartHeight(height, updates)
             }
             ConsensusMsg::ReceivedProposedValue(value, origin) => {
                 ConsensusActorMsg::ReceivedProposedValue(value, origin)
             }
-            ConsensusMsg::RestartHeight(height, validator_set) => {
-                ConsensusActorMsg::RestartHeight(height, validator_set)
+            ConsensusMsg::RestartHeight(height, updates) => {
+                ConsensusActorMsg::RestartHeight(height, updates)
             }
         }
     }
